@@ -17,6 +17,11 @@ The loop, per iteration `k`:
    anchor-prefixed improved trajectories (region-weighted SFT and/or anchor-conditioned DPO).
 7. Retrain (from base or last checkpoint), then iterate.
 
+**Deep dive:** [`src/expert_iter/README.md`](src/expert_iter/README.md) explains the
+architecture, the run-directory data flow, every module's role, and how to add new
+anchor policies / operators / gates. API quirks of the pinned bleeding-edge deps are
+in [`docs/api_notes.md`](docs/api_notes.md).
+
 ## Setup
 
 ```bash
