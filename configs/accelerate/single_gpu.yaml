@@ -1,0 +1,6 @@
+# Single-GPU debug backend (train.backend: single). num_processes is passed on
+# the command line by loop.py — never set it in these files.
+compute_environment: LOCAL_MACHINE
+distributed_type: "NO"
+mixed_precision: bf16
+use_cpu: false

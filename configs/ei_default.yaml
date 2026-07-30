@@ -1,0 +1,126 @@
+# Expert-iteration default config: Qwen3-4B-Instruct-2507 on the OpenThoughts
+# math subset. Any field can be overridden on the CLI: --override rollout.n=4
+# GPU topology is NEVER hardcoded here: engine.gpus null means "use
+# CUDA_VISIBLE_DEVICES, else all visible devices".
+
+run:
+  name: ei_qwen3_4b
+  output_root: runs
+  seed: 17
+  wandb:
+    project: ei_reasoning
+    mode: online              # online | offline | disabled
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  system_prompt: null
+
+engine:
+  gpus: null                  # e.g. [0, 1, 2]; null -> CUDA_VISIBLE_DEVICES -> all
+  tensor_parallel: 1          # >1 groups GPUs per vLLM worker (bigger models)
+  gpu_memory_utilization: 0.90
+  max_model_len: 12288        # >= train.max_seq_len (logprob scoring needs full sequences)
+  score_batch_size: 256
+  enable_prefix_caching: true # anchors share the question prefix — big win in improve
+  enforce_eager: false
+
+data:
+  adapter: openthoughts_math  # or local_jsonl with adapter_args.path
+  adapter_args:
+    hf_name: open-thoughts/OpenThoughts-114k
+    config: metadata
+    split: train
+    domain: math
+    max_items: 2000
+  question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  eval_holdout: 200
+  accumulate: true            # STaR-style: train on the union of all iterations' data
+
+rollout:
+  n: 8
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 8192
+  capture_logprobs: false
+
+partition:
+  verifier: math              # math | lean (lean needs the kimina server)
+  solved_keep_max: 4
+  solved_selection: shortest  # shortest | first | random
+
+# ---- research extension points ------------------------------------------ #
+
+anchor:                       # (I) how much of a failed rollout to keep
+  policy: fixed_fraction      # fixed_fraction | none (register more in anchor.py)
+  params:
+    fraction: 0.3
+    min_tokens: 32
+    max_tokens: 2048
+  base_selection: first_failed  # which failed rollout to anchor on
+
+improve:                      # (II) how to continue from question+anchor
+  operator: self_resample     # self_resample | teacher (stub)
+  n: 8
+  temperature: 1.2            # hotter than rollout: we need diversity to escape the failure
+  top_p: 0.98
+  max_tokens: 8192
+  rounds: 1
+  teacher:
+    model: null
+    gpus: null
+    quantization: null
+
+filter:                       # (III) learnability gates, applied in order
+  gates: [correctness, no_external_context, length, dedup]
+  max_total_tokens: 10240
+  max_per_question: 2
+  logprob_gate:
+    enabled: false            # scores survivors under the current policy (vLLM pass)
+    min_mean_logprob: -1.5
+    scope: continuation       # continuation | full
+
+train:                        # (IV) objective over the mixed dataset
+  objective: sft              # sft | dpo | sft+dpo
+  init_from: base             # base (STaR-style, default) | last
+  backend: zero2              # single | zero2 | zero3 | fsdp2
+  max_seq_len: 10240
+  sft:
+    lr: 1.0e-5
+    epochs: 2
+    scheduler: cosine
+    warmup_ratio: 0.03
+    global_batch_size: 32     # grad_accum derived at runtime from GPU count
+    micro_batch_size: 1
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    bf16: true
+    gradient_checkpointing: true
+    packing: false            # per-token region weights require packing off
+    logging_steps: 5
+    region_weights:           # the key methodology knob for part (IV)
+      prompt: 0.0
+      anchor: 0.0             # 0 = condition on the anchor, don't imitate it
+      continuation: 1.0       # operator's continuation on improved trajectories
+      solution: 1.0           # full response on natively-solved trajectories
+  dpo:
+    lr: 5.0e-7
+    beta: 0.1
+    epochs: 1
+    global_batch_size: 16
+    micro_batch_size: 1
+    loss_type: sigmoid
+    max_grad_norm: 1.0
+    logging_steps: 5
+
+loop:
+  iterations: 4
+  stages: [rollout, partition, anchor, improve, filters, build_dataset, train, eval]
+
+eval:
+  greedy_pass1: true
+  passk:
+    k: 8
+    temperature: 0.7
+    top_p: 0.95
+  max_tokens: 8192

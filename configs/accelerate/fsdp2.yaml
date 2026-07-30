@@ -1,0 +1,13 @@
+# PyTorch FSDP v2 (train.backend: fsdp2). FULL_STATE_DICT so the final save
+# gathers complete weights on rank 0 (required for the vLLM handoff).
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+fsdp_config:
+  fsdp_version: 2
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_reshard_after_forward: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_offload_params: false
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_activation_checkpointing: false   # trainer's gradient_checkpointing flag handles this

@@ -1,0 +1,9 @@
+# DeepSpeed ZeRO-3 (train.backend: zero3) — for models too big for ZeRO-2.
+# The json sets stage3_gather_16bit_weights_on_model_save so save_model writes
+# a FULL checkpoint vLLM can load (not sharded stubs).
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+mixed_precision: bf16
+deepspeed_config:
+  deepspeed_config_file: configs/deepspeed/zero3.json
+  zero3_init_flag: true

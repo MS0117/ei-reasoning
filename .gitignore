@@ -1,0 +1,16 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# experiment outputs
+runs/
+wandb/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# local scratch
+*.tmp

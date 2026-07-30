@@ -1,0 +1,9 @@
+# DeepSpeed ZeRO-2 (train.backend: zero2) — the default on PCIe boxes without
+# NVLink: params stay replicated (no per-layer all-gathers), only optimizer
+# state + gradients are sharded. Fits a 7-8B full fine-tune on 96GB cards.
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+mixed_precision: bf16
+deepspeed_config:
+  deepspeed_config_file: configs/deepspeed/zero2.json
+  zero3_init_flag: false

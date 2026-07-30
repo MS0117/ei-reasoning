@@ -1,0 +1,58 @@
+[project]
+name = "expert-iter"
+version = "0.1.0"
+description = "Expert iteration with pluggable improvement operators (math + Lean)."
+readme = "README.md"
+# Hard 3.11 pin: the flash-attn wheel below is cp311-only, and the vllm/torch
+# pins assume CUDA 12.9. Without this, uv will happily resolve for 3.12 and
+# only fail at the flash-attn download step.
+requires-python = "==3.11.*"
+
+dependencies = [
+    "torch==2.11.0",
+    "transformers==5.7.0",
+    "trl==1.3.0",
+    "accelerate==1.13.0",
+    "datasets==4.8.5",
+    "deepspeed==0.18.9",
+    "numpy==2.3.5",
+    "pyyaml==6.0.3",
+    "wandb==0.26.1",
+    # Versions for these two live in [tool.uv.sources] — the wheel URL is the
+    # only thing that selects the right CUDA/ABI build, so pinning a version
+    # here as well would just be a second place to forget to update.
+    "vllm",
+    "flash-attn",
+    # Imported directly by eval / lean / reflection code. They also arrive as
+    # transitive deps today, but declaring them keeps an upstream dependency
+    # drop from silently breaking us.
+    "httpx",
+    "pandas",
+    "tqdm",
+    "math-verify",   # eval/math_eval/eval_math.py
+    "bitsandbytes",  # controlled_reflection teacher default quantization
+]
+
+[tool.uv.sources]
+# vllm 0.20.0 — the PyPI default is the CUDA 13 wheel; we need the cu129 build
+# hosted on GitHub releases to match torch 2.11.0+cu129 / flash-attn cu12.
+vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0+cu129-cp38-abi3-manylinux_2_31_x86_64.whl" }
+# flash-attn 2.8.3 — must match torch + CUDA + python ABI exactly. Custom
+# prebuilt wheel for torch 2.11 / CUDA 12 / cp311 / cxx11abiTRUE.
+flash-attn = { url = "https://github.com/MS0117/wheels/releases/download/flash-attn-2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: multi-second tests (tiny-model training loops)"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Two importable roots: the core library under src/, and the inference-only
+# controlled-reflection package that sits at the repo root.
+packages = ["src/expert_iter", "inference_controlled_reflection"]

@@ -1,0 +1,167 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+
+======================================================================
+## versions
+======================================================================
+python       3.11.15
+torch        2.11.0+cu130 | cuda 13.0 | devices 3
+transformers 5.7.0
+trl          1.3.0
+accelerate   1.13.0
+vllm         0.20.0
+datasets     4.8.5
+deepspeed    0.18.9
+flash_attn   2.8.3
+
+======================================================================
+## trl SFTTrainer/SFTConfig
+======================================================================
+SFTTrainer.__init__: (self, model: 'str | PreTrainedModel | PeftModel', args: trl.trainer.sft_config.SFTConfig | transformers.training_args.TrainingArguments | None = None, data_collator: collections.abc.Callable[[list[typing.Any]], dict[str, typing.Any]] | None = None, train_dataset: datasets.arrow_dataset.Dataset | datasets.iterable_dataset.IterableDataset | None = None, eval_dataset: datasets.arrow_dataset.Dataset | datasets.iterable_dataset.IterableDataset | dict[str, datasets.arrow_dataset.Dataset | datasets.iterable_dataset.IterableDataset] | None = None, processing_class: transformers.tokenization_utils_base.PreTrainedTokenizerBase | transformers.processing_utils.ProcessorMixin | None = None, compute_loss_func: collections.abc.Callable | None = None, compute_metrics: collections.abc.Callable[[transformers.trainer_utils.EvalPrediction], dict] | None = None, callbacks: list[transformers.trainer_callback.TrainerCallback] | None = None, optimizers: tuple[torch.optim.optimizer.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None), optimizer_cls_and_kwargs: tuple[type[torch.optim.optimizer.Optimizer], dict[str, typing.Any]] | None = None, preprocess_logits_for_metrics: collections.abc.Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None, peft_config: 'PeftConfig | None' = None, formatting_func: collections.abc.Callable[[dict], str] | None = None)
+
+SFTTrainer MRO: ['SFTTrainer', '_BaseTrainer', 'Trainer', 'object']
+
+SFTConfig relevant fields:
+  assistant_only_loss = False
+  chat_template_path = None
+  completion_only_loss = None
+  dataset_kwargs = None
+  dataset_num_proc = None
+  dataset_text_field = 'text'
+  eval_packing = None
+  loss_type = 'nll'
+  max_length = 1024
+  model_init_kwargs = None
+  packing = False
+  packing_strategy = 'bfd'
+  padding_free = False
+  prediction_loss_only = False
+  shuffle_dataset = False
+
+SFTTrainer defines its own compute_loss: True
+  signature: (self, model, inputs, return_outputs=False, num_items_in_batch=None)
+
+======================================================================
+## trl DPOTrainer/DPOConfig
+======================================================================
+DPOTrainer.__init__: (self, model: 'str | PreTrainedModel | PeftModel', ref_model: transformers.modeling_utils.PreTrainedModel | None = None, args: trl.trainer.dpo_config.DPOConfig | None = None, data_collator: collections.abc.Callable[[list[typing.Any]], dict[str, typing.Any]] | None = None, train_dataset: datasets.arrow_dataset.Dataset | datasets.iterable_dataset.IterableDataset | None = None, eval_dataset: datasets.arrow_dataset.Dataset | datasets.iterable_dataset.IterableDataset | dict[str, datasets.arrow_dataset.Dataset | datasets.iterable_dataset.IterableDataset] | None = None, processing_class: transformers.tokenization_utils_base.PreTrainedTokenizerBase | transformers.processing_utils.ProcessorMixin | None = None, compute_metrics: collections.abc.Callable[[transformers.trainer_utils.EvalPrediction], dict] | None = None, callbacks: list[transformers.trainer_callback.TrainerCallback] | None = None, optimizers: tuple[torch.optim.optimizer.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None), peft_config: 'PeftConfig | None' = None)
+DPOConfig relevant fields:
+  adam_beta1 = 0.9
+  adam_beta2 = 0.999
+  beta = 0.1
+  loss_type = <dataclasses._MISSING_TYPE object at 0x77a8cc5dc1d0>
+  max_length = 1024
+  precompute_ref_batch_size = None
+  precompute_ref_log_probs = False
+
+======================================================================
+## transformers loss contract
+======================================================================
+Trainer.compute_loss: (self, model: torch.nn.modules.module.Module, inputs: dict[str, torch.Tensor | typing.Any], return_outputs: bool = False, num_items_in_batch: torch.Tensor | int | None = None) -> torch.Tensor | tuple[torch.Tensor, typing.Any]
+has num_items_in_batch param: True
+
+Trainer.get_batch_samples source (num_items accounting):
+    def get_batch_samples(
+        self, epoch_iterator: Iterator, num_batches: int, device: torch.device
+    ) -> tuple[list, torch.Tensor | int | None]:
+        """
+        Collects a specified number of batches from the epoch iterator and optionally counts the number of items in the batches to properly scale the loss.
+        """
+        batch_samples = []
+
+        for _ in range(num_batches):
+            try:
+                batch_samples.append(next(epoch_iterator))
+            except StopIteration:
+                break
+
+        num_items_in_batch = self._get_num_items_in_batch(batch_samples, device)
+        return batch_samples, num_items_in_batch
+
+
+======================================================================
+## vllm surface
+======================================================================
+SamplingParams params of interest:
+  n: MISSING
+  temperature: MISSING
+  top_p: MISSING
+  max_tokens: MISSING
+  seed: MISSING
+  logprobs: MISSING
+  prompt_logprobs: MISSING
+  stop: MISSING
+  include_stop_str_in_output: MISSING
+  detokenize: MISSING
+vllm.inputs.TokensPrompt: available
+  LLM.enable_prefix_caching: MISSING
+  LLM.gpu_memory_utilization: YES
+  LLM.max_model_len: MISSING
+  LLM.tensor_parallel_size: YES
+  LLM.seed: YES
+  LLM.enforce_eager: YES
+  LLM.dtype: YES
+
+======================================================================
+## chat template
+======================================================================
+chat template of Qwen/Qwen3-4B-Instruct-2507 (add_generation_prompt=True):
+'<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n'
+
+contains '<think>': False
+tokenize=True matches encode(text): False
+eos_token: '<|im_end|>' 151645
+anchor decode->re-encode roundtrip equal: True (False is EXPECTED sometimes — this is why we splice ids, not text)
+
+======================================================================
+## live GPU generation (Qwen/Qwen3-0.6B on GPU 2)
+======================================================================
+(EngineCore pid=1561709) Failed to get device capability: SM 12.x requires CUDA >= 12.9.
+(EngineCore pid=1561709) Failed to get device capability: SM 12.x requires CUDA >= 12.9.
+(EngineCore pid=1561709) Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+(EngineCore pid=1561709) Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+(EngineCore pid=1561709) Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.09it/s]
+(EngineCore pid=1561709) Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.09it/s]
+(EngineCore pid=1561709) 
+(EngineCore pid=1561709) 2026-07-30 21:35:58,323 - INFO - autotuner.py:457 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore pid=1561709) 2026-07-30 21:35:58,333 - INFO - autotuner.py:466 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(EngineCore pid=1561709) Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/51 [00:00<?, ?it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   6%|▌         | 3/51 [00:00<00:01, 27.40it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  12%|█▏        | 6/51 [00:00<00:01, 28.10it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  18%|█▊        | 9/51 [00:00<00:01, 26.90it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  24%|██▎       | 12/51 [00:00<00:01, 27.71it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  29%|██▉       | 15/51 [00:00<00:01, 28.10it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  35%|███▌      | 18/51 [00:00<00:01, 27.82it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  41%|████      | 21/51 [00:00<00:01, 28.49it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  47%|████▋     | 24/51 [00:00<00:01, 26.67it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  53%|█████▎    | 27/51 [00:00<00:00, 26.30it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  59%|█████▉    | 30/51 [00:01<00:00, 26.45it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  65%|██████▍   | 33/51 [00:01<00:00, 27.10it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  73%|███████▎  | 37/51 [00:01<00:00, 27.92it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  80%|████████  | 41/51 [00:01<00:00, 28.72it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  86%|████████▋ | 44/51 [00:01<00:00, 25.83it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  92%|█████████▏| 47/51 [00:01<00:00, 23.96it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  98%|█████████▊| 50/51 [00:01<00:00, 25.36it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 51/51 [00:02<00:00, 24.44it/s]
+(EngineCore pid=1561709) Capturing CUDA graphs (decode, FULL):   0%|          | 0/51 [00:00<?, ?it/s]Capturing CUDA graphs (decode, FULL):   8%|▊         | 4/51 [00:00<00:01, 34.79it/s]Capturing CUDA graphs (decode, FULL):  16%|█▌        | 8/51 [00:00<00:01, 35.44it/s]Capturing CUDA graphs (decode, FULL):  24%|██▎       | 12/51 [00:00<00:01, 36.42it/s]Capturing CUDA graphs (decode, FULL):  33%|███▎      | 17/51 [00:00<00:00, 37.98it/s]Capturing CUDA graphs (decode, FULL):  41%|████      | 21/51 [00:00<00:00, 37.89it/s]Capturing CUDA graphs (decode, FULL):  49%|████▉     | 25/51 [00:00<00:00, 37.36it/s]Capturing CUDA graphs (decode, FULL):  57%|█████▋    | 29/51 [00:00<00:00, 37.22it/s]Capturing CUDA graphs (decode, FULL):  65%|██████▍   | 33/51 [00:00<00:00, 37.35it/s]Capturing CUDA graphs (decode, FULL):  73%|███████▎  | 37/51 [00:01<00:00, 36.41it/s]Capturing CUDA graphs (decode, FULL):  80%|████████  | 41/51 [00:01<00:00, 37.22it/s]Capturing CUDA graphs (decode, FULL):  88%|████████▊ | 45/51 [00:01<00:00, 37.03it/s]Capturing CUDA graphs (decode, FULL):  96%|█████████▌| 49/51 [00:01<00:00, 37.41it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 51/51 [00:01<00:00, 37.09it/s]
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/shared/minsu/ei_reasoning/scripts/check_env.py", line 28, in guarded
+    fn()
+  File "/shared/minsu/ei_reasoning/scripts/check_env.py", line 205, in <lambda>
+    guarded(lambda: gpu_generation(args.model, gpu))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/scripts/check_env.py", line 167, in gpu_generation
+    out = llm.generate(
+          ^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/entrypoints/llm.py", line 500, in generate
+    return self._run_completion(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/entrypoints/llm.py", line 1642, in _run_completion
+    self._add_completion_requests(
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/entrypoints/llm.py", line 1610, in _add_completion_requests
+    return self._render_and_add_requests(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/entrypoints/llm.py", line 1814, in _render_and_add_requests
+    raise e
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/entrypoints/llm.py", line 1801, in _render_and_add_requests
+    request_id = self._add_request(
+                 ^^^^^^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/entrypoints/llm.py", line 1831, in _add_request
+    return self.llm_engine.add_request(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/v1/engine/llm_engine.py", line 241, in add_request
+    request = self.input_processor.process_inputs(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/v1/engine/input_processor.py", line 291, in process_inputs
+    self._validate_model_inputs(encoder_inputs, decoder_inputs)
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/v1/engine/input_processor.py", line 483, in _validate_model_inputs
+    self._validate_model_input(decoder_input, prompt_type="decoder")
+  File "/shared/minsu/ei_reasoning/.venv/lib/python3.11/site-packages/vllm/v1/engine/input_processor.py", line 472, in _validate_model_input
+    if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: '>' not supported between instances of 'str' and 'int'
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+[rank0]:[W730 21:36:17.754344924 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+!! <lambda> FAILED:
