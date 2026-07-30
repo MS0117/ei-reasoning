@@ -27,7 +27,10 @@ bash scripts/setup.sh                # full setup including Lean proof verificat
 ## Running
 
 ```bash
-# full loop
+# full loop (convenience launcher: -g GPUs, -c config, -b background/nohup, -h help)
+bash scripts/run.sh -g 0,1,2
+bash scripts/run.sh -g 2 -b -- --iterations 1        # background, log under logs/
+# equivalent direct call:
 .venv/bin/python -m expert_iter.loop --config configs/ei_default.yaml
 
 # any stage standalone (they compose via JSONL under runs/<name>/iter_k/)
