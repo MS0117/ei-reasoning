@@ -3,7 +3,9 @@
 # a FULL checkpoint vLLM can load (not sharded stubs).
 compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
-mixed_precision: bf16
+# NOTE: no top-level mixed_precision here — with deepspeed_config_file set,
+# accelerate 1.13 hard-errors on it; bf16 comes from the json's bf16.enabled
+# ("auto" -> filled from TrainingArguments.bf16 by the HF-DS integration).
 deepspeed_config:
   deepspeed_config_file: configs/deepspeed/zero3.json
   zero3_init_flag: true

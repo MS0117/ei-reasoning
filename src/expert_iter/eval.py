@@ -14,6 +14,7 @@ from .engine import GenRequest, run_pool
 from .registry import VERIFIERS, build
 from .templates import render_question_prompt
 from .utils import is_done, iter_dir, mark_done, stable_seed, write_json
+from . import verifier  # noqa: F401 — imported for its @register side effect on VERIFIERS
 
 
 def main(argv: list[str] | None = None) -> None:

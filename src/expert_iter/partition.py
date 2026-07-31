@@ -26,6 +26,7 @@ from .records import (
 )
 from .registry import VERIFIERS, build
 from .utils import is_done, iter_dir, mark_done, write_json
+from . import verifier  # noqa: F401 — imported for its @register side effect on VERIFIERS
 
 
 def main(argv: list[str] | None = None) -> None:

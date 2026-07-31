@@ -120,6 +120,14 @@ def make_weighted_trainer_cls():
                 if torch.is_tensor(denom):
                     denom = denom.to(ce.device)
                 loss = ce.sum() / denom
+                # DP compensation, mirroring base Trainer.compute_loss: with a
+                # globally-gathered denominator each rank holds sum_local/num_global,
+                # and the DP all-reduce AVERAGES gradients across ranks — without
+                # this factor both the gradient and the logged loss shrink by
+                # world_size (verified empirically: 2-GPU zero2 logged exactly
+                # half the single-GPU loss and grad_norm on identical data).
+                if self.args.average_tokens_across_devices and self.args.world_size > 1:
+                    loss = loss * self.args.world_size
             else:
                 loss = ce.sum() / shift_weights[shift_labels != -100].sum().clamp(min=1.0)
             return (loss, outputs) if return_outputs else loss

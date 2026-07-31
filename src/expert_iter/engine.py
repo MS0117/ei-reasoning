@@ -12,7 +12,13 @@ markers give worker-level resume for free.
 
 Modes:
   generate — sample continuations; per-request seed = stable_seed(...) so
-             results are independent of pool size and sharding.
+             results are independent of request ORDER within a fixed pool
+             topology (verified: same 1-GPU rerun is bitwise identical).
+             They are NOT independent of pool size/sharding or GPU model:
+             batch composition changes kernel numerics, and at temperature
+             sampling the sequences diverge (verified: 1-GPU vs 2-GPU pool
+             produced 0/160 identical responses). Pin engine.gpus for runs
+             you may want to reproduce exactly.
   score    — teacher-forced per-token logprobs over a suffix of the sequence
              (prompt_logprobs trick); used by the trainability logprob gate.
 """

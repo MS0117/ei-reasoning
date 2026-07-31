@@ -92,7 +92,7 @@ or from the current policy (`last`).
 | `registry.py` | Tiny name→class registries (`ADAPTERS`, `VERIFIERS`, `ANCHOR_POLICIES`, `OPERATORS`, `GATES`). Adding a component = one class + one `@register` decorator. |
 | `utils.py` | Atomic JSONL writes (tmp+rename), `.done` markers, stable hashing/seeding, GPU-list resolution, run-dir helpers, atomic symlinks. |
 | `templates.py` | The ONE text→ids location: chat-templates the question (`add_generation_prompt=True`), builds continuation prompts / training inputs by id concatenation, `ensure_eos`. |
-| `engine.py` | vLLM **data-parallel pool**: shards requests round-robin into per-worker JSONL, spawns one worker subprocess per GPU group (own `CUDA_VISIBLE_DEVICES`), merges results. Two modes: `generate` (sampling; per-request stable seeds ⇒ results independent of pool size) and `score` (teacher-forced per-token logprobs via `prompt_logprobs`, used by the trainability gate). |
+| `engine.py` | vLLM **data-parallel pool**: shards requests round-robin into per-worker JSONL, spawns one worker subprocess per GPU group (own `CUDA_VISIBLE_DEVICES`), merges results. Two modes: `generate` (sampling; per-request stable seeds ⇒ reproducible for a FIXED pool topology — pool size/GPU model changes alter numerics and thus samples) and `score` (teacher-forced per-token logprobs via `prompt_logprobs`, used by the trainability gate). |
 
 ### Data & grading
 | file | role |

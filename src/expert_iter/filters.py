@@ -21,6 +21,7 @@ from .config import Config, load_stage_config, stage_argparser
 from .records import ImprovedCandidate, QuestionRecord, UnsolvedQuestion
 from .registry import GATES, VERIFIERS, build, register
 from .utils import is_done, iter_dir, mark_done, stable_hash, write_json
+from . import verifier  # noqa: F401 — imported for its @register side effect on VERIFIERS
 
 
 @dataclass
