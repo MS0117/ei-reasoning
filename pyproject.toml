@@ -31,6 +31,7 @@ dependencies = [
     "tqdm",
     "math-verify",   # eval/math_eval/eval_math.py
     "bitsandbytes",  # controlled_reflection teacher default quantization
+    "peft",          # lora.py: merging externally-trained LoRA adapters for eval
 ]
 
 [tool.uv.sources]

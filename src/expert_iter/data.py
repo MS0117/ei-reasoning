@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from .records import QuestionRecord
 from .registry import ADAPTERS, build, register
 from .utils import read_jsonl, stable_hash
+from .verifier import last_boxed
 
 
 class DatasetAdapter(ABC):
@@ -117,6 +118,103 @@ class LocalJsonlAdapter(DatasetAdapter):
 
 
 # ---------------------------------------------------------------------------
+# External benchmarks (benchmark_eval stage)
+# ---------------------------------------------------------------------------
+
+# Dataset ids/columns for aime24/25, hmmt25, math500 ported from OPSD's
+# evaluate_math.py (community-standard sources, so numbers stay comparable);
+# aime26 from MathArena. All six presets verified loadable 2026-08-06
+# (30/30/30/30/500/134 questions). benchmark_eval reports (not raises) load
+# failures, so a renamed/removed hub dataset can't kill an EI loop.
+BENCHMARK_PRESETS: dict[str, dict] = {
+    "aime24": {"hf_name": "HuggingFaceH4/aime_2024", "split": "train"},
+    "aime25": {"hf_name": "yentinglin/aime_2025", "split": "train"},
+    "aime26": {"hf_name": "MathArena/aime_2026", "split": "train"},
+    "hmmt25": {"hf_name": "MathArena/hmmt_feb_2025", "split": "train"},
+    "math500": {"hf_name": "HuggingFaceH4/MATH-500", "split": "test"},
+    # "hard" = level-5 problems only (~134 of 500).
+    "math500_hard": {"hf_name": "HuggingFaceH4/MATH-500", "split": "test", "min_level": 5},
+}
+
+
+@register(ADAPTERS, "hf_benchmark")
+class HFBenchmarkAdapter(DatasetAdapter):
+    """Generic HF competition-benchmark adapter.
+
+    Unlike the training adapters, rows are NEVER dropped for unparsable gold —
+    dropping would silently change the benchmark's denominator. Grading copes
+    via math_strict's string-equality fallback.
+    """
+
+    def load(self, args: dict) -> list[QuestionRecord]:
+        import datasets as hf_datasets
+
+        hf_name = args["hf_name"]
+        split = args.get("split", "test")
+        bench_name = args.get("bench_name", hf_name.rsplit("/", 1)[-1].lower())
+        min_level = args.get("min_level")
+        max_items = args.get("max_items")
+
+        ds = hf_datasets.load_dataset(hf_name, split=split)
+        question_col = args.get("question_col") or _first_present(
+            ds.column_names, ["problem", "question", "prompt"]
+        )
+        answer_col = args.get("answer_col") or _first_present(
+            ds.column_names, ["answer", "final_answer", "solution"]
+        )
+        if question_col is None or answer_col is None:
+            raise KeyError(
+                f"{hf_name}[{split}] columns {ds.column_names} lack a recognizable "
+                "question/answer pair; pass adapter_args.question_col/answer_col."
+            )
+
+        records: list[QuestionRecord] = []
+        for idx, row in enumerate(ds):
+            if min_level is not None and int(row.get("level") or 0) < int(min_level):
+                continue
+            gold = str(row[answer_col]).strip()
+            records.append(
+                QuestionRecord(
+                    # "bench-" namespace guarantees benchmark qids can never
+                    # collide with training/holdout qids (contamination guard).
+                    qid=f"bench-{bench_name}-{idx:04d}",
+                    question=str(row[question_col]).strip(),
+                    # answer col may be a worked solution (math500): keep last boxed.
+                    final_answer=_extract_final_answer(gold),
+                    domain="math",
+                    meta={"hf_name": hf_name, "row_idx": idx},
+                )
+            )
+            if max_items and len(records) >= max_items:
+                break
+        print(f"[data] hf_benchmark {bench_name}: {len(records)} questions from {hf_name}[{split}]")
+        return records
+
+
+def load_benchmark_questions(bench) -> list[QuestionRecord]:
+    """Resolve a BenchmarkCfg: explicit adapter wins, else name is a preset key.
+    adapter_args always override/extend the preset."""
+    if bench.adapter:
+        adapter, args = bench.adapter, dict(bench.adapter_args)
+    else:
+        preset = BENCHMARK_PRESETS.get(bench.name)
+        if preset is None:
+            raise KeyError(
+                f"benchmark {bench.name!r} is not a preset ({sorted(BENCHMARK_PRESETS)}) "
+                "and sets no adapter; set eval.benchmarks[].adapter + adapter_args."
+            )
+        adapter, args = "hf_benchmark", {**preset, **bench.adapter_args}
+    args.setdefault("bench_name", bench.name)
+    records = build(ADAPTERS, adapter).load(args)
+    # Enforce the qid namespace for ANY adapter (e.g. a local_jsonl benchmark):
+    # benchmark qids must never be confusable with training/holdout qids.
+    for r in records:
+        if not r.qid.startswith("bench-"):
+            r.qid = f"bench-{bench.name}-{r.qid}"
+    return records
+
+
+# ---------------------------------------------------------------------------
 
 def load_questions(adapter_name: str, adapter_args: dict) -> list[QuestionRecord]:
     return build(ADAPTERS, adapter_name).load(adapter_args)
@@ -170,20 +268,9 @@ def _first_present(columns: list[str], candidates: list[str]) -> str | None:
 
 def _extract_final_answer(gold: str) -> str:
     r"""Ground truth may be a full worked solution; keep the last \boxed{...}
-    if present (balanced-brace scan), else the raw string (short answers)."""
-    idx = gold.rfind("\\boxed{")
-    if idx == -1:
-        return gold
-    start = idx + len("\\boxed{")
-    depth = 1
-    for i in range(start, len(gold)):
-        if gold[i] == "{":
-            depth += 1
-        elif gold[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return gold[start:i]
-    return gold  # unbalanced braces: fall back to the raw string
+    if present, else the raw string (short answers)."""
+    boxed = last_boxed(gold)
+    return boxed if boxed is not None else gold
 
 
 def _dedup_by_qid(records: list[QuestionRecord]) -> list[QuestionRecord]:

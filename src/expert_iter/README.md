@@ -43,6 +43,7 @@ runs/<name>/
   config.yaml              frozen config snapshot (stages load this)
   state.json  metrics.jsonl
   questions/{train,holdout}.jsonl      split materialized once per run
+  benchmarks/<bench>.jsonl             external benchmark questions, frozen once per run
   iter_0/
     rollout/rollouts.jsonl             one line per sampled response
     partition/{verdicts,solved,unsolved}.jsonl + stats.json (solve-rate)
@@ -52,6 +53,8 @@ runs/<name>/
     dataset/train_{sft,dpo}.jsonl      what the trainer reads (incl. accumulation)
     ckpt/                              full HF checkpoint → π_{k+1}
     eval/metrics.json                  pass@1 / pass@k on holdout
+    benchmark_eval/metrics.json        AIME/HMMT/MATH-500 pass@n / avg@n / maj@n
+    benchmark_eval/<bench>/samples.jsonl   graded generations (per-bench resume unit)
     logs/<stage>.log
   latest -> iter_k     latest_ckpt -> iter_k/ckpt
 ```
@@ -61,10 +64,12 @@ itself** if the marker matches. Crash recovery = re-run the same command.
 `--force STAGE|all` overrides. Subprocess isolation also guarantees vLLM fully
 releases GPUs before training starts (and vice versa).
 
-**Model resolution:** inference stages always use the current policy
+**Model resolution:** data-producing stages always use the current policy
 (`iter_{k-1}/ckpt`; `model.base` at k=0). Training initializes from `model.base`
 (`train.init_from: base`, STaR-style default, usually with `data.accumulate: true`)
-or from the current policy (`last`).
+or from the current policy (`last`). `eval`/`benchmark_eval` grade the
+**just-trained** `iter_k/ckpt` (falling back to the current policy in
+train-less stage lists).
 
 ## Load-bearing invariants
 
@@ -97,8 +102,9 @@ or from the current policy (`last`).
 ### Data & grading
 | file | role |
 |---|---|
-| `data.py` | `DatasetAdapter` registry → canonical `QuestionRecord{qid, question, final_answer, domain}`. `openthoughts_math` (filters OpenThoughts-114k to verifiable math; never reads its R1 traces), `local_jsonl`. Deterministic qid-hash holdout split, frozen per run. |
-| `verifier.py` | `Verifier` registry: `math` (math-verify; gold wrapped in `\boxed{}`, pred = last boxed expression) and `lean` (kimina HTTP client, lazily imported — math-only machines never need the Lean stack). |
+| `data.py` | `DatasetAdapter` registry → canonical `QuestionRecord{qid, question, final_answer, domain}`. `openthoughts_math` (filters OpenThoughts-114k to verifiable math; never reads its R1 traces), `local_jsonl`, `hf_benchmark` (+ `BENCHMARK_PRESETS`: aime24/25/26, hmmt25, math500[_hard]; qids namespaced `bench-*` so they can never collide with training qids). Deterministic qid-hash holdout split, frozen per run. |
+| `verifier.py` | `Verifier` registry: `math` (math-verify; gold wrapped in `\boxed{}`, pred = last boxed expression), `math_strict` (benchmark grading, OPSD semantics: last-`\boxed` extraction or wrong + format-rate, `no_fallback` parse, verify timeout, string-equality fallback) and `lean` (kimina HTTP client, lazily imported — math-only machines never need the Lean stack). |
+| `lora.py` | `resolve_model_path`: PEFT adapter dirs are merged into their base once (cached at `<adapter>/merged/`) so every inference stage keeps loading plain full checkpoints; full models/hub ids pass through. |
 
 ### The loop stages
 | file | role |
@@ -110,7 +116,8 @@ or from the current policy (`last`).
 | `filters.py` | ⚗ **(III)** ordered gate chain: `correctness` (verifier on anchor+continuation), `no_external_context`, `length`, `dedup` (continuation-id hash), optional batched `logprob_gate` (mean policy logprob threshold via engine `score` mode), then a `max_per_question` quota (shortest-first). Writes per-gate reject counts. |
 | `build_dataset.py` | Assembles train-ready examples. Solved → `[prompt][solution]`; improved → `[prompt][anchor][continuation]` (+EOS). Stores **region lengths, not baked weights**, so weight sweeps need no data rebuild. Builds DPO pairs sharing `prompt+anchor` (chosen = improved continuation, rejected = the same failed rollout's suffix). Merges prior iterations when `data.accumulate`. |
 | `train.py` | ⚗ **(IV)** `WeightedSFTTrainer` (subclasses `transformers.Trainer`; per-token region-weighted CE; normalization invariant to micro-batch/accum/DP topology — see `tests/test_loss_invariance.py`) and anchor-conditioned `trl.DPOTrainer`. `objective: sft | dpo | sft+dpo`. Saves one full HF checkpoint (gather flags per backend) with a post-save sanity assertion. |
-| `eval.py` | Greedy pass@1 + sampled pass@k / avg@k on the frozen holdout. |
+| `eval.py` | Greedy pass@1 + sampled pass@k / avg@k on the frozen holdout (in-distribution progress; cheap, every iteration). |
+| `benchmark_eval.py` | External competition benchmarks with literature-comparable grading (`math_strict`): pass@n / avg@n / majority-vote@n / format & truncation rates per benchmark, `eval.benchmark_every` cadence, per-benchmark resume. Also runs standalone on any HF model / checkpoint / LoRA adapter via `scripts/eval_bench.sh`. |
 | `loop.py` | The driver described above: stage sequencing, model resolution, resume, symlinks, `metrics.jsonl` aggregation. |
 
 ### Outside `src/`

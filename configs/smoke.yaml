@@ -55,3 +55,8 @@ eval:
   passk:
     k: 4
   max_tokens: 1024
+  # Exercise the benchmark_eval plumbing too: 5 questions, 2 samples. Qwen3-0.6B
+  # is hybrid-thinking, so most answers truncate at 1024 tokens — that's fine,
+  # smoke validates the pipeline, not the score.
+  benchmarks:
+    - {name: math500_hard, adapter_args: {max_items: 5}, n: 2, max_tokens: 1024}

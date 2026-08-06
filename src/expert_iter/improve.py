@@ -150,6 +150,7 @@ def main(argv: list[str] | None = None) -> None:
             tokenizer, u.question,
             system_prompt=cfg.model.system_prompt,
             question_suffix=cfg.data.question_suffix,
+            chat_template_kwargs=cfg.model.chat_template_kwargs,
         ).token_ids
         for u in unsolved
     }

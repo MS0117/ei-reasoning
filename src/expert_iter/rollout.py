@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> None:
             tokenizer, q.question,
             system_prompt=cfg.model.system_prompt,
             question_suffix=cfg.data.question_suffix,
+            chat_template_kwargs=cfg.model.chat_template_kwargs,
         )
         for q in train_questions
     }

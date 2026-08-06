@@ -13,7 +13,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import get_args, get_type_hints
+from typing import get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -44,6 +44,10 @@ class ModelCfg:
     base: str = "Qwen/Qwen3-4B-Instruct-2507"
     dtype: str = "bfloat16"
     system_prompt: str | None = None
+    # Forwarded to apply_chat_template by ALL prompt-rendering stages. Hybrid
+    # Qwen3 (0.6B/4B/8B) takes {enable_thinking: true|false}; Qwen3-*-2507
+    # Instruct and R1-Distill templates take no switches — leave empty.
+    chat_template_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -172,7 +176,7 @@ class LoopCfg:
     iterations: int = 4
     stages: list[str] = field(default_factory=lambda: [
         "rollout", "partition", "anchor", "improve", "filters",
-        "build_dataset", "train", "eval",
+        "build_dataset", "train", "eval", "benchmark_eval",
     ])
 
 
@@ -184,10 +188,36 @@ class PasskCfg:
 
 
 @dataclass
+class BenchmarkCfg:
+    """One external benchmark for the benchmark_eval stage.
+
+    `name` alone selects a preset from data.BENCHMARK_PRESETS (aime24, aime25,
+    aime26, hmmt25, math500, math500_hard); adapter/adapter_args override or
+    extend it. Sampling knobs follow Qwen3 best practices per model mode —
+    non-thinking: temp 0.7 / top_p 0.8 / top_k 20; thinking: 0.6 / 0.95 / 20.
+    n=1 with temperature 0.0 gives greedy pass@1.
+    """
+
+    name: str = ""
+    adapter: str = ""                  # "" -> preset lookup by name
+    adapter_args: dict = field(default_factory=dict)
+    n: int = 8                         # samples per problem -> pass@n / avg@n / maj@n
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20                    # -1 disables
+    min_p: float = 0.0
+    max_tokens: int = 16384
+
+
+@dataclass
 class EvalCfg:
     greedy_pass1: bool = True
     passk: PasskCfg = field(default_factory=PasskCfg)
     max_tokens: int = 8192
+    # ---- benchmark_eval stage ----
+    benchmarks: list[BenchmarkCfg] = field(default_factory=list)
+    benchmark_every: int = 1           # run benchmarks every N iterations (others skip)
+    benchmark_verifier: str = "math_strict"
 
 
 @dataclass
@@ -262,6 +292,17 @@ class Config:
             )
         if self.partition.solved_selection not in ("shortest", "first", "random"):
             raise ValueError(f"partition.solved_selection: {self.partition.solved_selection!r}")
+        if self.eval.benchmark_every < 1:
+            raise ValueError(f"eval.benchmark_every must be >= 1, got {self.eval.benchmark_every}")
+        seen_bench = set()
+        for i, b in enumerate(self.eval.benchmarks):
+            if not b.name:
+                raise ValueError(f"eval.benchmarks[{i}]: name is required")
+            if b.name in seen_bench:
+                raise ValueError(f"eval.benchmarks: duplicate name {b.name!r}")
+            seen_bench.add(b.name)
+            if b.n < 1:
+                raise ValueError(f"eval.benchmarks[{i}] ({b.name}): n must be >= 1")
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +323,15 @@ def _from_dict(cls, raw: dict, path: str):
             continue
         value = raw[name]
         target = hints[f.name]
+        # list[Dataclass] fields (e.g. eval.benchmarks): map each element.
+        if get_origin(target) is list:
+            (elem,) = get_args(target)
+            if dataclasses.is_dataclass(elem) and isinstance(value, list):
+                kwargs[name] = [
+                    _from_dict(elem, v, f"{path}.{name}[{i}]" if path else f"{name}[{i}]")
+                    for i, v in enumerate(value)
+                ]
+                continue
         # Unwrap Optional[X] / unions: pick the sole dataclass member if any.
         union_args = [a for a in get_args(target) if dataclasses.is_dataclass(a)]
         if union_args:

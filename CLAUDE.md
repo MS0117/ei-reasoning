@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Expert Iteration (EI) for math (later Lean) reasoning with pluggable improvement operators. Per iteration: rollout → partition (verifier grades) → anchor → improve → filters → build_dataset → train → eval, then repeat with the new checkpoint.
+Expert Iteration (EI) for math (later Lean) reasoning with pluggable improvement operators. Per iteration: rollout → partition (verifier grades) → anchor → improve → filters → build_dataset → train → eval → benchmark_eval, then repeat with the new checkpoint. `eval` tracks the run's own holdout split; `benchmark_eval` grades the just-trained checkpoint on external competition benchmarks (AIME/HMMT/MATH-500) with literature-comparable `math_strict` grading.
 
 ## Commands
 
@@ -28,6 +28,10 @@ bash scripts/setup.sh --skip-lean          # math-only; omit flag for Lean/kimin
 
 # end-to-end smoke test: 1 iteration, Qwen3-0.6B, 50 questions, 1 GPU
 bash scripts/smoke.sh [GPU_ID]
+
+# standalone benchmark eval (AIME24/25/26, HMMT25, MATH-500-hard) of any model:
+# HF hub id, EI checkpoint, or LoRA adapter dir (auto-merged)
+bash scripts/eval_bench.sh Qwen/Qwen3-4B-Instruct-2507 [-c configs/bench_eval.yaml] [-g 0,1] [-b]
 
 # verify the installed API surface (regenerates data behind docs/api_notes.md)
 .venv/bin/python scripts/check_env.py --skip-gpu

@@ -37,6 +37,18 @@ shift $((OPTIND - 1))
 if [ -n "$GPUS" ]; then
   export CUDA_VISIBLE_DEVICES="$GPUS"
 fi
+
+# On PCIe-only machines (no NVLink) P2P may be silently blocked by ACS/IOMMU:
+# cudaDeviceCanAccessPeer still says yes, so NCCL picks P2P and its first
+# collective hangs until the 600s watchdog (seen on srv04). Host shared memory
+# is always safe on PCIe and costs little, so disable P2P there; NVLink
+# machines keep P2P. Export NCCL_P2P_DISABLE yourself to override either way.
+if [ -z "${NCCL_P2P_DISABLE:-}" ] && command -v nvidia-smi >/dev/null; then
+  if ! nvidia-smi topo -m 2>/dev/null | grep -qE "NV[0-9]"; then
+    export NCCL_P2P_DISABLE=1
+    echo ">>> no NVLink detected: NCCL_P2P_DISABLE=1"
+  fi
+fi
 echo ">>> config=$CONFIG  GPUs=${CUDA_VISIBLE_DEVICES:-<all visible>}  extra args: $*"
 
 CMD=(.venv/bin/python -m expert_iter.loop --config "$CONFIG" "$@")

@@ -7,6 +7,7 @@ and are appended to runs/<name>/metrics.jsonl by loop.py.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from .config import load_stage_config, stage_argparser
 from .data import ensure_questions
@@ -14,6 +15,7 @@ from .engine import GenRequest, run_pool
 from .registry import VERIFIERS, build
 from .templates import render_question_prompt
 from .utils import is_done, iter_dir, mark_done, stable_seed, write_json
+from .wandb_utils import log_metrics, stage_wandb
 from . import verifier  # noqa: F401 — imported for its @register side effect on VERIFIERS
 
 
@@ -40,6 +42,7 @@ def main(argv: list[str] | None = None) -> None:
             tokenizer, q.question,
             system_prompt=cfg.model.system_prompt,
             question_suffix=cfg.data.question_suffix,
+            chat_template_kwargs=cfg.model.chat_template_kwargs,
         ).token_ids
         for q in holdout
     }
@@ -82,6 +85,14 @@ def main(argv: list[str] | None = None) -> None:
 
     write_json(out_path, metrics)
     mark_done(out_path, count=len(holdout), config_hash=cfg.hash())
+    # No-op under the loop driver (loop.py logs the merged iteration row);
+    # standalone `python -m expert_iter.eval` gets its own wandb run.
+    wb = stage_wandb(cfg, name=f"{Path(args.run_dir).name}-eval",
+                     id_file=Path(args.run_dir) / "wandb_eval_id.txt", job_type="eval",
+                     config={"model_path": args.model_path, "iter": args.iteration})
+    log_metrics(wb, metrics, step=args.iteration)
+    if wb is not None:
+        wb.finish()
     print(f"[eval] {metrics}")
 
 

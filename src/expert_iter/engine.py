@@ -204,6 +204,8 @@ def _worker(argv: list[str]) -> None:
                 n=r.n,
                 temperature=sampling.get("temperature", 1.0),
                 top_p=sampling.get("top_p", 1.0),
+                top_k=sampling.get("top_k", -1),
+                min_p=sampling.get("min_p", 0.0),
                 max_tokens=sampling.get("max_tokens", 1024),
                 stop=sampling.get("stop"),
                 seed=r.seed,

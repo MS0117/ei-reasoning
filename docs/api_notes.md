@@ -87,3 +87,23 @@ accelerate 1.13.0 · vllm 0.20.0 · deepspeed 0.18.9 · flash_attn 2.8.3
    orphan keeps holding GPU memory and a relaunch fails with
    `Free memory ... less than desired GPU memory utilization`. After killing a
    run manually, check `nvidia-smi` for `VLLM::EngineCore` leftovers.
+
+## Benchmark-eval findings (2026-08-06)
+
+12. **math-verify (installed pin) supports the OPSD grading knobs**:
+    `parse(pred, fallback_mode="no_fallback")` (returns `[]` on prose instead
+    of guessing) and `verify(gold, target, timeout_seconds=5)` — both verified
+    by signature inspection and a live equivalence check
+    (`$1/2$` ≡ `$\frac{1}{2}$` → True). `math_strict` in `verifier.py` relies
+    on both.
+
+13. **transformers 5.7 `from_pretrained` takes `dtype=` (with `torch_dtype`
+    kept as a deprecated alias)** — both appear as `kwargs.pop` in the source.
+    `lora.py` uses `dtype=`.
+
+14. **All six benchmark presets load from the hub** (verified 2026-08-06):
+    `HuggingFaceH4/aime_2024` (30), `yentinglin/aime_2025` (30),
+    `MathArena/aime_2026` (30 — exists!), `MathArena/hmmt_feb_2025` (30),
+    `HuggingFaceH4/MATH-500` (500 / 134 at level 5). All expose a
+    `problem`-like question column and an `answer`-like gold column that
+    `_first_present` resolves.

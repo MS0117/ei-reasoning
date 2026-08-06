@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from .config import Config, load_stage_config, stage_argparser
 from .records import ImprovedCandidate, QuestionRecord, UnsolvedQuestion
 from .registry import GATES, VERIFIERS, build, register
-from .utils import is_done, iter_dir, mark_done, stable_hash, write_json
+from .utils import is_done, iter_dir, mark_done, read_json, stable_hash, write_json
 from . import verifier  # noqa: F401 — imported for its @register side effect on VERIFIERS
 
 
@@ -137,6 +137,9 @@ def main(argv: list[str] | None = None) -> None:
         kept.extend(quota)
 
     n = ImprovedCandidate.dump_jsonl(out_path, kept)
+    part_stats_path = it_dir / "partition" / "stats.json"
+    n_total_questions = (read_json(part_stats_path).get("n_questions")
+                         if part_stats_path.exists() else None)
     report = {
         "iter": args.iteration,
         "n_candidates": len(candidates),
@@ -145,10 +148,47 @@ def main(argv: list[str] | None = None) -> None:
         "n_questions_unsolved": len(unsolved),
         "improve_yield": round(len({c.qid for c in kept}) / len(unsolved), 4) if unsolved else 0.0,
         "rejects": dict(rejects),
+        **cliff_stats(candidates, unsolved, ctx, n_total_questions),
+        # trainability/* metrics (D_mean, D_p95, D_max, per_token_max_deficit —
+        # sequence/token-level log-ratio of a trajectory under the current policy
+        # vs the policy that generated it) are reserved here but need
+        # generation-time logprobs (rollout.capture_logprobs / improve) plus a
+        # per-token scoring path in engine "score" mode; add them alongside that
+        # machinery, not before.
     }
     write_json(it_dir / "filtered" / "report.json", report)
     mark_done(out_path, count=n, config_hash=cfg.hash(), extra=report)
     print(f"[filters] {report}")
+
+
+def cliff_stats(candidates: list[ImprovedCandidate], unsolved: dict[str, UnsolvedQuestion],
+                ctx: FilterContext, n_total_questions: int | None) -> dict:
+    """Cliff = a question whose first rollouts ALL failed — exactly the unsolved
+    partition, the population the improvement operator exists to rescue.
+    cliff/count should fall across iterations; a flat curve means the loop is
+    spinning. Conversion counts correctness ONLY, deliberately ignoring the
+    learnability gates: it measures the operator's raw rescue power, while
+    improve_yield measures what survives into training data."""
+    correct_by_qid: dict[str, int] = {qid: 0 for qid in unsolved}
+    gate = CorrectnessGate()
+    for cand in candidates:
+        if cand.correct is None:  # gate chain short-circuited before correctness
+            gate.check(cand, ctx)
+        if cand.correct and cand.qid in correct_by_qid:
+            correct_by_qid[cand.qid] += 1
+
+    n_cliff = len(unsolved)
+    converted = sum(1 for v in correct_by_qid.values() if v > 0)
+    stats = {
+        "cliff/count": n_cliff,
+        "cliff/conversion_rate": round(converted / n_cliff, 4) if n_cliff else 0.0,
+        # Raw per-cliff correct-sample counts (out of improve.n * rounds);
+        # wandb renders numeric lists as histograms via log_metrics.
+        "cliff/conversion_histogram": sorted(correct_by_qid.values()),
+    }
+    if n_total_questions:
+        stats["cliff/ratio"] = round(n_cliff / n_total_questions, 4)
+    return stats
 
 
 def _logprob_gate(survivors, cfg: Config, model_path: str, it_dir):
