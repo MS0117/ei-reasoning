@@ -117,6 +117,99 @@ class LocalJsonlAdapter(DatasetAdapter):
         return _dedup_by_qid(records)
 
 
+@register(ADAPTERS, "hf_math")
+class HFMathAdapter(DatasetAdapter):
+    """Generic HF math *training-data* adapter with seeded random sampling.
+
+    Same filtering semantics as openthoughts_math (drop rows with no gold or
+    a gold that math-verify cannot parse — unverifiable => useless for EI),
+    but works for any HF dataset (passes `config` through to load_dataset,
+    which hf_benchmark does not) and can draw a seeded pseudo-random subset.
+
+    Answer-column preference puts `answer` BEFORE `solution`: datasets like
+    open-r1/OpenR1-Math-220k carry both a clean final answer and a worked R1
+    trace, and picking `solution` would leak the distillation trace into gold
+    extraction.
+
+    args: hf_name (required), config=None, split="train", question_col=None,
+          answer_col=None, n_questions=None (seeded random subset),
+          seed=17, max_items=None.
+    `max_items` head-truncates the stream BEFORE sampling (debug fast-path
+    only — it biases the sample toward the head of the dataset).
+    """
+
+    def load(self, args: dict) -> list[QuestionRecord]:
+        import datasets as hf_datasets
+
+        from .verifier import MathVerifier
+
+        hf_name = args["hf_name"]
+        config = args.get("config")
+        split = args.get("split", "train")
+        n_questions = args.get("n_questions")
+        seed = args.get("seed", 17)
+        max_items = args.get("max_items")
+
+        if config:
+            ds = hf_datasets.load_dataset(hf_name, config, split=split)
+        else:
+            ds = hf_datasets.load_dataset(hf_name, split=split)
+
+        question_col = args.get("question_col") or _first_present(
+            ds.column_names, ["problem", "question", "prompt"]
+        )
+        answer_col = args.get("answer_col") or _first_present(
+            ds.column_names, ["answer", "final_answer", "ground_truth", "solution"]
+        )
+        if question_col is None or answer_col is None:
+            raise KeyError(
+                f"{hf_name}[{split}] columns {ds.column_names} lack a recognizable "
+                "question/answer pair; pass adapter_args.question_col/answer_col."
+            )
+
+        verifier = MathVerifier()
+        records: list[QuestionRecord] = []
+        n_seen = n_no_gold = n_unparsable = 0
+        for row in ds:
+            n_seen += 1
+            question = str(row.get(question_col) or "").strip()
+            gold = str(row.get(answer_col) or "").strip()
+            if not question or not gold:
+                n_no_gold += 1
+                continue
+            final_answer = _extract_final_answer(gold)
+            if not verifier.gold_parsable(final_answer):
+                n_unparsable += 1
+                continue
+            records.append(
+                QuestionRecord(
+                    qid="hfm-" + stable_hash(hf_name, question),
+                    question=question,
+                    final_answer=final_answer,
+                    domain="math",
+                    meta={"hf_name": hf_name, "row_source": str(row.get("source") or "")},
+                )
+            )
+            if max_items and len(records) >= max_items:
+                break
+        records = _dedup_by_qid(records)
+        print(
+            f"[data] hf_math {hf_name}: kept {len(records)} / seen {n_seen} "
+            f"(no-gold {n_no_gold}, unparsable {n_unparsable})"
+        )
+        if n_questions:
+            if n_questions > len(records):
+                print(
+                    f"[data] hf_math: n_questions={n_questions} > {len(records)} "
+                    "available; keeping all"
+                )
+            else:
+                # Same order-independent (seed, qid)-hash ranking as split_holdout.
+                records = sorted(records, key=lambda r: stable_hash(seed, r.qid))[:n_questions]
+                print(f"[data] hf_math: sampled {len(records)} questions (seed {seed})")
+        return records
+
+
 # ---------------------------------------------------------------------------
 # External benchmarks (benchmark_eval stage)
 # ---------------------------------------------------------------------------

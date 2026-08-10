@@ -1,0 +1,58 @@
+# Pass-rate distribution toy experiment: sample N questions from an HF math
+# dataset, roll out K samples each with the policy model, grade, and report the
+# per-question correct-count histogram plus cliff/frontier/solved classes.
+#
+#   bash data/run_passrate.sh -g 0,1                 # model.base below
+#   bash data/run_passrate.sh Qwen/Qwen3-4B -g 0 -b  # any HF id / ckpt / LoRA dir
+#
+# Hyperparameter map:
+#   dataset  -> data.adapter_args.hf_name (+ config)
+#   N        -> data.adapter_args.n_questions
+#   K        -> rollout.n
+#   sampling -> rollout.{temperature, top_p, max_tokens}
+#   model    -> model.base (or the launcher's MODEL argument)
+#   grading  -> partition.verifier (math = lenient, same as the EI partition
+#               stage; math_strict = benchmark-style, requires \boxed{})
+# Class thresholds (cliff c=0 / frontier 1<=c<=2 / solved c>=3) are runner CLI
+# flags: data/passrate.py --frontier-min 1 --solved-min 3.
+#
+# Sampling defaults deliberately match the EI rollout stage (temp 1.0 /
+# top_p 0.95), NOT the Qwen3-2507 benchmark recommendation (0.7 / 0.8): the
+# distribution is meant to predict what expert iteration will actually see.
+
+run:
+  name: passrate
+  seed: 17
+  wandb:
+    mode: disabled                # flip to online for histogram logging
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  # Qwen3-*-2507 Instruct templates take no switches — keep this empty. For
+  # hybrid Qwen3 (0.6B/4B/8B) set {enable_thinking: true|false}.
+  chat_template_kwargs: {}
+
+engine:
+  gpus: null                      # CUDA_VISIBLE_DEVICES -> all visible
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.75    # GPUs are shared: size to free memory at launch
+  max_model_len: 12288            # auto-raised by the runner to fit prompt+max_tokens
+
+data:
+  adapter: hf_math
+  adapter_args:
+    hf_name: open-r1/OpenR1-Math-220k     # or open-r1/OpenThoughts-114k-math (config: null)
+    config: default
+    split: train
+    n_questions: 100              # N: 100 / 200 / 1000 / ...
+    seed: 17                      # seeded (seed, qid)-hash sampling, order-independent
+  eval_holdout: 0                 # no split — every sampled question is rolled out
+
+rollout:
+  n: 8                            # K: 8 / 16 / ...
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 8192              # 8192 16384 24576 32768
+
+partition:
+  verifier: math
