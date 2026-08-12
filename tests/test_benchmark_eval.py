@@ -9,7 +9,7 @@ import pytest
 from expert_iter.config import BenchmarkCfg, Config
 from expert_iter.data import BENCHMARK_PRESETS, load_benchmark_questions
 from expert_iter.benchmark_eval import summarize_benchmark
-from expert_iter.lora import resolve_model_path
+from expert_iter.lora import _adapter_cache_key, resolve_model_path
 from expert_iter.records import QuestionRecord
 from expert_iter.templates import render_question_prompt
 from expert_iter.verifier import StrictMathVerifier, last_boxed
@@ -133,6 +133,18 @@ def test_summarize_majority_vote():
     assert m["b/maj@3"] == 1.0
 
 
+def test_majority_vote_groups_equivalent_answer_forms():
+    rows = [
+        _row("q1", True, extracted=r"\frac{1}{2}"),
+        _row("q1", True, extracted="1/2"),
+        _row("q1", False, extracted="3"),
+        _row("q1", False, extracted="3"),
+        _row("q1", False, extracted="4"),
+    ]
+    m = summarize_benchmark("b", 5, rows, {"q1": "1/2"}, StrictMathVerifier())
+    assert m["b/maj@5"] == 1.0
+
+
 def test_summarize_empty_rows():
     assert "b/error" in summarize_benchmark("b", 4, [], {}, StrictMathVerifier())
 
@@ -214,3 +226,17 @@ def test_resolve_model_path_passthrough_for_full_model(tmp_path):
 
 def test_resolve_model_path_passthrough_for_hub_id():
     assert resolve_model_path("Qwen/Qwen3-4B-Instruct-2507") == "Qwen/Qwen3-4B-Instruct-2507"
+
+
+def test_lora_cache_key_tracks_weight_content(tmp_path):
+    (tmp_path / "adapter_config.json").write_text(
+        '{"base_model_name_or_path": "org/base"}'
+    )
+    weights = tmp_path / "adapter_model.safetensors"
+    weights.write_bytes(b"first")
+    first = _adapter_cache_key(tmp_path, "bfloat16")
+
+    weights.write_bytes(b"other")
+    second = _adapter_cache_key(tmp_path, "bfloat16")
+    assert first != second
+    assert second != _adapter_cache_key(tmp_path, "float16")

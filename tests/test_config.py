@@ -1,6 +1,6 @@
 import pytest
 
-from expert_iter.config import Config
+from expert_iter.config import Config, freeze_run_config
 
 
 def test_defaults_load():
@@ -42,3 +42,36 @@ def test_hash_stable_and_sensitive():
     assert a.hash() == b.hash()
     c = Config.load(None, overrides=["rollout.n=3"])
     assert a.hash() != c.hash()
+
+
+@pytest.mark.parametrize("override", [
+    "rollout.capture_logprobs=true",
+    "improve.rounds=2",
+    "improve.teacher.model=org/teacher",
+])
+def test_unimplemented_options_are_rejected(override):
+    with pytest.raises(ValueError, match="not implemented"):
+        Config.load(None, overrides=[override])
+
+
+@pytest.mark.parametrize("override", [
+    "run.name=''",
+    "model.base=''",
+    "engine.gpus=[-1]",
+    "loop.iterations=0",
+    "train.sft.lr=0",
+])
+def test_invalid_runtime_values_are_rejected(override):
+    with pytest.raises(ValueError):
+        Config.load(None, overrides=[override])
+
+
+def test_frozen_run_config_rejects_mismatched_resume(tmp_path):
+    cfg = Config.load(None)
+    frozen = freeze_run_config(cfg, tmp_path)
+    assert frozen.exists()
+    assert freeze_run_config(Config.load(None), tmp_path) == frozen
+
+    changed = Config.load(None, overrides=["rollout.n=3"])
+    with pytest.raises(ValueError, match="config mismatch"):
+        freeze_run_config(changed, tmp_path)

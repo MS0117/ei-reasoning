@@ -8,6 +8,12 @@
 #   bash scripts/run.sh -b                                # background (nohup) + log file
 #   bash scripts/run.sh -g 2 -- --override rollout.n=4 --iterations 1
 #
+# Every launch gets a FRESH run dir: run.name is overridden to
+# <config run.name>_<YYYYmmdd_HHMMSS>, so re-launching the same config never
+# overwrites an earlier run. To RESUME a crashed/partial run instead, pass its
+# exact (timestamped) name:
+#   bash scripts/run.sh -r ei_qwen3_4b_openr1_20260811_153000
+#
 # Everything after `--` is passed straight to `expert_iter.loop`
 # (e.g. --override a.b=c, --iterations N, --start-iter K, --force STAGE).
 set -euo pipefail
@@ -18,11 +24,13 @@ cd "$REPO_ROOT"
 CONFIG="configs/ei_default.yaml"
 GPUS=""
 BACKGROUND=false
+RESUME_NAME=""
 
-while getopts ":g:c:bh" opt; do
+while getopts ":g:c:r:bh" opt; do
   case "$opt" in
     g) GPUS="$OPTARG" ;;
     c) CONFIG="$OPTARG" ;;
+    r) RESUME_NAME="$OPTARG" ;;
     b) BACKGROUND=true ;;
     h) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     \?) echo "unknown option -$OPTARG (try -h)" >&2; exit 2 ;;
@@ -49,13 +57,22 @@ if [ -z "${NCCL_P2P_DISABLE:-}" ] && command -v nvidia-smi >/dev/null; then
     echo ">>> no NVLink detected: NCCL_P2P_DISABLE=1"
   fi
 fi
-echo ">>> config=$CONFIG  GPUs=${CUDA_VISIBLE_DEVICES:-<all visible>}  extra args: $*"
+# Fresh timestamped run name per launch (resume with -r <exact name>). The
+# override sits BEFORE "$@" so an explicit --override run.name=... still wins.
+if [ -n "$RESUME_NAME" ]; then
+  RUN_NAME="$RESUME_NAME"
+else
+  BASE_NAME="$(grep -m1 -oE '^[[:space:]]*name:[[:space:]]*[^[:space:]#]+' "$CONFIG" | awk '{print $2}')"
+  RUN_NAME="${BASE_NAME:-run}_$(date +%Y%m%d_%H%M%S)"
+fi
+echo ">>> config=$CONFIG  run.name=$RUN_NAME  GPUs=${CUDA_VISIBLE_DEVICES:-<all visible>}  extra args: $*"
 
-CMD=(.venv/bin/python -m expert_iter.loop --config "$CONFIG" "$@")
+CMD=(.venv/bin/python -m expert_iter.loop --config "$CONFIG" \
+     --override "run.name=$RUN_NAME" "$@")
 
 if $BACKGROUND; then
   mkdir -p logs
-  LOG="logs/loop_$(date +%Y%m%d_%H%M%S).log"
+  LOG="logs/loop_${RUN_NAME}.log"
   nohup "${CMD[@]}" > "$LOG" 2>&1 &
   echo ">>> started in background: PID $!"
   echo ">>> follow with: tail -f $LOG"

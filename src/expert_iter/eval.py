@@ -55,12 +55,19 @@ def main(argv: list[str] | None = None) -> None:
             mode="generate", model_path=args.model_path,
             sampling={"temperature": 0.0, "top_p": 1.0, "max_tokens": cfg.eval.max_tokens},
             engine_cfg=cfg.engine, work_dir=out_dir / "pool_greedy",
+            dtype=cfg.model.dtype,
         )
-        correct = sum(
-            verifier.verify(q, r.samples[0]["text"]).correct
-            for q, r in zip(holdout, results)
-        )
-        metrics["pass@1_greedy"] = round(correct / len(holdout), 4)
+        raw_correct = clean_correct = truncated = 0
+        for q, result in zip(holdout, results):
+            sample = result.samples[0]
+            ok = verifier.verify(q, sample["text"]).correct
+            is_clean = sample.get("finish_reason") != "length"
+            raw_correct += ok
+            clean_correct += ok and is_clean
+            truncated += not is_clean
+        metrics["pass@1_greedy"] = round(raw_correct / len(holdout), 4)
+        metrics["pass@1_greedy_clean"] = round(clean_correct / len(holdout), 4)
+        metrics["truncated_rate_greedy"] = round(truncated / len(holdout), 4)
 
     k = cfg.eval.passk.k
     if k > 1:
@@ -74,14 +81,25 @@ def main(argv: list[str] | None = None) -> None:
             sampling={"temperature": cfg.eval.passk.temperature,
                       "top_p": cfg.eval.passk.top_p, "max_tokens": cfg.eval.max_tokens},
             engine_cfg=cfg.engine, work_dir=out_dir / "pool_passk",
+            dtype=cfg.model.dtype,
         )
-        n_pass = n_avg = 0.0
+        n_pass = n_avg = n_pass_clean = n_avg_clean = n_truncated = 0.0
         for q, r in zip(holdout, results):
             oks = [verifier.verify(q, s["text"]).correct for s in r.samples]
+            clean_oks = [
+                ok and s.get("finish_reason") != "length"
+                for ok, s in zip(oks, r.samples)
+            ]
             n_pass += any(oks)
             n_avg += sum(oks) / len(oks)
+            n_pass_clean += any(clean_oks)
+            n_avg_clean += sum(clean_oks) / len(clean_oks)
+            n_truncated += sum(s.get("finish_reason") == "length" for s in r.samples)
         metrics[f"pass@{k}"] = round(n_pass / len(holdout), 4)
         metrics[f"avg@{k}"] = round(n_avg / len(holdout), 4)
+        metrics[f"pass@{k}_clean"] = round(n_pass_clean / len(holdout), 4)
+        metrics[f"avg@{k}_clean"] = round(n_avg_clean / len(holdout), 4)
+        metrics[f"truncated_rate@{k}"] = round(n_truncated / (len(holdout) * k), 4)
 
     write_json(out_path, metrics)
     mark_done(out_path, count=len(holdout), config_hash=cfg.hash())

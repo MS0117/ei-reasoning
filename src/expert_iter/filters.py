@@ -46,7 +46,9 @@ class CorrectnessGate(Gate):
     def check(self, cand, ctx):
         if cand.correct is None:
             q = ctx.questions[cand.qid]
-            full_text = ctx.tokenizer.decode(cand.anchor_token_ids) + cand.continuation_text
+            full_text = ctx.tokenizer.decode(
+                cand.anchor_token_ids + cand.continuation_token_ids
+            )
             verdict = ctx.verifier.verify(
                 QuestionRecord(qid=q.qid, question=q.question, final_answer=q.final_answer),
                 full_text,
@@ -210,6 +212,7 @@ def _logprob_gate(survivors, cfg: Config, model_path: str, it_dir):
     results = run_pool(
         reqs, mode="score", model_path=model_path, sampling={},
         engine_cfg=cfg.engine, work_dir=it_dir / "filtered" / "pool",
+        dtype=cfg.model.dtype,
     )
     thr = cfg.filter.logprob_gate.min_mean_logprob
     kept, n_rej = [], 0

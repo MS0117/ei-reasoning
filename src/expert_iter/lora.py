@@ -9,6 +9,8 @@ to the unchanged engine path. Full models and hub ids pass through untouched.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 from .utils import is_done, mark_done, stable_hash
@@ -18,15 +20,15 @@ def resolve_model_path(model_path: str, dtype: str = "bfloat16") -> str:
     """Return a path vLLM can load directly.
 
     If model_path is a PEFT adapter dir (has adapter_config.json), merge into
-    <adapter_dir>/merged/ (cached via .done marker keyed on adapter+base) and
-    return that; otherwise return model_path unchanged.
+    <adapter_dir>/merged/<content-key>/ and return that; otherwise return
+    model_path unchanged.
     """
     adapter_dir = Path(model_path)
     if not (adapter_dir / "adapter_config.json").exists():
         return model_path
 
-    merged = adapter_dir / "merged"
-    cache_key = stable_hash("lora_merge", str(adapter_dir.resolve()), dtype)
+    cache_key = _adapter_cache_key(adapter_dir, dtype)
+    merged = adapter_dir / "merged" / cache_key
     if is_done(merged / "config.json", config_hash=cache_key):
         print(f"[lora] using cached merge {merged}")
         return str(merged)
@@ -38,14 +40,14 @@ def resolve_model_path(model_path: str, dtype: str = "bfloat16") -> str:
             f"{model_path} is a LoRA adapter dir but peft is not installed; "
             "run `uv sync` (peft is in pyproject) or pass a merged/full checkpoint."
         ) from e
-    import json
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     base = json.loads((adapter_dir / "adapter_config.json").read_text())["base_model_name_or_path"]
     print(f"[lora] merging adapter {adapter_dir} into base {base} -> {merged}")
-    model = AutoModelForCausalLM.from_pretrained(base, dtype=getattr(torch, dtype))
+    torch_dtype = "auto" if dtype == "auto" else getattr(torch, dtype)
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch_dtype)
     model = PeftModel.from_pretrained(model, str(adapter_dir))
     model = model.merge_and_unload()
     model.save_pretrained(merged)
@@ -53,3 +55,28 @@ def resolve_model_path(model_path: str, dtype: str = "bfloat16") -> str:
     AutoTokenizer.from_pretrained(base).save_pretrained(merged)
     mark_done(merged / "config.json", count=1, config_hash=cache_key)
     return str(merged)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _adapter_cache_key(adapter_dir: Path, dtype: str) -> str:
+    """Fingerprint config and actual adapter weights, not merely their path."""
+    config_path = adapter_dir / "adapter_config.json"
+    weights = sorted(
+        p for p in adapter_dir.glob("adapter_model*") if p.is_file()
+    )
+    if not weights:
+        raise RuntimeError(f"LoRA adapter has no adapter_model weights: {adapter_dir}")
+    manifest = [
+        (p.name, p.stat().st_size, _file_sha256(p))
+        for p in weights
+    ]
+    return stable_hash(
+        "lora_merge_v2", dtype, _file_sha256(config_path), manifest,
+    )

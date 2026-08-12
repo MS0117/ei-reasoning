@@ -19,6 +19,11 @@ import yaml
 
 from .utils import write_json
 
+LOOP_STAGES = (
+    "rollout", "partition", "anchor", "improve", "filters",
+    "build_dataset", "train", "eval", "benchmark_eval",
+)
+
 
 # ---------------------------------------------------------------------------
 # Sections
@@ -266,6 +271,69 @@ class Config:
     # -- validation ---------------------------------------------------------
 
     def validate(self) -> None:
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (self.run.name, self.run.output_root)
+        ):
+            raise ValueError("run.name/output_root must be non-empty")
+        if self.run.wandb.mode not in ("online", "offline", "disabled"):
+            raise ValueError(f"run.wandb.mode: {self.run.wandb.mode!r}")
+        if not isinstance(self.model.base, str) or not self.model.base.strip():
+            raise ValueError("model.base must be non-empty")
+        if self.model.dtype not in ("auto", "bfloat16", "float16", "float32"):
+            raise ValueError(f"model.dtype: {self.model.dtype!r}")
+        e = self.engine
+        if e.tensor_parallel < 1:
+            raise ValueError("engine.tensor_parallel must be >= 1")
+        if e.gpus is not None:
+            if (not e.gpus or any(not isinstance(g, int) or g < 0 for g in e.gpus)
+                    or len(set(e.gpus)) != len(e.gpus)):
+                raise ValueError("engine.gpus must be null or a non-empty unique list of non-negative ints")
+            if len(e.gpus) % e.tensor_parallel:
+                raise ValueError("engine.tensor_parallel must divide len(engine.gpus)")
+        if not 0 < e.gpu_memory_utilization <= 1:
+            raise ValueError("engine.gpu_memory_utilization must be in (0, 1]")
+        if e.max_model_len < 1 or e.score_batch_size < 1:
+            raise ValueError("engine max_model_len/score_batch_size must be >= 1")
+        if self.rollout.n < 1 or self.rollout.max_tokens < 1:
+            raise ValueError("rollout.n/max_tokens must be >= 1")
+        if self.rollout.temperature < 0 or not 0 < self.rollout.top_p <= 1:
+            raise ValueError("rollout temperature must be >= 0 and top_p in (0, 1]")
+        if self.rollout.capture_logprobs:
+            raise ValueError("rollout.capture_logprobs=true is not implemented")
+        if self.partition.solved_keep_max < 1:
+            raise ValueError("partition.solved_keep_max must be >= 1")
+        if self.partition.solved_selection not in ("shortest", "first", "random"):
+            raise ValueError(f"partition.solved_selection: {self.partition.solved_selection!r}")
+        if self.anchor.base_selection not in ("first_failed", "longest", "random"):
+            raise ValueError(f"anchor.base_selection: {self.anchor.base_selection!r}")
+        if self.improve.n < 1 or self.improve.max_tokens < 1:
+            raise ValueError("improve.n/max_tokens must be >= 1")
+        if self.improve.temperature < 0 or not 0 < self.improve.top_p <= 1:
+            raise ValueError("improve temperature must be >= 0 and top_p in (0, 1]")
+        if self.improve.rounds != 1:
+            raise ValueError("improve.rounds other than 1 is not implemented")
+        teacher_values = dataclasses.asdict(self.improve.teacher)
+        if self.improve.operator == "teacher" or any(v is not None for v in teacher_values.values()):
+            raise ValueError("the teacher improvement operator/options are not implemented")
+        if self.filter.max_total_tokens < 1 or self.filter.max_per_question < 1:
+            raise ValueError("filter token/per-question limits must be >= 1")
+        if not self.filter.gates or len(set(self.filter.gates)) != len(self.filter.gates):
+            raise ValueError("filter.gates must be a non-empty list without duplicates")
+        if self.filter.logprob_gate.scope not in ("continuation", "full"):
+            raise ValueError(f"filter.logprob_gate.scope: {self.filter.logprob_gate.scope!r}")
+        if self.loop.iterations < 1:
+            raise ValueError("loop.iterations must be >= 1")
+        if not self.loop.stages or len(set(self.loop.stages)) != len(self.loop.stages):
+            raise ValueError("loop.stages must be a non-empty list without duplicates")
+        unknown_stages = set(self.loop.stages) - set(LOOP_STAGES)
+        if unknown_stages:
+            raise ValueError(f"loop.stages contains unknown names: {sorted(unknown_stages)}")
+        order = [LOOP_STAGES.index(stage) for stage in self.loop.stages]
+        if order != sorted(order):
+            raise ValueError(f"loop.stages must follow pipeline order: {LOOP_STAGES}")
+        if self.data.eval_holdout < 0:
+            raise ValueError("data.eval_holdout must be >= 0")
         t = self.train
         if t.objective not in ("sft", "dpo", "sft+dpo"):
             raise ValueError(f"train.objective: {t.objective!r}")
@@ -273,13 +341,25 @@ class Config:
             raise ValueError(f"train.init_from: {t.init_from!r}")
         if t.backend not in ("single", "zero2", "zero3", "fsdp2"):
             raise ValueError(f"train.backend: {t.backend!r}")
-        weights = set(t.sft.region_weights.values())
-        if t.sft.packing and weights != {1.0}:
+        if t.max_seq_len < 2:
+            raise ValueError("train.max_seq_len must be >= 2")
+        if t.sft.lr <= 0 or t.sft.epochs <= 0 or t.dpo.lr <= 0 or t.dpo.epochs <= 0:
+            raise ValueError("train learning rates and epochs must be positive")
+        required_regions = {"prompt", "anchor", "continuation", "solution"}
+        if set(t.sft.region_weights) != required_regions:
+            raise ValueError(f"train.sft.region_weights needs exactly {sorted(required_regions)}")
+        if any(not isinstance(v, (int, float)) or v < 0 for v in t.sft.region_weights.values()):
+            raise ValueError("train.sft.region_weights values must be non-negative numbers")
+        if t.sft.packing:
             raise ValueError(
-                "train.sft.packing=true with non-uniform region_weights is not "
-                "supported: the packed-order weight splicing is not implemented. "
-                "Disable packing or set all region weights to 1.0."
+                "train.sft.packing=true is not implemented by WeightedCausalCollator"
             )
+        for name, global_bs, micro_bs in (
+            ("sft", t.sft.global_batch_size, t.sft.micro_batch_size),
+            ("dpo", t.dpo.global_batch_size, t.dpo.micro_batch_size),
+        ):
+            if global_bs < 1 or micro_bs < 1 or global_bs % micro_bs:
+                raise ValueError(f"train.{name} batch sizes must be positive and global divisible by micro")
         if self.filter.max_total_tokens > t.max_seq_len:
             raise ValueError(
                 f"filter.max_total_tokens ({self.filter.max_total_tokens}) exceeds "
@@ -290,8 +370,10 @@ class Config:
                 f"engine.max_model_len ({self.engine.max_model_len}) < train.max_seq_len "
                 f"({t.max_seq_len}): logprob scoring of full trajectories would fail."
             )
-        if self.partition.solved_selection not in ("shortest", "first", "random"):
-            raise ValueError(f"partition.solved_selection: {self.partition.solved_selection!r}")
+        if self.eval.passk.k < 1 or self.eval.max_tokens < 1:
+            raise ValueError("eval.passk.k/max_tokens must be >= 1")
+        if self.eval.passk.temperature < 0 or not 0 < self.eval.passk.top_p <= 1:
+            raise ValueError("eval.passk temperature must be >= 0 and top_p in (0, 1]")
         if self.eval.benchmark_every < 1:
             raise ValueError(f"eval.benchmark_every must be >= 1, got {self.eval.benchmark_every}")
         seen_bench = set()
@@ -303,6 +385,10 @@ class Config:
             seen_bench.add(b.name)
             if b.n < 1:
                 raise ValueError(f"eval.benchmarks[{i}] ({b.name}): n must be >= 1")
+            if b.temperature < 0 or not 0 < b.top_p <= 1:
+                raise ValueError(f"eval.benchmarks[{i}] sampling values are invalid")
+            if not 0 <= b.min_p <= 1 or b.top_k < -1 or b.max_tokens < 1:
+                raise ValueError(f"eval.benchmarks[{i}] sampling values are invalid")
 
 
 # ---------------------------------------------------------------------------
@@ -370,24 +456,42 @@ def _set_dotted(d: dict, dotted: str, value) -> None:
 # Shared stage CLI
 # ---------------------------------------------------------------------------
 
-def stage_argparser(description: str) -> argparse.ArgumentParser:
+def stage_argparser(description: str, model_required: bool = True) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=description)
     p.add_argument("--config", required=True, help="path to the YAML config")
     p.add_argument("--override", action="append", default=[], metavar="a.b=c",
                    help="dot-path config override (repeatable)")
     p.add_argument("--run-dir", required=True, help="runs/<name> directory")
     p.add_argument("--iter", type=int, required=True, dest="iteration")
-    p.add_argument("--model-path", required=True,
-                   help="HF hub id or local checkpoint dir of the CURRENT policy")
+    # model_required=False for stages that also run standalone on an arbitrary
+    # model (benchmark_eval): they fall back to cfg.model.base. Under the loop
+    # driver the current policy is always passed explicitly.
+    p.add_argument("--model-path", required=model_required, default=None,
+                   help="HF hub id or local checkpoint dir of the CURRENT policy"
+                        + ("" if model_required else " (default: cfg.model.base)"))
     return p
+
+
+def freeze_run_config(cfg: Config, run_dir: str | Path) -> Path:
+    """Create the immutable run snapshot, or reject a mismatched resume."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    frozen = run_dir / "config.yaml"
+    if frozen.exists():
+        frozen_cfg = Config.load(frozen)
+        if frozen_cfg.hash() != cfg.hash():
+            raise ValueError(
+                f"run config mismatch for {run_dir}: frozen={frozen_cfg.hash()} "
+                f"requested={cfg.hash()}; use the frozen config or a new run.name"
+            )
+    else:
+        cfg.save(frozen)
+        write_json(run_dir / "config.hash.json", {"config_hash": cfg.hash()})
+    return frozen
 
 
 def load_stage_config(args: argparse.Namespace) -> Config:
     cfg = Config.load(args.config, overrides=args.override)
     run_dir = Path(args.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    frozen = run_dir / "config.yaml"
-    if not frozen.exists():
-        cfg.save(frozen)
-        write_json(run_dir / "config.hash.json", {"config_hash": cfg.hash()})
+    freeze_run_config(cfg, run_dir)
     return cfg

@@ -57,46 +57,15 @@ def main(argv: list[str] | None = None) -> None:
         for s, v in zip(rollouts, verdicts)
     ]
 
-    by_qid: dict[str, list[tuple[RolloutSample, bool]]] = defaultdict(list)
-    for s, v in zip(rollouts, verdicts):
-        by_qid[s.qid].append((s, v.correct))
-
-    rng = random.Random(cfg.run.seed)
-    solved_rows: list[SolvedTrajectory] = []
-    unsolved_rows: list[UnsolvedQuestion] = []
-    n_solved_q = 0
-    for qid, pairs in by_qid.items():
-        q = questions[qid]
-        # Only cleanly-finished correct samples are trainable as-is; a
-        # truncated sample can grade "correct" if a boxed answer appears
-        # mid-text, but training on it teaches non-termination.
-        correct = [s for s, ok in pairs if ok and s.finish_reason == "stop"]
-        if correct:
-            n_solved_q += 1
-            solved_rows.extend(
-                SolvedTrajectory(
-                    qid=qid, question=q.question, final_answer=q.final_answer,
-                    sample_idx=s.sample_idx, prompt_token_ids=s.prompt_token_ids,
-                    response_token_ids=s.response_token_ids, response_text=s.response_text,
-                    iter=args.iteration,
-                )
-                for s in _select(correct, cfg.partition.solved_keep_max,
-                                  cfg.partition.solved_selection, rng)
-            )
-        else:
-            failed = [s for s, ok in pairs if not ok]
-            if failed:
-                unsolved_rows.append(UnsolvedQuestion(
-                    qid=qid, question=q.question, final_answer=q.final_answer,
-                    failed_sample_idxs=[s.sample_idx for s in failed],
-                    iter=args.iteration,
-                ))
+    (
+        solved_rows, unsolved_rows, n_solved_q, n_q,
+        n_clean_correct, n_truncated_correct,
+    ) = _partition_rows(questions, rollouts, verdicts, cfg, args.iteration)
 
     VerdictRecord.dump_jsonl(out_dir / "verdicts.jsonl", verdict_rows)
     n_solved = SolvedTrajectory.dump_jsonl(solved_path, solved_rows)
     UnsolvedQuestion.dump_jsonl(out_dir / "unsolved.jsonl", unsolved_rows)
 
-    n_q = len(by_qid)
     stats = {
         "iter": args.iteration,
         "n_questions": n_q,
@@ -104,6 +73,8 @@ def main(argv: list[str] | None = None) -> None:
         "n_unsolved_questions": len(unsolved_rows),
         "solve_rate": round(n_solved_q / n_q, 4) if n_q else 0.0,
         "sample_accuracy": round(sum(v.correct for v in verdicts) / len(verdicts), 4) if verdicts else 0.0,
+        "clean_sample_accuracy": round(n_clean_correct / len(verdicts), 4) if verdicts else 0.0,
+        "n_truncated_correct": n_truncated_correct,
         "n_solved_trajectories_kept": n_solved,
     }
     write_json(out_dir / "stats.json", stats)
@@ -120,6 +91,64 @@ def _select(samples: list[RolloutSample], keep: int, how: str, rng: random.Rando
     else:  # first
         ranked = sorted(samples, key=lambda s: s.sample_idx)
     return ranked[:keep]
+
+
+def _partition_rows(questions, rollouts, verdicts, cfg, iteration: int):
+    """Split every question exactly once; truncated-correct samples are unsolved."""
+    by_qid: dict[str, list[tuple[RolloutSample, bool]]] = defaultdict(list)
+    for sample, verdict in zip(rollouts, verdicts, strict=True):
+        by_qid[sample.qid].append((sample, verdict.correct))
+
+    missing = sorted(set(questions) - set(by_qid))
+    unexpected = sorted(set(by_qid) - set(questions))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"rollout/question mismatch: missing={missing[:5]}, unexpected={unexpected[:5]}"
+        )
+
+    rng = random.Random(cfg.run.seed)
+    solved_rows: list[SolvedTrajectory] = []
+    unsolved_rows: list[UnsolvedQuestion] = []
+    n_solved_q = 0
+    n_clean_correct = 0
+    n_truncated_correct = 0
+    for qid, pairs in by_qid.items():
+        q = questions[qid]
+        clean_correct = [s for s, ok in pairs if ok and s.finish_reason == "stop"]
+        n_clean_correct += len(clean_correct)
+        n_truncated_correct += sum(
+            1 for s, ok in pairs if ok and s.finish_reason != "stop"
+        )
+        if clean_correct:
+            n_solved_q += 1
+            solved_rows.extend(
+                SolvedTrajectory(
+                    qid=qid, question=q.question, final_answer=q.final_answer,
+                    sample_idx=s.sample_idx, prompt_token_ids=s.prompt_token_ids,
+                    response_token_ids=s.response_token_ids, response_text=s.response_text,
+                    iter=iteration,
+                )
+                for s in _select(
+                    clean_correct, cfg.partition.solved_keep_max,
+                    cfg.partition.solved_selection, rng,
+                )
+            )
+        else:
+            rejected = [
+                s for s, ok in pairs if not (ok and s.finish_reason == "stop")
+            ]
+            unsolved_rows.append(UnsolvedQuestion(
+                qid=qid, question=q.question, final_answer=q.final_answer,
+                failed_sample_idxs=[s.sample_idx for s in rejected],
+                iter=iteration,
+            ))
+
+    if n_solved_q + len(unsolved_rows) != len(by_qid):
+        raise AssertionError("partition did not classify every question")
+    return (
+        solved_rows, unsolved_rows, n_solved_q, len(by_qid),
+        n_clean_correct, n_truncated_correct,
+    )
 
 
 if __name__ == "__main__":

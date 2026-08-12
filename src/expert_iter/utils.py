@@ -75,8 +75,11 @@ def mark_done(output: str | Path, *, count: int, config_hash: str, extra: dict |
 
 
 def is_done(output: str | Path, *, config_hash: str | None = None) -> bool:
+    output = Path(output)
     marker = done_marker(output)
-    if not marker.exists():
+    # A marker without its primary artifact can be left behind by a manual
+    # cleanup or by a buggy/partial producer. Never trust that phantom marker.
+    if not output.exists() or not marker.exists():
         return False
     if config_hash is None:
         return True

@@ -42,12 +42,13 @@ class MathVerifier(Verifier):
     prefers the last \\boxed{...}, falling back to the last expression.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, timeout_seconds: int = 5) -> None:
         # Import here so merely constructing other verifiers never needs math_verify.
         from math_verify import parse, verify
 
         self._parse = parse
         self._verify = verify
+        self._timeout = timeout_seconds
 
     def verify(self, question: QuestionRecord, response_text: str) -> Verdict:
         try:
@@ -57,7 +58,8 @@ class MathVerifier(Verifier):
             pred = self._parse(response_text)
             if not pred:
                 return Verdict(False, meta={"error": "pred_unparsable"})
-            ok = bool(self._verify(gold, pred))
+            # timeout: sympy can hang on pathological latex (same guard as strict).
+            ok = bool(self._verify(gold, pred, timeout_seconds=self._timeout))
             return Verdict(ok, extracted_answer=_repr_short(pred))
         except Exception as e:  # math-verify can raise on pathological latex
             return Verdict(False, meta={"error": f"{type(e).__name__}: {e}"})

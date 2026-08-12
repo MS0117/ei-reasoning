@@ -1,15 +1,21 @@
-# Standalone benchmark evaluation config — currently set up for hybrid-thinking
-# Qwen3 (0.6B/4B/8B) in THINKING mode: enable_thinking on, temp .6 / top_p .95 /
-# top_k 20 (Qwen best practice), 32k generation room, n=64 so summarize_benchmark
-# reports unbiased pass@{1,2,...,64} on the 30-problem competition sets.
+# Standalone benchmark evaluation config — currently set up for Qwen3-4B-Instruct
+# -2507 in NON-THINKING mode: enable_thinking off, temp .6 / top_p .95 / top_k 20,
+# 16k generation room, n=64 so summarize_benchmark reports unbiased
+# pass@{1,2,...,64} on the 30-problem competition sets.
 #
+#   bash scripts/eval_bench.sh -g 0,1 -b                        # model.base below
 #   bash scripts/eval_bench.sh Qwen/Qwen3-4B -g 0,1 -b
 #   bash scripts/eval_bench.sh runs/ei_qwen3_4b/iter_2/ckpt
 #   bash scripts/eval_bench.sh /path/to/lora_adapter_dir        # auto-merged
 #
-# The model comes from the launcher's --model-path; model.base here is unused.
-# For NON-thinking models (e.g. Qwen3-4B-Instruct-2507) switch to temp 0.7 /
-# top_p 0.8, max_tokens 16384 and drop chat_template_kwargs.
+# Hyperparameter map:
+#   model    -> model.base (or the launcher's MODEL argument, which wins)
+#   thinking -> model.chat_template_kwargs.enable_thinking (currently OFF)
+#   grading  -> eval.benchmark_verifier (math_strict = literature-comparable)
+#   sets     -> eval.benchmarks[].{name, n, temperature, top_p, top_k, max_tokens}
+#
+# For THINKING models switch enable_thinking on and raise max_tokens to ~32768;
+# temp .6 / top_p .95 / top_k 20 below is already the Qwen3 recommendation.
 
 run:
   name: bench_eval
@@ -18,20 +24,28 @@ run:
     mode: online                # no API key -> auto-falls back to offline (wandb sync later)
 
 model:
-  chat_template_kwargs: {enable_thinking: true}   # hybrid Qwen3 thinking mode
+  # Evaluated model. The launcher's MODEL argument overrides this when given:
+  #   bash scripts/eval_bench.sh            -> model.base (this line)
+  #   bash scripts/eval_bench.sh MODEL      -> MODEL
+  # Accepts an HF hub id, an EI checkpoint dir, or a LoRA adapter dir (auto-merged).
+  base: Qwen/Qwen3-4B-Instruct-2507
+  # THINKING MODE: OFF. Qwen3-*-2507 Instruct is non-thinking by construction
+  # (no switch in its template, so the flag is ignored there); the flag is what
+  # actually toggles thinking on hybrid Qwen3 (0.6B/4B/8B).
+  chat_template_kwargs: {enable_thinking: false}
 
 engine:
   gpus: null                    # CUDA_VISIBLE_DEVICES -> all visible
   tensor_parallel: 1
-  gpu_memory_utilization: 0.75  # GPUs are shared: size to the free memory at launch
+  gpu_memory_utilization: 0.8  # GPUs are shared: size to the free memory at launch
   max_model_len: 12288          # auto-raised per benchmark to fit prompt+max_tokens
 
 eval:
   greedy_pass1: false           # holdout eval not used standalone
   benchmark_verifier: math_strict
   benchmarks:
-    - {name: aime24, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 32768}
-    - {name: aime25, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 32768}
-    - {name: aime26, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 32768}
-    - {name: hmmt25, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 32768}
-    - {name: math500_hard, n: 8, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 8192}
+    - {name: aime24, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: aime25, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: aime26, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: hmmt25, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: math500_hard, n: 8, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}

@@ -35,3 +35,9 @@ def test_ensure_boxed_idempotent():
 def test_garbage_response_not_correct():
     v = MathVerifier()
     assert not v.verify(q("42"), "I have no idea!!! ####").correct
+
+
+def test_timeout_configurable_grading_unchanged():
+    v = MathVerifier(timeout_seconds=1)
+    assert v.verify(q("42"), r"\boxed{42}").correct
+    assert not v.verify(q("42"), r"\boxed{41}").correct

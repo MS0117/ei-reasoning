@@ -92,32 +92,32 @@ train-less stage lists).
 ### Plumbing
 | file | role |
 |---|---|
-| `config.py` | Nested dataclasses ↔ one YAML; dot-path `--override a.b=c`; validation (e.g. packing × region-weights conflict); config hash for `.done` markers; shared stage CLI (`--config/--run-dir/--iter/--model-path`). |
+| `config.py` | Nested dataclasses ↔ one YAML; dot-path `--override a.b=c`; validation; immutable per-run config snapshot (mismatched resumes fail); config hash for `.done` markers; shared stage CLI. |
 | `records.py` | Typed records for every stage boundary (`RolloutSample`, `SolvedTrajectory`, `AnchorRecord`, `ImprovedCandidate`, `SFTExample`, `DPOExample`, …) with JSONL (de)serialization and invariant checks (`SFTExample.validate`). |
 | `registry.py` | Tiny name→class registries (`ADAPTERS`, `VERIFIERS`, `ANCHOR_POLICIES`, `OPERATORS`, `GATES`). Adding a component = one class + one `@register` decorator. |
 | `utils.py` | Atomic JSONL writes (tmp+rename), `.done` markers, stable hashing/seeding, GPU-list resolution, run-dir helpers, atomic symlinks. |
 | `templates.py` | The ONE text→ids location: chat-templates the question (`add_generation_prompt=True`), builds continuation prompts / training inputs by id concatenation, `ensure_eos`. |
-| `engine.py` | vLLM **data-parallel pool**: shards requests round-robin into per-worker JSONL, spawns one worker subprocess per GPU group (own `CUDA_VISIBLE_DEVICES`), merges results. Two modes: `generate` (sampling; per-request stable seeds ⇒ reproducible for a FIXED pool topology — pool size/GPU model changes alter numerics and thus samples) and `score` (teacher-forced per-token logprobs via `prompt_logprobs`, used by the trainability gate). |
+| `engine.py` | vLLM **data-parallel pool**: shards requests into worker subprocesses, auto-fits context, and resumes only when model/request/sampling/engine keys match. `generate` uses stable per-request seeds (fixed pool topology); `score` provides teacher-forced suffix logprobs. |
 
 ### Data & grading
 | file | role |
 |---|---|
 | `data.py` | `DatasetAdapter` registry → canonical `QuestionRecord{qid, question, final_answer, domain}`. `openthoughts_math` (filters OpenThoughts-114k to verifiable math; never reads its R1 traces), `local_jsonl`, `hf_benchmark` (+ `BENCHMARK_PRESETS`: aime24/25/26, hmmt25, math500[_hard]; qids namespaced `bench-*` so they can never collide with training qids). Deterministic qid-hash holdout split, frozen per run. |
 | `verifier.py` | `Verifier` registry: `math` (math-verify; gold wrapped in `\boxed{}`, pred = last boxed expression), `math_strict` (benchmark grading, OPSD semantics: last-`\boxed` extraction or wrong + format-rate, `no_fallback` parse, verify timeout, string-equality fallback) and `lean` (kimina HTTP client, lazily imported — math-only machines never need the Lean stack). |
-| `lora.py` | `resolve_model_path`: PEFT adapter dirs are merged into their base once (cached at `<adapter>/merged/`) so every inference stage keeps loading plain full checkpoints; full models/hub ids pass through. |
+| `lora.py` | `resolve_model_path`: PEFT adapters are merged into content-addressed `<adapter>/merged/<key>/` caches keyed by config, actual weight bytes, and dtype; full models/hub ids pass through. |
 
 ### The loop stages
 | file | role |
 |---|---|
 | `rollout.py` | π_k samples `rollout.n` responses per train question → `rollouts.jsonl`. |
-| `partition.py` | Grades every sample; questions with ≥1 correct **cleanly-finished** sample → `solved.jsonl` (≤ `solved_keep_max` per question, shortest-first); zero-correct questions → `unsolved.jsonl`; writes `stats.json` (solve-rate = the headline metric). |
+| `partition.py` | Grades every sample; questions with ≥1 correct **cleanly-finished** sample → `solved.jsonl`; every other question (including truncated-correct only) → `unsolved.jsonl`; reports raw and clean sample accuracy. |
 | `anchor.py` | ⚗ **(I)** `AnchorPolicy.select_len(question, failed_rollout, params) -> int`. Baselines: `fixed_fraction` (keep first ρ of the failed response, clamped), `none` (pure resample ⇒ STaR/rejection-sampling ablation). |
 | `improve.py` | ⚗ **(II)** `ImprovementOperator.propose(...) -> list[ImprovedCandidate]`. Baseline `self_resample`: best-of-n continuation of `question+anchor` by the policy itself at higher temperature (trivially learnability-safe). `teacher` is a stub whose docstring specifies the external-context contract. |
 | `filters.py` | ⚗ **(III)** ordered gate chain: `correctness` (verifier on anchor+continuation), `no_external_context`, `length`, `dedup` (continuation-id hash), optional batched `logprob_gate` (mean policy logprob threshold via engine `score` mode), then a `max_per_question` quota (shortest-first). Writes per-gate reject counts. |
 | `build_dataset.py` | Assembles train-ready examples. Solved → `[prompt][solution]`; improved → `[prompt][anchor][continuation]` (+EOS). Stores **region lengths, not baked weights**, so weight sweeps need no data rebuild. Builds DPO pairs sharing `prompt+anchor` (chosen = improved continuation, rejected = the same failed rollout's suffix). Merges prior iterations when `data.accumulate`. |
 | `train.py` | ⚗ **(IV)** `WeightedSFTTrainer` (subclasses `transformers.Trainer`; per-token region-weighted CE; normalization invariant to micro-batch/accum/DP topology — see `tests/test_loss_invariance.py`) and anchor-conditioned `trl.DPOTrainer`. `objective: sft | dpo | sft+dpo`. Saves one full HF checkpoint (gather flags per backend) with a post-save sanity assertion. |
-| `eval.py` | Greedy pass@1 + sampled pass@k / avg@k on the frozen holdout (in-distribution progress; cheap, every iteration). |
-| `benchmark_eval.py` | External competition benchmarks with literature-comparable grading (`math_strict`): pass@n / avg@n / majority-vote@n / format & truncation rates per benchmark, `eval.benchmark_every` cadence, per-benchmark resume. Also runs standalone on any HF model / checkpoint / LoRA adapter via `scripts/eval_bench.sh`. |
+| `eval.py` | Greedy and sampled pass/avg metrics on the frozen holdout, with raw verifier scores and clean (non-truncated) variants. |
+| `benchmark_eval.py` | External competition benchmarks with `math_strict`: pass@n / avg@n / equivalence-aware majority@n / format & truncation rates, cadence and per-benchmark resume. Load failures remain incomplete and are retried. |
 | `loop.py` | The driver described above: stage sequencing, model resolution, resume, symlinks, `metrics.jsonl` aggregation. |
 
 ### Outside `src/`

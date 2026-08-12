@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-from .config import Config
+from .config import Config, freeze_run_config
 from .wandb_utils import DRIVER_ENV, init_wandb, log_metrics
 from .utils import (
     append_jsonl,
@@ -64,8 +64,7 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = Config.load(args.config, overrides=args.override)
     run_dir = Path(cfg.run.output_root) / cfg.run.name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    cfg.save(run_dir / "config.yaml")
+    freeze_run_config(cfg, run_dir)
     n_iters = args.iterations if args.iterations is not None else cfg.loop.iterations
     n_gpus = len(visible_gpus(cfg.engine.gpus))
     print(f"[loop] run={cfg.run.name} iterations={n_iters} gpus={n_gpus} "

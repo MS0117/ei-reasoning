@@ -33,6 +33,10 @@ bash scripts/smoke.sh [GPU_ID]
 # HF hub id, EI checkpoint, or LoRA adapter dir (auto-merged)
 bash scripts/eval_bench.sh Qwen/Qwen3-4B-Instruct-2507 [-c configs/bench_eval.yaml] [-g 0,1] [-b]
 
+# run.sh / eval_bench.sh / data/run_passrate.sh all create a FRESH timestamped
+# run dir per launch (never overwrite); resume a crashed run with -r <name|dir>
+
+
 # verify the installed API surface (regenerates data behind docs/api_notes.md)
 .venv/bin/python scripts/check_env.py --skip-gpu
 ```

@@ -30,11 +30,11 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from .config import EngineCfg
-from .utils import is_done, mark_done, read_jsonl, visible_gpus, write_jsonl
+from .utils import is_done, mark_done, read_jsonl, stable_hash, visible_gpus, write_jsonl
 
 
 @dataclass
@@ -74,8 +74,19 @@ def run_pool(
     engine_cfg: EngineCfg,
     work_dir: str | Path,
     gpus: list[int] | None = None,   # override engine_cfg.gpus (e.g. teacher split)
+    dtype: str = "bfloat16",
 ) -> list[GenResult]:
     assert mode in ("generate", "score"), mode
+    if not requests:
+        return []
+    extra_tokens = sampling.get("max_tokens", 0) if mode == "generate" else 0
+    required_context = max(len(r.prompt_token_ids) for r in requests) + extra_tokens
+    if required_context > engine_cfg.max_model_len:
+        engine_cfg = replace(engine_cfg, max_model_len=required_context)
+    rids = [r.rid for r in requests]
+    if len(set(rids)) != len(rids):
+        dupes = sorted(rid for rid in set(rids) if rids.count(rid) > 1)
+        raise ValueError(f"GenRequest.rid must be unique; duplicates: {dupes[:5]}")
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +94,11 @@ def run_pool(
     if not gpu_ids:
         raise RuntimeError("no GPUs available (engine.gpus / CUDA_VISIBLE_DEVICES empty)")
     tp = max(1, engine_cfg.tensor_parallel)
-    n_workers = max(1, len(gpu_ids) // tp)
+    if tp > len(gpu_ids) or len(gpu_ids) % tp:
+        raise ValueError(
+            f"tensor_parallel={tp} must divide the {len(gpu_ids)} visible GPU(s): {gpu_ids}"
+        )
+    n_workers = len(gpu_ids) // tp
     worker_gpus = [gpu_ids[i * tp:(i + 1) * tp] for i in range(n_workers)]
 
     # Deterministic sharding (round-robin over rid-sorted requests).
@@ -96,11 +111,16 @@ def run_pool(
         out_path = work_dir / f"out_{wi}.jsonl"
         log_path = work_dir / f"worker_{wi}.log"
         write_jsonl(in_path, (r.to_dict() for r in shard))
+        worker_key = stable_hash(
+            "pool_worker_v2", mode, _model_fingerprint(model_path), sampling,
+            asdict(engine_cfg), dtype, tuple(wgpus),
+            tuple(r.to_dict() for r in shard),
+        )
         if not shard:
             write_jsonl(out_path, [])
-            mark_done(out_path, count=0, config_hash="empty")
+            mark_done(out_path, count=0, config_hash=worker_key)
             continue
-        if is_done(out_path):
+        if is_done(out_path, config_hash=worker_key):
             continue  # worker-level resume
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in wgpus)
@@ -111,9 +131,11 @@ def run_pool(
             "--model", model_path, "--mode", mode,
             "--input", str(in_path), "--output", str(out_path),
             "--sampling-json", json.dumps(sampling),
+            "--cache-key", worker_key,
             "--engine-json", json.dumps({
                 "tensor_parallel": tp,
                 "gpu_memory_utilization": engine_cfg.gpu_memory_utilization,
+                "dtype": dtype,
                 "max_model_len": engine_cfg.max_model_len,
                 "enable_prefix_caching": engine_cfg.enable_prefix_caching,
                 "enforce_eager": engine_cfg.enforce_eager,
@@ -121,7 +143,9 @@ def run_pool(
             }),
         ]
         log_f = log_path.open("w")
-        procs.append((subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT), out_path, log_path))
+        proc = subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT)
+        log_f.close()  # the child owns its duplicated descriptor
+        procs.append((proc, out_path, log_path))
 
     _wait_all(procs, total=len(ordered), work_dir=work_dir, n_workers=n_workers)
 
@@ -133,6 +157,28 @@ def run_pool(
     if missing:
         raise RuntimeError(f"pool returned no result for {len(missing)} requests, e.g. {missing[:5]}")
     return [results[r.rid] for r in requests]
+
+
+def _model_fingerprint(model_path: str) -> str:
+    """Fast cache identity for a hub reference or local checkpoint.
+
+    Local model weights are often many GB, so use a root-file manifest rather
+    than rereading them before every stage. Size + nanosecond mtime catches
+    ordinary checkpoint replacement; immutable/revision-pinned hub ids remain
+    reproducible by their literal reference.
+    """
+    path = Path(model_path)
+    if not path.exists():
+        return stable_hash("hub_model", model_path)
+    if path.is_file():
+        st = path.stat()
+        return stable_hash("model_file", str(path.resolve()), st.st_size, st.st_mtime_ns)
+    manifest = []
+    for p in sorted(path.iterdir(), key=lambda x: x.name):
+        if p.is_file():
+            st = p.stat()
+            manifest.append((p.name, st.st_size, st.st_mtime_ns))
+    return stable_hash("model_dir", str(path.resolve()), tuple(manifest))
 
 
 def _wait_all(procs, *, total: int, work_dir: Path, n_workers: int) -> None:
@@ -176,6 +222,7 @@ def _worker(argv: list[str]) -> None:
     ap.add_argument("--output", required=True)
     ap.add_argument("--sampling-json", required=True)
     ap.add_argument("--engine-json", required=True)
+    ap.add_argument("--cache-key", required=True)
     args = ap.parse_args(argv)
 
     sampling = json.loads(args.sampling_json)
@@ -186,7 +233,7 @@ def _worker(argv: list[str]) -> None:
 
     llm = LLM(
         model=args.model,
-        dtype="bfloat16",
+        dtype=ecfg["dtype"],
         tensor_parallel_size=ecfg["tensor_parallel"],
         gpu_memory_utilization=ecfg["gpu_memory_utilization"],
         max_model_len=ecfg["max_model_len"],
@@ -251,7 +298,7 @@ def _worker(argv: list[str]) -> None:
                 ).__dict__)
 
     n = write_jsonl(args.output, rows)
-    mark_done(args.output, count=n, config_hash="worker")
+    mark_done(args.output, count=n, config_hash=args.cache_key)
     print(f"[worker] wrote {n} results to {args.output}", flush=True)
 
 

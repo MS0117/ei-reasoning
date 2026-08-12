@@ -139,8 +139,15 @@ def _merge(run_dir, iteration: int, filename: str, current: list, record_cls, *,
 
 
 def _content_key(r) -> str:
-    ids = getattr(r, "input_ids", None) or getattr(r, "chosen_token_ids")
-    return stable_hash(r.qid, tuple(ids))
+    input_ids = getattr(r, "input_ids", None)
+    if input_ids is not None:
+        return stable_hash("sft", r.qid, tuple(input_ids))
+    return stable_hash(
+        "dpo", r.qid,
+        tuple(r.prompt_token_ids),
+        tuple(r.chosen_token_ids),
+        tuple(r.rejected_token_ids),
+    )
 
 
 if __name__ == "__main__":

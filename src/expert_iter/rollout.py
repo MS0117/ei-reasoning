@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> None:
         },
         engine_cfg=cfg.engine,
         work_dir=out_dir / "pool",
+        dtype=cfg.model.dtype,
     )
 
     def rows():

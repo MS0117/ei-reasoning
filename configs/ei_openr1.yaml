@@ -1,7 +1,8 @@
 # Expert-iteration config: Qwen3-4B-Instruct-2507 on open-r1/OpenR1-Math-220k
 # via the hf_math adapter — a seeded random n_questions sample (order-
-# independent), not a head-truncation. First run scans all ~94k rows once for
-# gold parsability, then questions freeze into runs/<name>/questions/.
+# independent), not a head-truncation. First run scans all ~94k rows once
+# through the metadata filters below + gold parsability (keeping the
+# math-verify-verifiable ~2/3), then questions freeze into runs/<name>/questions/.
 # Any field can be overridden on the CLI: --override rollout.n=4
 # GPU topology is NEVER hardcoded here: engine.gpus null means "use
 # CUDA_VISIBLE_DEVICES, else all visible devices".
@@ -31,9 +32,13 @@ engine:
 data:
   adapter: hf_math
   adapter_args:
-    hf_name: open-r1/OpenR1-Math-220k
-    config: default
-    split: train
+    # Expands to open-r1/OpenR1-Math-220k default split + metadata cleanup
+    # (HF_MATH_PRESETS in data.py): MCQ out (17% — gold is a choice letter;
+    # letter/value mismatch misgrades, 4-way guessing pollutes pass rates) via
+    # question_type, and rows upstream math-verify never graded an R1
+    # generation correct against out (multi-part/text/proof golds, the
+    # llama-judge-rescued 12%) via correctness_math_verify. ~59k of 94k kept.
+    preset: openr1
     n_questions: 2000         # seeded random sample (replaces max_items head-truncation)
     seed: 17
   question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."

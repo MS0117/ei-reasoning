@@ -151,8 +151,18 @@ fi
 log "Running kimina setup.sh (builds Lean REPL + optionally Mathlib)"
 if $SKIP_MATHLIB; then
   log "  --skip-mathlib set: skipping Mathlib download (~50 GB)"
-  # Run setup.sh but stop before mathlib; set env var if supported
-  SKIP_MATHLIB_BUILD=true bash setup.sh || true
+  # Upstream setup.sh has no skip hook and always installs mathlib4. Build only
+  # the REPL here; the server package is installed below, but proof checking
+  # needs a Lean project before it can be started.
+  if [ ! -d repl ]; then
+    git clone --branch "$LEAN_VERSION" --single-branch --depth 1 \
+      https://github.com/leanprover-community/repl.git repl
+  fi
+  (
+    cd repl
+    git checkout "$LEAN_VERSION"
+    lake build
+  )
 else
   bash setup.sh
 fi
@@ -174,6 +184,18 @@ uv pip install --python .venv/bin/python -e ".[server]"
 # PATH for generate to find it.
 log "Generating Prisma client"
 PATH="$KIMINA_DIR/.venv/bin:$PATH" .venv/bin/python -m prisma generate
+
+if $SKIP_MATHLIB; then
+  log "Setup complete (--skip-mathlib; server smoke test skipped)"
+  cat <<EOF
+
+  expert-iter venv : $EXPERT_ITER_DIR/.venv
+  kimina server    : $KIMINA_DIR/.venv
+  Mathlib was not installed. Add a Lean project and set
+  LEAN_SERVER_PROJECT_DIR before starting the server.
+EOF
+  exit 0
+fi
 
 # ─── 4. Smoke test ──────────────────────────────────────────────────────────
 log "Starting kimina server for smoke test (background)"

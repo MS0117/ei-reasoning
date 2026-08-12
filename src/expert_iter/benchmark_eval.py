@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import dataclasses
 import sys
-from collections import Counter
 from math import comb
 from pathlib import Path
 
@@ -47,8 +46,11 @@ from . import verifier as _verifier_registration  # noqa: F401 — @register sid
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = stage_argparser("EI benchmark_eval stage").parse_args(argv)
+    args = stage_argparser("EI benchmark_eval stage", model_required=False).parse_args(argv)
     cfg = load_stage_config(args)
+    # Standalone (scripts/eval_bench.sh with no MODEL): grade the config's own
+    # model.base. Under the loop driver --model-path is always the current policy.
+    args.model_path = args.model_path or cfg.model.base
     out_dir = iter_dir(args.run_dir, args.iteration) / "benchmark_eval"
     out_path = out_dir / "metrics.json"
     if is_done(out_path, config_hash=cfg.hash()):
@@ -81,12 +83,14 @@ def main(argv: list[str] | None = None) -> None:
                 "benchmarks": [dataclasses.asdict(b) for b in cfg.eval.benchmarks]},
     )
 
+    failed_benchmarks = []
     for bench in cfg.eval.benchmarks:
         try:
             questions = _frozen_questions(args.run_dir, bench)
         except Exception as e:
             print(f"[benchmark_eval] {bench.name}: LOAD FAILED — {type(e).__name__}: {e}")
             metrics[f"{bench.name}/error"] = f"{type(e).__name__}: {e}"
+            failed_benchmarks.append(bench.name)
             log_metrics(wb, {f"{bench.name}/error": metrics[f"{bench.name}/error"]})
             continue
 
@@ -98,8 +102,8 @@ def main(argv: list[str] | None = None) -> None:
             cfg.model.system_prompt, cfg.data.question_suffix, cfg.model.chat_template_kwargs,
         )
         if not is_done(samples_path, config_hash=bench_key):
-            # Pool work dir embeds the key: run_pool's worker-level resume is
-            # not config-aware, so stale shards must never alias a new spec.
+            # Keep pool artifacts grouped by the benchmark sample key for easy
+            # inspection; run_pool additionally validates every worker cache.
             rows = _generate_and_grade(bench, questions, tokenizer, grader, cfg, model_path,
                                        work_dir=out_dir / bench.name / f"pool_{bench_key[:8]}")
             write_jsonl(samples_path, rows)
@@ -114,8 +118,11 @@ def main(argv: list[str] | None = None) -> None:
             f"{k.split('/', 1)[1]}={v}" for k, v in metrics.items() if k.startswith(f"{bench.name}/")
         ))
 
+    if failed_benchmarks:
+        metrics["incomplete_benchmarks"] = failed_benchmarks
     write_json(out_path, metrics)
-    mark_done(out_path, count=len(cfg.eval.benchmarks), config_hash=cfg.hash())
+    if not failed_benchmarks:
+        mark_done(out_path, count=len(cfg.eval.benchmarks), config_hash=cfg.hash())
     if wb is not None:
         wb.finish()
     print(f"[benchmark_eval] {metrics}")
@@ -162,7 +169,7 @@ def _generate_and_grade(bench, questions, tokenizer, grader, cfg, model_path, wo
         mode="generate", model_path=model_path,
         sampling={"temperature": bench.temperature, "top_p": bench.top_p,
                   "top_k": bench.top_k, "min_p": bench.min_p, "max_tokens": bench.max_tokens},
-        engine_cfg=engine_cfg, work_dir=work_dir,
+        engine_cfg=engine_cfg, work_dir=work_dir, dtype=cfg.model.dtype,
     )
     rows = []
     for q, r in zip(questions, results):
@@ -214,7 +221,7 @@ def summarize_benchmark(name: str, n: int, rows: list[dict],
         if can_maj:
             answers = [s["extracted"] for s in samples if s["formatted"] and s["extracted"]]
             if answers:
-                top = Counter(answers).most_common(1)[0][0]
+                top = _majority_answer(answers, grader)
                 n_maj += grader.grade_extracted(top, gold_by_qid[qid])
 
     min_n = min(c[0] for c in counts)
@@ -232,6 +239,19 @@ def summarize_benchmark(name: str, n: int, rows: list[dict],
     if can_maj:
         out[f"{name}/maj@{n}"] = round(n_maj / n_q, 4)
     return out
+
+
+def _majority_answer(answers: list[str], grader) -> str:
+    """Vote by verifier equivalence, preserving first-answer tie breaking."""
+    clusters: list[list] = []
+    for answer in answers:
+        for cluster in clusters:
+            if grader.grade_extracted(answer, cluster[0]):
+                cluster[1] += 1
+                break
+        else:
+            clusters.append([answer, 1])
+    return max(clusters, key=lambda cluster: cluster[1])[0]
 
 
 if __name__ == "__main__":

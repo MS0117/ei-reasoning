@@ -79,6 +79,7 @@ class SelfResampleOperator(ImprovementOperator):
             },
             engine_cfg=cfg.engine,
             work_dir=work_dir,
+            dtype=cfg.model.dtype,
         )
         out: list[ImprovedCandidate] = []
         for q, res in zip(usable, results):

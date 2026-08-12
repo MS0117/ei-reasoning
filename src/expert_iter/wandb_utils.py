@@ -37,6 +37,9 @@ def init_wandb(cfg, *, name: str, id_file: Path, job_type: str,
         print("[wandb] no API key (run `wandb login`) — falling back to offline; "
               "upload later with `wandb sync`", flush=True)
         mode = "offline"
+    # Trainer runs in a later subprocess. Propagate the resolved mode so it
+    # cannot retry online auth after the driver already chose offline.
+    os.environ["WANDB_MODE"] = mode
     id_file.parent.mkdir(parents=True, exist_ok=True)
     run_id = id_file.read_text().strip() if id_file.exists() else wandb.util.generate_id()
     id_file.write_text(run_id)

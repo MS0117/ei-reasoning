@@ -217,21 +217,27 @@ def run_sft(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path
     _save_and_check(trainer, tokenizer, out_dir)
 
 
-def run_dpo(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path) -> None:
+def run_dpo(
+    cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path,
+    *, allow_empty: bool = False,
+) -> bool:
     """Anchor-conditioned DPO. v1 feeds decoded text (prompt/chosen/rejected) to
     trl's DPOTrainer; special tokens round-trip through the Qwen tokenizer.
     If exact id-level control turns out to matter for DPO too, switch to trl's
     pre-tokenized columns."""
+    rows = list(read_jsonl(dataset_path))
+    if not rows:
+        if allow_empty:
+            print("[train] no DPO pairs this iteration — keeping the SFT checkpoint")
+            return False
+        raise RuntimeError("empty DPO training set for train.objective=dpo")
+
     from datasets import Dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import DPOConfig, DPOTrainer
 
     dpo = cfg.train.dpo
     tokenizer = AutoTokenizer.from_pretrained(init_path)
-    rows = list(read_jsonl(dataset_path))
-    if not rows:
-        print("[train] no DPO pairs this iteration — skipping DPO phase")
-        return
     ds = Dataset.from_list([
         {
             "prompt": tokenizer.decode(r["prompt_token_ids"]),
@@ -264,6 +270,7 @@ def run_dpo(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path
     trainer = DPOTrainer(model=model, args=dargs, train_dataset=ds, processing_class=tokenizer)
     trainer.train()
     _save_and_check(trainer, tokenizer, out_dir)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -295,14 +302,21 @@ def _save_and_check(trainer, tokenizer, out_dir: Path) -> None:
     trainer.save_model(str(out_dir))
     if trainer.is_world_process_zero():
         tokenizer.save_pretrained(str(out_dir))
-        assert (out_dir / "config.json").exists(), "checkpoint missing config.json"
-        shards = list(out_dir.glob("*.safetensors")) + list(out_dir.glob("*.bin"))
-        total = sum(p.stat().st_size for p in shards)
-        assert shards and total > 1_000_000, (
+        n_shards, total = _check_checkpoint(out_dir)
+        print(f"[train] saved checkpoint: {n_shards} shard(s), {total / 1e9:.2f} GB -> {out_dir}")
+
+
+def _check_checkpoint(out_dir: Path) -> tuple[int, int]:
+    if not (out_dir / "config.json").exists():
+        raise RuntimeError(f"checkpoint missing config.json: {out_dir}")
+    shards = list(out_dir.glob("*.safetensors")) + list(out_dir.glob("*.bin"))
+    total = sum(p.stat().st_size for p in shards)
+    if not shards or total <= 1_000_000:
+        raise RuntimeError(
             f"checkpoint at {out_dir} looks empty ({total} bytes) — "
             "sharded save without gather? Check backend save flags."
         )
-        print(f"[train] saved checkpoint: {len(shards)} shard(s), {total / 1e9:.2f} GB -> {out_dir}")
+    return len(shards), total
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -322,9 +336,13 @@ def main(argv: list[str] | None = None) -> None:
         run_sft(cfg, args, it_dir / "dataset" / "train_sft.jsonl", args.model_path, out_dir)
     if objective in ("dpo", "sft+dpo"):
         dpo_init = str(out_dir) if objective == "sft+dpo" else args.model_path
-        run_dpo(cfg, args, it_dir / "dataset" / "train_dpo.jsonl", dpo_init, out_dir)
+        run_dpo(
+            cfg, args, it_dir / "dataset" / "train_dpo.jsonl", dpo_init, out_dir,
+            allow_empty=objective == "sft+dpo",
+        )
 
     if int(os.environ.get("RANK", "0")) == 0:
+        _check_checkpoint(out_dir)
         mark_done(done_key, count=1, config_hash=cfg.hash())
 
 

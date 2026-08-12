@@ -6,6 +6,7 @@ domain filtering). Downstream stages only ever see QuestionRecord.
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 
 from .records import QuestionRecord
@@ -117,6 +118,56 @@ class LocalJsonlAdapter(DatasetAdapter):
         return _dedup_by_qid(records)
 
 
+# Ready-made hf_math adapter_args for the training datasets we use, selected
+# via adapter_args.preset (explicit args override preset values, same merge
+# rule as BENCHMARK_PRESETS). Filters differ deliberately:
+#   openr1      — rich upstream metadata: drop MCQ/proof via question_type,
+#                 keep only golds math-verify demonstrably graded R1
+#                 generations correct against (correctness_math_verify).
+#   openthoughts — gold is the last \boxed of the worked `solution`
+#                 (require_boxed_gold), kept only when R1's answer was graded
+#                 correct against it by upstream math-verify (`correct` col,
+#                 56,730/89,120 — the same demonstrated-gradable standard as
+#                 openr1; the cost is dropping problems R1 failed, but an
+#                 ungradable gold is dead weight for EI either way). Proof-
+#                 worded problems are excluded by regex: NuminaMath boxes the
+#                 claimed bound/identity as "gold" (measured 18% of the
+#                 correct=True rows!), so a model that merely echoes the
+#                 statement's own expression grades as a free pass.
+HF_MATH_PRESETS: dict[str, dict] = {
+    "openr1": {
+        "hf_name": "open-r1/OpenR1-Math-220k",
+        "config": "default",
+        "split": "train",
+        "where": {"question_type": ["math-word-problem"]},
+        "require_any_true": ["correctness_math_verify"],
+    },
+    "openthoughts": {
+        "hf_name": "open-r1/OpenThoughts-114k-math",
+        "config": "default",
+        "split": "train",
+        "require_boxed_gold": True,
+        "require_any_true": ["correct"],
+        "exclude_question_regex": r"(?i)^\s*(prove|show)\b|\b(prove that|show that)\b",
+    },
+}
+
+
+def resolve_adapter_args(adapter_name: str, args: dict) -> dict:
+    """Adapter args in canonical expanded form (hf_math preset resolved,
+    explicit keys winning). Cache keys over question sets must hash THIS, not
+    the raw args: a preset NAME stays constant when its definition in code
+    changes, so raw-args keys would keep stale frozen artifacts alive."""
+    if adapter_name == "hf_math" and args.get("preset") is not None:
+        base = HF_MATH_PRESETS.get(args["preset"])
+        if base is None:
+            raise KeyError(
+                f"hf_math preset {args['preset']!r} unknown; presets: {sorted(HF_MATH_PRESETS)}"
+            )
+        return {**base, **{k: v for k, v in args.items() if k != "preset"}}
+    return dict(args)
+
+
 @register(ADAPTERS, "hf_math")
 class HFMathAdapter(DatasetAdapter):
     """Generic HF math *training-data* adapter with seeded random sampling.
@@ -131,11 +182,34 @@ class HFMathAdapter(DatasetAdapter):
     trace, and picking `solution` would leak the distillation trace into gold
     extraction.
 
-    args: hf_name (required), config=None, split="train", question_col=None,
-          answer_col=None, n_questions=None (seeded random subset),
-          seed=17, max_items=None.
+    args: preset=None (HF_MATH_PRESETS key; explicit args override), hf_name
+          (required unless preset), config=None, split="train",
+          question_col=None, answer_col=None, n_questions=None (seeded random
+          subset), seed=17, max_items=None, where=None, require_any_true=None,
+          require_boxed_gold=False.
     `max_items` head-truncates the stream BEFORE sampling (debug fast-path
     only — it biases the sample toward the head of the dataset).
+
+    Metadata row filters (both applied BEFORE dedup/sampling; referencing a
+    missing column is a hard KeyError, mirroring the config unknown-key policy):
+      where: {column: [allowed values]} — keep rows whose str(column) is in the
+          whitelist. E.g. {question_type: [math-word-problem]} drops OpenR1's
+          MCQ rows (gold is a choice letter — letter/value mismatch misgrades,
+          and 4-way guessing pollutes pass rates).
+      require_any_true: [column, ...] — keep rows whose bool-list column has at
+          least one true (scalar bools allowed). E.g. [correctness_math_verify]
+          keeps only rows where upstream math-verify actually graded an R1
+          generation correct against this gold — evidence the gold is
+          verifiable in practice, which gold_parsable cannot establish (it
+          accepts proof/multi-part/text golds that then misgrade).
+      require_boxed_gold: drop rows whose gold has no extractable \\boxed —
+          for datasets where gold is a worked solution (OpenThoughts): a
+          proof-style solution without \\boxed would otherwise become a
+          whole-solution-text gold that can never grade correctly.
+      exclude_question_regex: drop rows whose QUESTION matches (re.search).
+          For proof-worded problems ("Prove that X >= f(n)") whose "gold" is
+          the statement's own expression — echoing the question grades as a
+          free pass, so pass/fail carries no signal.
     """
 
     def load(self, args: dict) -> list[QuestionRecord]:
@@ -143,12 +217,23 @@ class HFMathAdapter(DatasetAdapter):
 
         from .verifier import MathVerifier
 
+        args = resolve_adapter_args("hf_math", args)
         hf_name = args["hf_name"]
         config = args.get("config")
         split = args.get("split", "train")
         n_questions = args.get("n_questions")
         seed = args.get("seed", 17)
         max_items = args.get("max_items")
+        where = {
+            col: {str(v) for v in (vals if isinstance(vals, (list, tuple)) else [vals])}
+            for col, vals in (args.get("where") or {}).items()
+        }
+        require_any_true = args.get("require_any_true") or []
+        require_boxed_gold = bool(args.get("require_boxed_gold"))
+        exclude_question = (
+            re.compile(args["exclude_question_regex"])
+            if args.get("exclude_question_regex") else None
+        )
 
         if config:
             ds = hf_datasets.load_dataset(hf_name, config, split=split)
@@ -166,16 +251,34 @@ class HFMathAdapter(DatasetAdapter):
                 f"{hf_name}[{split}] columns {ds.column_names} lack a recognizable "
                 "question/answer pair; pass adapter_args.question_col/answer_col."
             )
+        for col in [*where, *require_any_true]:
+            if col not in ds.column_names:
+                raise KeyError(
+                    f"{hf_name}[{split}] has no column {col!r} (referenced by a "
+                    f"where/require_any_true filter); columns: {ds.column_names}"
+                )
 
         verifier = MathVerifier()
         records: list[QuestionRecord] = []
-        n_seen = n_no_gold = n_unparsable = 0
+        n_seen = n_where = n_no_true = n_q_excl = n_unboxed = n_no_gold = n_unparsable = 0
         for row in ds:
             n_seen += 1
+            if any(str(row.get(col)) not in allowed for col, allowed in where.items()):
+                n_where += 1
+                continue
+            if any(not _any_true(row.get(col)) for col in require_any_true):
+                n_no_true += 1
+                continue
             question = str(row.get(question_col) or "").strip()
             gold = str(row.get(answer_col) or "").strip()
             if not question or not gold:
                 n_no_gold += 1
+                continue
+            if exclude_question is not None and exclude_question.search(question):
+                n_q_excl += 1
+                continue
+            if require_boxed_gold and last_boxed(gold) is None:
+                n_unboxed += 1
                 continue
             final_answer = _extract_final_answer(gold)
             if not verifier.gold_parsable(final_answer):
@@ -195,7 +298,9 @@ class HFMathAdapter(DatasetAdapter):
         records = _dedup_by_qid(records)
         print(
             f"[data] hf_math {hf_name}: kept {len(records)} / seen {n_seen} "
-            f"(no-gold {n_no_gold}, unparsable {n_unparsable})"
+            f"(where-filtered {n_where}, no-true-filtered {n_no_true}, "
+            f"question-excluded {n_q_excl}, unboxed-gold {n_unboxed}, "
+            f"no-gold {n_no_gold}, unparsable {n_unparsable})"
         )
         if n_questions:
             if n_questions > len(records):
@@ -364,6 +469,14 @@ def _extract_final_answer(gold: str) -> str:
     if present, else the raw string (short answers)."""
     boxed = last_boxed(gold)
     return boxed if boxed is not None else gold
+
+
+def _any_true(value) -> bool:
+    """require_any_true semantics: bool-list columns need >= 1 true; scalars
+    count as their truthiness (an absent column is caught earlier as KeyError)."""
+    if isinstance(value, (list, tuple)):
+        return any(bool(v) for v in value)
+    return bool(value)
 
 
 def _dedup_by_qid(records: list[QuestionRecord]) -> list[QuestionRecord]:

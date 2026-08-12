@@ -29,8 +29,8 @@ from collections import Counter
 from pathlib import Path
 
 from expert_iter.benchmark_eval import summarize_benchmark
-from expert_iter.config import Config
-from expert_iter.data import load_questions
+from expert_iter.config import Config, freeze_run_config
+from expert_iter.data import load_questions, resolve_adapter_args
 from expert_iter.engine import GenRequest, run_pool
 from expert_iter.lora import resolve_model_path
 from expert_iter.records import QuestionRecord
@@ -77,9 +77,11 @@ def classify(c: int, frontier_min: int, solved_min: int) -> str:
 
 def frozen_questions(run_dir: Path, cfg: Config) -> list[QuestionRecord]:
     """Materialize the sampled questions once; keyed by the adapter spec only,
-    so changing rollout/model params never resamples the question set."""
+    so changing rollout/model params never resamples the question set. The
+    spec is hashed in EXPANDED form so editing a preset in code re-freezes."""
     path = run_dir / "questions.jsonl"
-    key = stable_hash("passrate_questions", cfg.data.adapter, cfg.data.adapter_args)
+    key = stable_hash("passrate_questions", cfg.data.adapter,
+                      resolve_adapter_args(cfg.data.adapter, cfg.data.adapter_args))
     if not is_done(path, config_hash=key):
         records = load_questions(cfg.data.adapter, cfg.data.adapter_args)
         if not records:
@@ -113,15 +115,18 @@ def generate_and_grade(cfg: Config, questions: list[QuestionRecord], tokenizer,
         mode="generate", model_path=model_path,
         sampling={"temperature": cfg.rollout.temperature, "top_p": cfg.rollout.top_p,
                   "max_tokens": cfg.rollout.max_tokens},
-        engine_cfg=engine_cfg, work_dir=work_dir,
+        engine_cfg=engine_cfg, work_dir=work_dir, dtype=cfg.model.dtype,
     )
     rows = []
     for q, r in zip(questions, results):
         for i, s in enumerate(r.samples):
             v = grader.verify(q, s["text"])
+            raw_correct = bool(v.correct)
+            clean_correct = raw_correct and s.get("finish_reason") != "length"
             rows.append({
                 "qid": q.qid, "sample_idx": i,
-                "correct": bool(v.correct),
+                "correct": clean_correct,
+                "raw_correct": raw_correct,
                 "formatted": bool(v.meta.get("formatted", v.extracted_answer is not None)),
                 "extracted": v.extracted_answer,
                 "finish_reason": s.get("finish_reason", ""),
@@ -140,11 +145,18 @@ def summarize(rows: list[dict], k: int, grader, gold_by_qid: dict[str, str],
 
     question_stats = []
     for qid, samples in by_qid.items():
-        c = sum(s["correct"] for s in samples)
+        clean = [
+            bool(s.get("raw_correct", s["correct"]))
+            and s.get("finish_reason") != "length"
+            for s in samples
+        ]
+        c = sum(clean)
+        c_raw = sum(bool(s.get("raw_correct", s["correct"])) for s in samples)
         n = len(samples)
         question_stats.append({
-            "qid": qid, "n": n, "c": c,
+            "qid": qid, "n": n, "c": c, "c_raw": c_raw,
             "pass_rate": round(c / n, 4),
+            "raw_pass_rate": round(c_raw / n, 4),
             "class": classify(c, frontier_min, solved_min),
             "n_truncated": sum(s["finish_reason"] == "length" for s in samples),
             "final_answer": gold_by_qid.get(qid, ""),
@@ -152,6 +164,7 @@ def summarize(rows: list[dict], k: int, grader, gold_by_qid: dict[str, str],
     question_stats.sort(key=lambda r: (r["c"], r["qid"]))
 
     counts = [r["c"] for r in question_stats]
+    raw_counts = [r["c_raw"] for r in question_stats]
     classes = Counter(r["class"] for r in question_stats)
     n_q = len(question_stats)
     metrics = {
@@ -166,8 +179,13 @@ def summarize(rows: list[dict], k: int, grader, gold_by_qid: dict[str, str],
         "frac_solved": round(classes["solved"] / n_q, 4),
         "thresholds": {"frontier_min": frontier_min, "solved_min": solved_min},
         "solve_rate": round(sum(c > 0 for c in counts) / n_q, 4),
+        "raw_solve_rate": round(sum(c > 0 for c in raw_counts) / n_q, 4),
         "all_correct_rate": round(sum(c == k for c in counts) / n_q, 4),
+        "raw_all_correct_rate": round(sum(c == k for c in raw_counts) / n_q, 4),
         "mean_pass_rate": round(sum(r["pass_rate"] for r in question_stats) / n_q, 4),
+        "raw_mean_pass_rate": round(
+            sum(r["raw_pass_rate"] for r in question_stats) / n_q, 4
+        ),
     }
     metrics.update(summarize_benchmark("passrate", k, rows, gold_by_qid, grader))
     return metrics, question_stats
@@ -195,11 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     cfg = Config.load(args.config, overrides=args.override)
     run_dir = Path(args.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    frozen = run_dir / "config.yaml"
-    if not frozen.exists():
-        cfg.save(frozen)
-        write_json(run_dir / "config.hash.json", {"config_hash": cfg.hash()})
+    freeze_run_config(cfg, run_dir)
 
     questions = frozen_questions(run_dir, cfg)
     print(f"[passrate] {len(questions)} questions, K={cfg.rollout.n}")
@@ -236,9 +250,14 @@ def main(argv: list[str] | None = None) -> None:
 
     samples_path = run_dir / "samples.jsonl"
     # Resume unit keyed by exactly what changes the samples — not the full
-    # config hash, so e.g. threshold flags never trigger regeneration.
+    # config hash, so e.g. threshold flags never trigger regeneration. The
+    # adapter spec IS part of the key: it determines the question set, and
+    # without it a dataset switch in the same run dir would silently reuse the
+    # previous dataset's generations against the new gold set.
     key = stable_hash(
-        "passrate_samples", model_path, dataclasses.asdict(cfg.rollout), cfg.run.seed,
+        "passrate_samples", model_path, cfg.data.adapter,
+        resolve_adapter_args(cfg.data.adapter, cfg.data.adapter_args),
+        dataclasses.asdict(cfg.rollout), cfg.run.seed,
         cfg.model.system_prompt, cfg.data.question_suffix, cfg.model.chat_template_kwargs,
     )
     if not is_done(samples_path, config_hash=key):
@@ -254,7 +273,9 @@ def main(argv: list[str] | None = None) -> None:
     metrics, question_stats = summarize(rows, cfg.rollout.n, grader, gold_by_qid,
                                         args.frontier_min, args.solved_min)
     metrics = {"model_path": model_path,
-               "hf_name": cfg.data.adapter_args.get("hf_name", cfg.data.adapter),
+               # resolved form: with a preset, the raw args carry no hf_name
+               "hf_name": resolve_adapter_args(cfg.data.adapter, cfg.data.adapter_args)
+                          .get("hf_name", cfg.data.adapter),
                **metrics}
     write_jsonl(run_dir / "question_stats.jsonl", question_stats)
     write_json(run_dir / "metrics.json", metrics)

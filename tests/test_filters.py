@@ -41,16 +41,23 @@ def test_cliff_verifies_unfilled_candidates():
     """Candidates the gate chain never reached (correct=None) are graded here so
     conversion is independent of gate order."""
     unsolved = _unsolved("q1")
+    decoded = []
+
+    def decode(ids):
+        decoded.append(ids)
+        return "the answer is 42" if 42 in ids else "no idea"
+
     ctx = FilterContext(
         cfg=None,
         verifier=SimpleNamespace(verify=lambda q, text: SimpleNamespace(correct="42" in text)),
-        tokenizer=SimpleNamespace(decode=lambda ids: ""),
+        tokenizer=SimpleNamespace(decode=decode),
         questions=unsolved,
     )
     good, bad = _cand("q1", None), _cand("q1", None, 1)
-    good.continuation_text = "the answer is 42"
-    bad.continuation_text = "no idea"
+    good.continuation_token_ids = [42]
+    bad.continuation_token_ids = [0]
     stats = cliff_stats([good, bad], unsolved, ctx=ctx, n_total_questions=1)
     assert stats["cliff/conversion_rate"] == 1.0
     assert stats["cliff/conversion_histogram"] == [1]
     assert good.correct is True and bad.correct is False
+    assert decoded == [[2, 42], [2, 0]]
