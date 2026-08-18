@@ -1,0 +1,95 @@
+# One-iteration smoke test of the FULL new-method path on a tiny model:
+# min-mean-NLL base selection -> privileged-divergence anchor -> pooled LoRA
+# fit -> project-back over a 2-point alpha grid -> C(y) selection. Minutes on
+# one GPU; validates plumbing, not quality (Qwen3-0.6B truncates a lot at
+# 1024 tokens — expected).
+#
+#   bash scripts/smoke.sh 0 configs/methods/smoke_lora.yaml
+
+run:
+  name: smoke_lora
+  seed: 17
+  wandb:
+    mode: disabled
+
+model:
+  base: Qwen/Qwen3-0.6B
+
+engine:
+  max_model_len: 4096
+  gpu_memory_utilization: 0.60
+  enable_lora: true
+  max_loras: 4
+  max_lora_rank: 16
+
+data:
+  adapter: hf_math
+  adapter_args:
+    preset: openr1
+    include_solution: true
+    max_items: 300            # stop scanning after 300 kept rows (smoke fast-path)
+    n_questions: 16
+    seed: 17
+  eval_holdout: 4
+
+rollout:
+  n: 4
+  max_tokens: 1024
+
+partition:
+  cliff_max_correct: 0
+
+anchor:
+  policy: privileged_divergence
+  base_selection: min_mean_nll
+  params:
+    signal: realized_logratio
+    c_sigma: 2.0
+    search_frac: 0.333
+    min_steps: 2
+    max_frac: 0.8
+
+improve:
+  operator: lora_sft
+  n: 4
+  max_tokens: 1024
+  lora_sft:
+    adapter_scope: pooled
+    refit_budget: 1           # exercise the refit path on one cliff
+    fit:
+      steps: 2
+      max_pair_tokens: 2048
+      num_processes: null
+    project_back:
+      enabled: true
+      alphas: [0.5, 1.0]      # tiny grid — exercises alpha variants + per-request adapters
+      tau_p: 0.25
+      m_rollouts: 4
+
+filter:
+  max_total_tokens: 2048
+  selection:
+    method: c_score           # exercises the S_mean/S_tail scoring pass
+    always_score: false     # true -> measure C(y) even when method != c_score
+    lambda_tail: 1.0
+    gamma_dtail: 0.0
+    tail_fraction: 0.1
+
+train:
+  objective: sft
+  backend: single
+  max_seq_len: 2048
+  sft:
+    epochs: 1
+    global_batch_size: 8
+    logging_steps: 1
+
+loop:
+  iterations: 1
+
+eval:
+  passk:
+    k: 4
+  max_tokens: 1024
+  benchmarks:
+    - {name: math500_hard, adapter_args: {max_items: 5}, n: 2, max_tokens: 1024}

@@ -10,14 +10,14 @@ policy model, grade them, and report how many questions land at each correct
 count c = 0/K, 1/K, ..., K/K.
 
 ```bash
-bash data/run_passrate.sh -g 0,1                  # defaults: N=100, K=8, model.base
+bash data/run_passrate.sh -g 0,1                  # config defaults: N=2000, K=32, model.base
 bash data/run_passrate.sh Qwen/Qwen3-4B -g 0 -b   # any HF id / EI ckpt / LoRA dir
 bash data/run_passrate.sh -- --dry-run            # no GPU: verify data + prompts
 ```
 
 | hyperparameter | where |
 |---|---|
-| dataset | `data.adapter_args.hf_name` (+ `config`) in [configs/passrate.yaml](configs/passrate.yaml) |
+| dataset | `data.adapter_args.preset` (`openr1` \| `openthoughts` \| `deepmath`) in [configs/passrate.yaml](configs/passrate.yaml); override with `hf_name` (+ `config`) |
 | N questions | `data.adapter_args.n_questions` (seeded, order-independent sampling) |
 | K rollouts | `rollout.n` |
 | sampling | `rollout.{temperature, top_p, max_tokens}` (defaults match the EI rollout stage) |
@@ -47,6 +47,10 @@ values are recorded in `metrics.json`.
 - `samples.jsonl` — graded generations: `{qid, sample_idx, correct, formatted, extracted, finish_reason, n_tokens, response_text}` (same schema as `benchmark_eval`)
 - `question_stats.jsonl` — per question: `{qid, n, c, pass_rate, class, n_truncated, final_answer}` — filter by `class` for curation
 - `metrics.json` — `hist` (count of questions per c), class counts/fractions, `solve_rate`, `mean_pass_rate`, `passrate/pass@{1,2,4,...,K}`, `passrate/avg@K`, format/truncation rates
+- `cliff_questions.jsonl` — **the curated cliff set**: the `c == 0` questions as `QuestionRecord`s,
+  carrying their adapter meta (`hf_name`, `row_idx`, and `gold_solution`/`gold_solutions_alt` when
+  `include_solution` is on) plus `passrate_{c,k,run,model}` provenance. Written on every run; copy it
+  to `data/cliff_sets/<name>.jsonl` to promote it, and read it back with the `local_jsonl` adapter.
 
 Re-running resumes: frozen questions and `.done`-marked samples are skipped;
 changing rollout/model params regenerates into a fresh `pool_<hash>` dir.

@@ -1,10 +1,16 @@
 """Stage: partition — grade every rollout sample, split questions into
 solved (keep correct trajectories) and unsolved (send to improvement).
 
+Routing rule: a question is SOLVED iff it has >= 1 clean-correct sample
+(correct AND finish_reason == "stop"); it is IMPROVEMENT-ELIGIBLE (written to
+unsolved.jsonl) iff its clean-correct count <= partition.cliff_max_correct.
+With the default threshold 0 these are complementary (the classic cliff rule:
+all rollouts failed); with a threshold >= 1 a question can be both.
+
 Outputs under iter_k/partition/:
   verdicts.jsonl  one VerdictRecord per rollout sample
   solved.jsonl    ≤ partition.solved_keep_max correct trajectories per question
-  unsolved.jsonl  one UnsolvedQuestion per question with zero correct samples
+  unsolved.jsonl  one UnsolvedQuestion per improvement-eligible question
   stats.json      solve-rate — the headline EI metric per iteration
 """
 
@@ -59,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
 
     (
         solved_rows, unsolved_rows, n_solved_q, n_q,
-        n_clean_correct, n_truncated_correct,
+        n_clean_correct, n_truncated_correct, n_overlap,
     ) = _partition_rows(questions, rollouts, verdicts, cfg, args.iteration)
 
     VerdictRecord.dump_jsonl(out_dir / "verdicts.jsonl", verdict_rows)
@@ -76,6 +82,8 @@ def main(argv: list[str] | None = None) -> None:
         "clean_sample_accuracy": round(n_clean_correct / len(verdicts), 4) if verdicts else 0.0,
         "n_truncated_correct": n_truncated_correct,
         "n_solved_trajectories_kept": n_solved,
+        # questions that are solved AND improvement-eligible (cliff_max_correct >= 1)
+        "n_overlap_questions": n_overlap,
     }
     write_json(out_dir / "stats.json", stats)
     mark_done(solved_path, count=n_solved, config_hash=cfg.hash(), extra=stats)
@@ -94,7 +102,8 @@ def _select(samples: list[RolloutSample], keep: int, how: str, rng: random.Rando
 
 
 def _partition_rows(questions, rollouts, verdicts, cfg, iteration: int):
-    """Split every question exactly once; truncated-correct samples are unsolved."""
+    """Route every question (see module docstring); truncated-correct samples
+    count as failures on both sides."""
     by_qid: dict[str, list[tuple[RolloutSample, bool]]] = defaultdict(list)
     for sample, verdict in zip(rollouts, verdicts, strict=True):
         by_qid[sample.qid].append((sample, verdict.correct))
@@ -110,6 +119,7 @@ def _partition_rows(questions, rollouts, verdicts, cfg, iteration: int):
     solved_rows: list[SolvedTrajectory] = []
     unsolved_rows: list[UnsolvedQuestion] = []
     n_solved_q = 0
+    n_overlap = 0
     n_clean_correct = 0
     n_truncated_correct = 0
     for qid, pairs in by_qid.items():
@@ -133,7 +143,9 @@ def _partition_rows(questions, rollouts, verdicts, cfg, iteration: int):
                     cfg.partition.solved_selection, rng,
                 )
             )
-        else:
+        if len(clean_correct) <= cfg.partition.cliff_max_correct:
+            # Improvement-eligible. rejected is never empty here: clean count
+            # <= cliff_max_correct < rollout.n leaves >= 1 non-clean sample.
             rejected = [
                 s for s, ok in pairs if not (ok and s.finish_reason == "stop")
             ]
@@ -142,12 +154,14 @@ def _partition_rows(questions, rollouts, verdicts, cfg, iteration: int):
                 failed_sample_idxs=[s.sample_idx for s in rejected],
                 iter=iteration,
             ))
+            if clean_correct:
+                n_overlap += 1
 
-    if n_solved_q + len(unsolved_rows) != len(by_qid):
+    if n_solved_q + len(unsolved_rows) - n_overlap != len(by_qid):
         raise AssertionError("partition did not classify every question")
     return (
         solved_rows, unsolved_rows, n_solved_q, len(by_qid),
-        n_clean_correct, n_truncated_correct,
+        n_clean_correct, n_truncated_correct, n_overlap,
     )
 
 

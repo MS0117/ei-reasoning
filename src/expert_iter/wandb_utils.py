@@ -23,6 +23,20 @@ from pathlib import Path
 DRIVER_ENV = "EI_LOOP_DRIVER"
 
 
+def resolve_wandb_mode(mode: str) -> str:
+    """A requested online mode with no API key downgrades to offline — a
+    background job must never hang on an interactive login prompt."""
+    if mode != "online":
+        return mode
+    import wandb
+
+    if wandb.api.api_key is None:
+        print("[wandb] no API key (run `wandb login`) — falling back to offline; "
+              "upload later with `wandb sync`", flush=True)
+        return "offline"
+    return mode
+
+
 def init_wandb(cfg, *, name: str, id_file: Path, job_type: str,
                config: dict | None = None):
     """Start (or resume) a wandb run; None when cfg.run.wandb.mode is disabled.
@@ -32,11 +46,7 @@ def init_wandb(cfg, *, name: str, id_file: Path, job_type: str,
         return None
     import wandb
 
-    mode = cfg.run.wandb.mode
-    if mode == "online" and wandb.api.api_key is None:
-        print("[wandb] no API key (run `wandb login`) — falling back to offline; "
-              "upload later with `wandb sync`", flush=True)
-        mode = "offline"
+    mode = resolve_wandb_mode(cfg.run.wandb.mode)
     # Trainer runs in a later subprocess. Propagate the resolved mode so it
     # cannot retry online auth after the driver already chose offline.
     os.environ["WANDB_MODE"] = mode

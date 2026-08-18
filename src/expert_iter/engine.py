@@ -20,7 +20,16 @@ Modes:
              produced 0/160 identical responses). Pin engine.gpus for runs
              you may want to reproduce exactly.
   score    — teacher-forced per-token logprobs over a suffix of the sequence
-             (prompt_logprobs trick); used by the trainability logprob gate.
+             (prompt_logprobs trick); used by the trainability logprob gate,
+             anchor divergence signals, and C(y) candidate selection. Optional
+             sampling keys: return_token_logprobs=true adds the per-position
+             realized-token logprob array to each result; prompt_logprobs_k=K
+             adds per-position top-K {token_id: logprob} maps (needs
+             engine.max_logprobs >= K).
+
+Per-request LoRA: GenRequest.lora_path routes that request through a PEFT
+adapter dir (engine.enable_lora must be true). Requests with different
+adapters (or none) can share one pool launch.
 """
 
 from __future__ import annotations
@@ -47,6 +56,12 @@ class GenRequest:
     seed: int = 0
     # score mode only: score tokens from this index onward
     score_from: int = 0
+    # PEFT adapter dir for THIS request (generate and score); None = base model.
+    # Adapter dirs must be content-addressed: the pool cache key hashes this
+    # path string, not the weights behind it.
+    lora_path: str | None = None
+    # generate mode: per-request override of sampling["max_tokens"]
+    max_tokens: int | None = None
     meta: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -62,6 +77,12 @@ class GenResult:
     sum_logprob: float | None = None
     mean_logprob: float | None = None
     n_scored: int | None = None
+    # score mode extras. Alignment contract: index i corresponds to sequence
+    # position max(1, score_from) + i — the same positions the aggregates
+    # cover. Positions vLLM returned no entry for are None-filled.
+    token_logprobs: list[float | None] | None = None    # sampling["return_token_logprobs"]
+    topk_logprobs: list[dict[str, float] | None] | None = None  # sampling["prompt_logprobs_k"]>0;
+    # per-position {str(token_id): logprob}, realized token first
     meta: dict = field(default_factory=dict)
 
 
@@ -79,10 +100,24 @@ def run_pool(
     assert mode in ("generate", "score"), mode
     if not requests:
         return []
-    extra_tokens = sampling.get("max_tokens", 0) if mode == "generate" else 0
-    required_context = max(len(r.prompt_token_ids) for r in requests) + extra_tokens
+    if mode == "generate":
+        default_max = sampling.get("max_tokens", 0)
+        required_context = max(
+            len(r.prompt_token_ids) + (r.max_tokens if r.max_tokens is not None else default_max)
+            for r in requests
+        )
+    else:
+        required_context = max(len(r.prompt_token_ids) for r in requests)
+        # Leave headroom for the full-vocab logprobs spike (see EngineCfg).
+        if engine_cfg.score_gpu_memory_utilization < engine_cfg.gpu_memory_utilization:
+            engine_cfg = replace(
+                engine_cfg,
+                gpu_memory_utilization=engine_cfg.score_gpu_memory_utilization,
+            )
     if required_context > engine_cfg.max_model_len:
         engine_cfg = replace(engine_cfg, max_model_len=required_context)
+    if any(r.lora_path for r in requests) and not engine_cfg.enable_lora:
+        raise ValueError("requests carry lora_path but engine.enable_lora is false")
     rids = [r.rid for r in requests]
     if len(set(rids)) != len(rids):
         dupes = sorted(rid for rid in set(rids) if rids.count(rid) > 1)
@@ -140,6 +175,10 @@ def run_pool(
                 "enable_prefix_caching": engine_cfg.enable_prefix_caching,
                 "enforce_eager": engine_cfg.enforce_eager,
                 "score_batch_size": engine_cfg.score_batch_size,
+                "enable_lora": engine_cfg.enable_lora,
+                "max_loras": engine_cfg.max_loras,
+                "max_lora_rank": engine_cfg.max_lora_rank,
+                "max_logprobs": engine_cfg.max_logprobs,
             }),
         ]
         log_f = log_path.open("w")
@@ -231,7 +270,7 @@ def _worker(argv: list[str]) -> None:
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
         dtype=ecfg["dtype"],
         tensor_parallel_size=ecfg["tensor_parallel"],
@@ -240,62 +279,122 @@ def _worker(argv: list[str]) -> None:
         enable_prefix_caching=ecfg["enable_prefix_caching"],
         enforce_eager=ecfg["enforce_eager"],
     )
+    # Added only when non-default so a plain run constructs the engine with the
+    # exact argument set that existed before LoRA support.
+    if ecfg.get("enable_lora"):
+        llm_kwargs.update(
+            enable_lora=True,
+            max_loras=int(ecfg.get("max_loras", 8)),
+            max_lora_rank=int(ecfg.get("max_lora_rank", 16)),
+        )
+    if int(ecfg.get("max_logprobs", 20)) != 20:
+        llm_kwargs["max_logprobs"] = int(ecfg["max_logprobs"])
+    # Score mode only: bound the per-chunk full-vocab fp32 log_softmax spike.
+    if args.mode == "score" and ecfg.get("score_max_num_batched_tokens"):
+        llm_kwargs["max_num_batched_tokens"] = int(ecfg["score_max_num_batched_tokens"])
+    llm = LLM(**llm_kwargs)
 
     reqs = [GenRequest(**row) for row in read_jsonl(args.input)]
     rows: list[dict] = []
 
+    # Group by adapter: one llm.generate call per adapter (or None = base
+    # model). Per-request seeds keep results independent of request order, so
+    # grouping does not affect reproducibility beyond the already-documented
+    # batch-composition numerics caveat.
+    lora_paths = sorted({r.lora_path for r in reqs if r.lora_path})
+    if lora_paths and not ecfg.get("enable_lora"):
+        raise RuntimeError("requests carry lora_path but the engine was built without enable_lora")
+    lora_ids = {path: i + 1 for i, path in enumerate(lora_paths)}  # stable within the worker
+
+    def lora_kw(path: str | None) -> dict:
+        if path is None:
+            return {}
+        from vllm.lora.request import LoRARequest
+
+        return {"lora_request": LoRARequest(
+            lora_name=path, lora_int_id=lora_ids[path], lora_path=path,
+        )}
+
+    groups: dict[str | None, list[GenRequest]] = {}
+    for r in reqs:
+        groups.setdefault(r.lora_path, []).append(r)
+
     if args.mode == "generate":
-        prompts = [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in reqs]
-        params = [
-            SamplingParams(
-                n=r.n,
-                temperature=sampling.get("temperature", 1.0),
-                top_p=sampling.get("top_p", 1.0),
-                top_k=sampling.get("top_k", -1),
-                min_p=sampling.get("min_p", 0.0),
-                max_tokens=sampling.get("max_tokens", 1024),
-                stop=sampling.get("stop"),
-                seed=r.seed,
-            )
-            for r in reqs
-        ]
-        outs = llm.generate(prompts, params)
-        for r, out in zip(reqs, outs):
-            rows.append(GenResult(
-                rid=r.rid,
-                samples=[
-                    {
-                        "text": o.text,
-                        "token_ids": list(o.token_ids),
-                        "finish_reason": o.finish_reason or "stop",
-                    }
-                    for o in out.outputs
-                ],
-                meta=r.meta,
-            ).__dict__)
-    else:  # score
-        bs = max(1, ecfg.get("score_batch_size", 256))
-        params = SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0)
-        for start in range(0, len(reqs), bs):
-            chunk = reqs[start:start + bs]
-            outs = llm.generate(
-                [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in chunk],
-                params,
-            )
-            for r, out in zip(chunk, outs):
-                plp = out.prompt_logprobs or []
-                lps: list[float] = []
-                for pos in range(max(1, r.score_from), len(plp)):  # pos 0 is always None
-                    d = plp[pos]
-                    if d:
-                        lps.append(next(iter(d.values())).logprob)
+        for path in [None, *lora_paths]:
+            group = groups.get(path)
+            if not group:
+                continue
+            prompts = [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in group]
+            params = [
+                SamplingParams(
+                    n=r.n,
+                    temperature=sampling.get("temperature", 1.0),
+                    top_p=sampling.get("top_p", 1.0),
+                    top_k=sampling.get("top_k", -1),
+                    min_p=sampling.get("min_p", 0.0),
+                    max_tokens=(r.max_tokens if r.max_tokens is not None
+                                else sampling.get("max_tokens", 1024)),
+                    stop=sampling.get("stop"),
+                    seed=r.seed,
+                )
+                for r in group
+            ]
+            outs = llm.generate(prompts, params, **lora_kw(path))
+            for r, out in zip(group, outs):
                 rows.append(GenResult(
                     rid=r.rid,
-                    sum_logprob=float(sum(lps)) if lps else None,
-                    mean_logprob=float(sum(lps) / len(lps)) if lps else None,
-                    n_scored=len(lps),
+                    samples=[
+                        {
+                            "text": o.text,
+                            "token_ids": list(o.token_ids),
+                            "finish_reason": o.finish_reason or "stop",
+                        }
+                        for o in out.outputs
+                    ],
                     meta=r.meta,
                 ).__dict__)
+    else:  # score
+        bs = max(1, ecfg.get("score_batch_size", 256))
+        want_tokens = bool(sampling.get("return_token_logprobs"))
+        top_k = int(sampling.get("prompt_logprobs_k", 0) or 0)
+        params = SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=top_k)
+        for path in [None, *lora_paths]:
+            group = groups.get(path)
+            if not group:
+                continue
+            for start in range(0, len(group), bs):
+                chunk = group[start:start + bs]
+                outs = llm.generate(
+                    [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in chunk],
+                    params,
+                    **lora_kw(path),
+                )
+                for r, out in zip(chunk, outs):
+                    plp = out.prompt_logprobs or []
+                    # Aligned per-position views from max(1, score_from) on;
+                    # vLLM's per-position dict lists the realized token FIRST.
+                    lps: list[float | None] = []
+                    topk: list[dict[str, float] | None] = []
+                    for pos in range(max(1, r.score_from), len(plp)):  # pos 0 is always None
+                        d = plp[pos]
+                        if d:
+                            lps.append(next(iter(d.values())).logprob)
+                            if top_k > 0:
+                                topk.append({str(t): lp.logprob for t, lp in d.items()})
+                        else:  # None-fill keeps index i <-> position score_from+i
+                            lps.append(None)
+                            if top_k > 0:
+                                topk.append(None)
+                    scored = [v for v in lps if v is not None]
+                    rows.append(GenResult(
+                        rid=r.rid,
+                        sum_logprob=float(sum(scored)) if scored else None,
+                        mean_logprob=float(sum(scored) / len(scored)) if scored else None,
+                        n_scored=len(scored),
+                        token_logprobs=lps if want_tokens else None,
+                        topk_logprobs=topk if top_k > 0 else None,
+                        meta=r.meta,
+                    ).__dict__)
 
     n = write_jsonl(args.output, rows)
     mark_done(args.output, count=n, config_hash=args.cache_key)

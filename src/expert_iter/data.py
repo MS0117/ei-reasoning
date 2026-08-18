@@ -134,6 +134,28 @@ class LocalJsonlAdapter(DatasetAdapter):
 #                 claimed bound/identity as "gold" (measured 18% of the
 #                 correct=True rows!), so a model that merely echoes the
 #                 statement's own expression grades as a free pass.
+#   deepmath    — has none of the upstream verification metadata the other two
+#                 lean on (no question_type/correct/source column), so the
+#                 cleanup is expressed on the answer side: 21,725 of 103,022
+#                 rows (21%) answer Yes/No/True/False or a bare MCQ letter.
+#                 math-verify grades those fine, but they are guessable, so at
+#                 K rollouts they reach c=0 with probability 0.5**K — never a
+#                 real cliff, only noise in the pass-rate histogram. The letter
+#                 half of the pattern is UPPERCASE-ONLY on purpose: [a-e] would
+#                 also drop 666 legitimate algebraic golds, 406 of them "e".
+#                 Proof-worded rows are NOT excluded (unlike openthoughts):
+#                 final_answer is a separately curated column here rather than
+#                 the last \boxed of a solution, so the echo-the-statement free
+#                 pass does not apply (spot-checked: golds like \mathbb{Z}_{42},
+#                 e^{t^2/2}, \ln 2 are genuine). Gold y* is r1_solution_1 with
+#                 the R1 thinking half stripped (solution_strip_think), which
+#                 makes it the analogue of openr1's short human `solution`:
+#                 1,450 vs 14,367 chars, 100% ending in \boxed. The other two
+#                 R1 solutions are genuinely different derivations (mean text
+#                 similarity 0.29, 0/805 near-duplicates) and are kept in
+#                 meta.gold_solutions_alt for a future multi-reference operator.
+#                 difficulty/topic ride into meta (and so into the cliff set) as
+#                 the analogue of the problem_type the openr1 cliff set carried.
 HF_MATH_PRESETS: dict[str, dict] = {
     "openr1": {
         "hf_name": "open-r1/OpenR1-Math-220k",
@@ -149,6 +171,18 @@ HF_MATH_PRESETS: dict[str, dict] = {
         "require_boxed_gold": True,
         "require_any_true": ["correct"],
         "exclude_question_regex": r"(?i)^\s*(prove|show)\b|\b(prove that|show that)\b",
+    },
+    "deepmath": {
+        "hf_name": "zwhe99/DeepMath-103K",
+        "config": "default",
+        "split": "train",
+        "solution_col": "r1_solution_1",
+        "solution_alt_cols": ["r1_solution_2", "r1_solution_3"],
+        "solution_strip_think": True,
+        "meta_cols": ["difficulty", "topic"],
+        # (?i:...) scopes case-folding to the words only — [A-E] must stay
+        # case-SENSITIVE or it eats 666 legitimate algebraic golds (406 "e").
+        "exclude_answer_regex": r"^(?:\\text\{)?(?:(?i:yes|no|true|false)|[A-E])\}?$",
     },
 }
 
@@ -182,15 +216,30 @@ class HFMathAdapter(DatasetAdapter):
     trace, and picking `solution` would leak the distillation trace into gold
     extraction.
 
+    include_solution=True additionally copies the reference worked solution
+    (column `solution_col`, default "solution") into meta.gold_solution. This
+    deliberately relaxes the never-read-solutions rule BEHIND AN OPT-IN for the
+    privileged improvement machinery (anchor privileged_divergence, improve
+    lora_sft): y* flows only into privileged scoring contexts and transient
+    LoRA weights — never into rollout/eval prompts or training text.
+    solution_strip_think keeps only the worked solution half of an R1-style
+    trace (see _clean_solution). solution_alt_cols names EXTRA solution columns
+    cleaned the same way into meta.gold_solutions_alt (a list) — datasets like
+    DeepMath ship several independent correct solutions per problem. Nothing
+    consumes gold_solutions_alt yet: load_gold_solutions returns one string per
+    qid, and every operator assumes that. It is captured here so a future
+    multi-reference operator does not require re-deriving the question set.
+
     args: preset=None (HF_MATH_PRESETS key; explicit args override), hf_name
           (required unless preset), config=None, split="train",
           question_col=None, answer_col=None, n_questions=None (seeded random
           subset), seed=17, max_items=None, where=None, require_any_true=None,
-          require_boxed_gold=False.
+          require_boxed_gold=False, include_solution=False, solution_col=None,
+          solution_alt_cols=None, solution_strip_think=False, meta_cols=None.
     `max_items` head-truncates the stream BEFORE sampling (debug fast-path
     only — it biases the sample toward the head of the dataset).
 
-    Metadata row filters (both applied BEFORE dedup/sampling; referencing a
+    Metadata row filters (all applied BEFORE dedup/sampling; referencing a
     missing column is a hard KeyError, mirroring the config unknown-key policy):
       where: {column: [allowed values]} — keep rows whose str(column) is in the
           whitelist. E.g. {question_type: [math-word-problem]} drops OpenR1's
@@ -210,6 +259,22 @@ class HFMathAdapter(DatasetAdapter):
           For proof-worded problems ("Prove that X >= f(n)") whose "gold" is
           the statement's own expression — echoing the question grades as a
           free pass, so pass/fail carries no signal.
+      exclude_answer_regex: drop rows whose EXTRACTED gold matches (re.search,
+          so the pattern must carry its own ^...$ anchors). Applied to the
+          post-_extract_final_answer string, i.e. exactly what grading uses.
+          For coin-flip golds: DeepMath answers 21% Yes/No/True/False plus bare
+          MCQ letters, which math-verify grades perfectly well but which a model
+          reaches by guessing — they can never be true cliffs (0.5**K) and only
+          inflate the solved class. Same rationale as openr1's question_type
+          MCQ drop, expressed on the answer side because DeepMath has no
+          question_type column.
+
+    meta_cols: [column, ...] — copy these columns verbatim into meta (NOT a
+        filter, but validated the same way: a missing column is a hard KeyError).
+        For curation columns worth carrying into the cliff set, e.g. deepmath's
+        difficulty/topic, so "which topics and difficulties does the model fall
+        off?" is answerable from the cliff set alone. Values must be
+        JSON-serializable — they are written to questions.jsonl.
     """
 
     def load(self, args: dict) -> list[QuestionRecord]:
@@ -230,9 +295,18 @@ class HFMathAdapter(DatasetAdapter):
         }
         require_any_true = args.get("require_any_true") or []
         require_boxed_gold = bool(args.get("require_boxed_gold"))
+        include_solution = bool(args.get("include_solution"))
+        solution_col = args.get("solution_col") or "solution"
+        solution_alt_cols = list(args.get("solution_alt_cols") or [])
+        strip_think = bool(args.get("solution_strip_think"))
+        meta_cols = list(args.get("meta_cols") or [])
         exclude_question = (
             re.compile(args["exclude_question_regex"])
             if args.get("exclude_question_regex") else None
+        )
+        exclude_answer = (
+            re.compile(args["exclude_answer_regex"])
+            if args.get("exclude_answer_regex") else None
         )
 
         if config:
@@ -251,17 +325,25 @@ class HFMathAdapter(DatasetAdapter):
                 f"{hf_name}[{split}] columns {ds.column_names} lack a recognizable "
                 "question/answer pair; pass adapter_args.question_col/answer_col."
             )
-        for col in [*where, *require_any_true]:
+        for col in [*where, *require_any_true, *meta_cols]:
             if col not in ds.column_names:
                 raise KeyError(
                     f"{hf_name}[{split}] has no column {col!r} (referenced by a "
-                    f"where/require_any_true filter); columns: {ds.column_names}"
+                    f"where/require_any_true/meta_cols entry); columns: {ds.column_names}"
                 )
+        if include_solution:
+            for col in [solution_col, *solution_alt_cols]:
+                if col not in ds.column_names:
+                    raise KeyError(
+                        f"{hf_name}[{split}] has no column {col!r} "
+                        f"(adapter_args.include_solution); columns: {ds.column_names}"
+                    )
 
         verifier = MathVerifier()
         records: list[QuestionRecord] = []
         n_seen = n_where = n_no_true = n_q_excl = n_unboxed = n_no_gold = n_unparsable = 0
-        for row in ds:
+        n_a_excl = n_no_solution = n_think_stripped = 0
+        for row_idx, row in enumerate(ds):
             n_seen += 1
             if any(str(row.get(col)) not in allowed for col, allowed in where.items()):
                 n_where += 1
@@ -281,16 +363,45 @@ class HFMathAdapter(DatasetAdapter):
                 n_unboxed += 1
                 continue
             final_answer = _extract_final_answer(gold)
+            if exclude_answer is not None and exclude_answer.search(final_answer):
+                n_a_excl += 1
+                continue
             if not verifier.gold_parsable(final_answer):
                 n_unparsable += 1
                 continue
+            # row_idx is the ORIGINAL dataset index (survives dedup/sampling), so
+            # scripts/backfill_gold_solutions.py can positionally re-join later.
+            # NB that script has no strip-think step: re-joining a solution_strip_think
+            # dataset through it would write the raw R1 trace back over a clean y*.
+            meta = {"hf_name": hf_name, "row_source": str(row.get("source") or ""),
+                    "row_idx": row_idx}
+            # Passthrough curation columns (deepmath: difficulty/topic). These
+            # ride into the cliff set, which is what makes "which topics and
+            # difficulties does the model fall off?" answerable without a re-join.
+            for col in meta_cols:
+                meta[col] = row.get(col)
+            if include_solution:
+                solution, stripped = _clean_solution(row.get(solution_col), strip_think)
+                n_think_stripped += stripped
+                if solution:
+                    meta["gold_solution"] = solution
+                else:
+                    n_no_solution += 1
+                alts = []
+                for col in solution_alt_cols:
+                    alt, stripped = _clean_solution(row.get(col), strip_think)
+                    n_think_stripped += stripped
+                    if alt:
+                        alts.append(alt)
+                if alts:
+                    meta["gold_solutions_alt"] = alts
             records.append(
                 QuestionRecord(
                     qid="hfm-" + stable_hash(hf_name, question),
                     question=question,
                     final_answer=final_answer,
                     domain="math",
-                    meta={"hf_name": hf_name, "row_source": str(row.get("source") or "")},
+                    meta=meta,
                 )
             )
             if max_items and len(records) >= max_items:
@@ -299,8 +410,12 @@ class HFMathAdapter(DatasetAdapter):
         print(
             f"[data] hf_math {hf_name}: kept {len(records)} / seen {n_seen} "
             f"(where-filtered {n_where}, no-true-filtered {n_no_true}, "
-            f"question-excluded {n_q_excl}, unboxed-gold {n_unboxed}, "
-            f"no-gold {n_no_gold}, unparsable {n_unparsable})"
+            f"question-excluded {n_q_excl}, answer-excluded {n_a_excl}, "
+            f"unboxed-gold {n_unboxed}, "
+            f"no-gold {n_no_gold}, unparsable {n_unparsable}"
+            + (f", missing-solution {n_no_solution}" if include_solution else "")
+            + (f", think-stripped {n_think_stripped}" if strip_think else "")
+            + ")"
         )
         if n_questions:
             if n_questions > len(records):
@@ -443,6 +558,25 @@ def ensure_questions(cfg, run_dir) -> tuple[list[QuestionRecord], list[QuestionR
     )
 
 
+def load_gold_solutions(run_dir) -> dict[str, str]:
+    """qid -> gold reference solution y* (privileged), read from the run's
+    FROZEN questions/train.jsonl — the single source of truth, so downstream
+    records (UnsolvedQuestion etc.) never need to carry y*. Questions without
+    meta.gold_solution are simply absent from the map; stages that require y*
+    decide how to handle the gap."""
+    from pathlib import Path
+
+    path = Path(run_dir) / "questions" / "train.jsonl"
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for q in QuestionRecord.load_jsonl(path):
+        solution = str(q.meta.get("gold_solution") or "").strip()
+        if solution:
+            out[q.qid] = solution
+    return out
+
+
 def split_holdout(
     records: list[QuestionRecord], n_holdout: int, seed: int
 ) -> tuple[list[QuestionRecord], list[QuestionRecord]]:
@@ -462,6 +596,28 @@ def _first_present(columns: list[str], candidates: list[str]) -> str | None:
         if c in columns:
             return c
     return None
+
+
+THINK_CLOSE = "</think>"
+
+
+def _clean_solution(text, strip_think: bool) -> tuple[str, bool]:
+    r"""(reference solution as y*, whether a think region was removed).
+
+    With strip_think, keep only what follows the LAST </think>. R1-style traces
+    (DeepMath r1_solution_*) are "<reasoning> </think> <worked solution>", and
+    handing the whole thing over as y* breaks three things: </think> is a REAL
+    special token (151668 for Qwen3) that templates.py would re-encode mid-USER
+    turn; the trace is ~10x the worked solution, so 13.5% of them alone exceed
+    lora_sft's max_pair_tokens and get silently dropped; and the privileged
+    scoring pass in anchor.py has no length cap, so prompt_logprobs OOMs.
+    No marker => nothing to strip (the tags come in pairs), text passes through.
+    """
+    s = str(text or "")
+    stripped = strip_think and THINK_CLOSE in s
+    if stripped:
+        s = s.rsplit(THINK_CLOSE, 1)[-1]
+    return s.strip(), stripped
 
 
 def _extract_final_answer(gold: str) -> str:

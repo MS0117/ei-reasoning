@@ -1,40 +1,39 @@
-# Expert-iteration default config: Qwen3-4B-Instruct-2507 on the OpenThoughts
-# math subset. Any field can be overridden on the CLI: --override rollout.n=4
-# GPU topology is NEVER hardcoded here: engine.gpus null means "use
-# CUDA_VISIBLE_DEVICES, else all visible devices".
+# LSPO baseline: vanilla LoRA-SFT — identical to toy_cliff.yaml except
+#   * NO anchor          (anchor.policy: none — resample from x alone)
+#   * NO project-back    (improve.lora_sft.project_back.enabled: false)
+#   * filtering = ONE uniform-random pick among verifier-passing candidates
+#                        (filter.selection.method: random + max_per_question: 1)
+#
+#   bash data/run_toy_cliff.sh -c data/configs/LSPO.yaml -b
+#
+# See the header comment of data/configs/toy_cliff.yaml for the full
+# toggle / token-budget documentation.
 
 run:
-  name: ei_qwen3_4b
+  name: lspo_toy_cliff        # wandb group
   output_root: runs
   seed: 17
   wandb:
     project: ei_reasoning
-    entity: null              # null -> the logged-in default entity
-    mode: online              # online | offline | disabled
+    mode: online
 
 model:
   base: Qwen/Qwen3-4B-Instruct-2507
   dtype: bfloat16
-  system_prompt: null
-  chat_template_kwargs: {}    # forwarded to apply_chat_template by EVERY
-                              # prompt-rendering stage. Hybrid Qwen3 (0.6B/4B/8B)
-                              # takes {enable_thinking: true|false}; the *-2507
-                              # Instruct and R1-Distill templates take none
 
 engine:
-  gpus: null                  # e.g. [0, 1, 2]; null -> CUDA_VISIBLE_DEVICES -> all
-  tensor_parallel: 1          # >1 groups GPUs per vLLM worker (bigger models)
+  gpus: null
+  tensor_parallel: 1
   gpu_memory_utilization: 0.90
-  max_model_len: 12288        # >= train.max_seq_len (logprob scoring needs full sequences)
-  score_batch_size: 256
-  enable_prefix_caching: true # anchors share the question prefix — big win in improve
-  enforce_eager: false
+  max_model_len: 20480
+  enable_lora: true
+  max_loras: 8
+  max_lora_rank: 16
+  max_logprobs: 20
   score_gpu_memory_utilization: 0.80   # C(y)/anchor scoring pools run at this
                               # instead of the value above: prompt_logprobs
                               # materializes a full-vocab fp32 log_softmax
                               # (~5 GiB spike) and 0.90 OOMs at 16k tokens
-  # ---- LoRA serving: required by the lora_sft / bridge_sft operators ----
-  # All default-off, so a non-LoRA run builds a byte-identical vLLM engine.
   score_max_num_batched_tokens: 4096   # score-mode prefill chunk. The
                               # full-vocab fp32 log_softmax is materialized per
                               # chunk, so the spike is chunk x vocab x 4 bytes:
@@ -42,60 +41,37 @@ engine:
                               # which OOMed even at 0.80 utilization once the KV
                               # cache was sized. Halving the chunk halves the
                               # spike and leaves the KV cache alone.
-  enable_lora: false          # true to serve per-request adapters in improve
-  max_loras: 8                # adapters co-resident per vLLM batch
-  max_lora_rank: 16           # must cover improve.lora_sft.fit.r
-  max_logprobs: 20            # raise to >= anchor.params.top_k for signal=topk_kl
 
 data:
-  adapter: openthoughts_math  # or local_jsonl with adapter_args.path
+  adapter: local_jsonl
   adapter_args:
-    hf_name: open-thoughts/OpenThoughts-114k
-    config: metadata
-    split: train
-    domain: math
-    max_items: 2000
+    path: data/cliff_sets/openr1_qwen3-4b-2507_n2000_with_gold.jsonl
   question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
-  eval_holdout: 200
-  accumulate: true            # STaR-style: train on the union of all iterations' data
+  eval_holdout: 0
+  accumulate: true
 
 rollout:
   n: 8
   temperature: 1.0
   top_p: 0.95
-  max_tokens: 8192
-  capture_logprobs: false
+  max_tokens: 16384
 
 partition:
-  verifier: math              # math | lean (lean needs the kimina server)
+  verifier: math
   solved_keep_max: 4
-  solved_selection: shortest  # shortest | first | random
-  # Route a question to improvement iff its clean-correct count <= this.
-  # 0 == the classic cliff rule (ALL rollouts failed); >= 1 lets a question be
-  # both solved (keeps its native trajectories) and improvement-eligible.
+  solved_selection: shortest
   cliff_max_correct: 0
 
-# ---- research extension points ------------------------------------------ #
+anchor:
+  policy: none                # LSPO: no anchor (improved samples are x -> full response)
+  base_selection: first_failed   # no anchor -> no selection cost either
 
-anchor:                       # (I) how much of a failed rollout to keep
-  policy: fixed_fraction      # fixed_fraction | none (register more in anchor.py)
-  params:
-    fraction: 0.3
-    min_tokens: 32
-    max_tokens: 2048
-  base_selection: first_failed  # which failed rollout to anchor on
-
-improve:                      # (II) how to continue from question+anchor
-  operator: self_resample     # self_resample | teacher (stub)
-  n: 8
-  temperature: 1.2            # hotter than rollout: we need diversity to escape the failure
+improve:
+  operator: lora_sft
+  n: 16                       # samples per question from q_phi
+  temperature: 1.2
   top_p: 0.98
-  max_tokens: 8192
-  rounds: 1
-  # ---- transient-LoRA operators (read by lora_sft AND bridge_sft) --------
-  # Inert while operator is self_resample; engine.enable_lora must be true to
-  # use either. Gold y* reaches the model through ADAPTER WEIGHTS only — it is
-  # never rendered into a rollout/eval prompt or into training text.
+  max_tokens: 16384
   lora_sft:
     # ---- HOW MANY TRANSIENT ADAPTERS FOR THE CLIFF BATCH ------------------
     # The operator's premise is a TRANSIENT adapter that overfits THIS batch
@@ -132,17 +108,18 @@ improve:                      # (II) how to continue from question+anchor
     #     single-adapter. Validate cheaply first: re-run the 107-cliff set with
     #     chunk_size 25 (4 adapters) against the pooled arm (--reuse-rollout
     #     makes it paired).
-    adapter_scope: pooled     # pooled (ONE adapter for the cliff batch) | per_problem
-    chunk_size: 0             # pooled only: 0 = one adapter for all questions;
-                              # N = one adapter per N-question chunk
-    refit_budget: 0           # per-problem refits for cliffs the pooled adapter
-                              # failed to resolve (0 = off)
+    adapter_scope: pooled     # LoRA fit question-batch: pooled (whole cliff batch, ONE
+                              # adapter) | per_problem (one adapter per question)
+    chunk_size: 0             # pooled only: 0 = one batch of ALL questions (current:
+                              # ~137 pairs -> 1 adapter); e.g. 4 = fit one adapter per
+                              # 4-question chunk, then sample those questions from it
+    refit_budget: 0
     fit:
       r: 16
       lora_alpha: 32
       lr: 1.0e-4
       steps: 3                # spec: 2-4 full-batch gradient steps
-      max_pair_tokens: 8192   # drop (x -> y*) pairs longer than this
+      max_pair_tokens: 16384
       dropout: 0.0
       micro_batch_size: 1     # grad-accum reaches the full batch each step
       max_grad_norm: 1.0      # 0 disables clipping
@@ -173,12 +150,12 @@ improve:                      # (II) how to continue from question+anchor
         eval_every: 2         # gradient steps per round (each round = 1 engine boot)
         m_rollouts: 4         # probe samples per question per round
         criterion: frac_solved   # frac_solved | mean_p_hat
-    project_back:             # sample alpha-scaled adapters, keep alpha* per problem
-      enabled: false
+    project_back:
+      enabled: false          # LSPO: no alpha scaling
       alphas: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-      tau_p: 0.25             # alpha* = min{alpha : P_hat >= tau_p}
-      m_rollouts: 16          # samples per (question, alpha) for P_hat
-      granularity: per_problem   # per_problem (C2-1) | per_batch
+      tau_p: 0.25
+      m_rollouts: 16
+      granularity: per_problem
     bridge:                   # read ONLY by improve.operator: bridge_sft
       n: 8                    # N_B bridge samples per cliff (base policy + y* prompt)
       temperature: null       # null -> improve.temperature
@@ -260,25 +237,27 @@ improve:                      # (II) how to continue from question+anchor
       min_delta: 0.01
       window: null            # logs averaged before comparing; null -> one epoch
                               # of steps ("did this epoch beat the last?")
-  teacher:
+  rounds: 1                   # improvement passes per iteration
+  teacher:                    # read only by improve.operator: teacher (stub)
     model: null
     gpus: null
     quantization: null
 
-filter:                       # (III) learnability gates, applied in order
+filter:
   gates: [correctness, no_external_context, length, dedup]
-  max_total_tokens: 10240
-  max_per_question: 2
-  selection:                  # which surviving candidates to keep
-    method: shortest          # shortest | c_score | random
-    always_score: false       # true -> measure C(y) even when method ignores it,
-                              # so arms with different selection stay comparable
-    lambda_tail: 1.0          # C = S_mean + lambda*S_tail + gamma*D_tail
-    gamma_dtail: 0.0          # > 0 adds a D_tail pass under the generating policy
-    tail_fraction: 0.1        # CVaR tail: mean of the worst 10% tokens
-    scope: continuation       # continuation | full
-  logprob_gate:
-    enabled: false            # scores survivors under the current policy (vLLM pass)
+  max_total_tokens: 18432
+  max_per_question: 1         # keep exactly ONE per question
+  selection:
+    method: random            # uniform random among verifier-passing candidates
+                              # (seeded per question — deterministic, order-independent)
+    always_score: true        # measure C(y) even though selection ignores it, so
+                              # arms that select differently stay comparable
+    lambda_tail: 1.0          # (unused by random; still shapes the reported C)
+    gamma_dtail: 0.0
+    tail_fraction: 0.1
+    scope: continuation
+  logprob_gate:               # drop candidates the student finds too unlikely
+    enabled: false
     min_mean_logprob: -1.5
     scope: continuation       # continuation | full
   leakage:                    # used by the `leakage_rules` gate (add it to gates
@@ -300,66 +279,15 @@ filter:                       # (III) learnability gates, applied in order
       - '\bthe hint\b'
       - '\baccording to the (solution|reference)\b'
 
-train:                        # (IV) objective over the mixed dataset
-  objective: sft              # sft | dpo | sft+dpo
-  init_from: base             # base (STaR-style, default) | last
-  backend: zero2              # single | zero2 | zero3 | fsdp2
-  max_seq_len: 10240
-  sft:
-    lr: 1.0e-5
-    epochs: 2
-    scheduler: cosine
-    warmup_ratio: 0.03
-    global_batch_size: 32     # grad_accum derived at runtime from GPU count
-    micro_batch_size: 1
-    weight_decay: 0.0
-    max_grad_norm: 1.0
-    bf16: true
-    gradient_checkpointing: true
-    packing: false            # per-token region weights require packing off
-    logging_steps: 5
-    region_weights:           # the key methodology knob for part (IV)
-      prompt: 0.0
-      anchor: 0.0             # 0 = condition on the anchor, don't imitate it
-      continuation: 1.0       # operator's continuation on improved trajectories
-      solution: 1.0           # full response on natively-solved trajectories
-  dpo:
-    lr: 5.0e-7
-    beta: 0.1
-    epochs: 1
-    global_batch_size: 16
-    micro_batch_size: 1
-    loss_type: sigmoid
-    max_grad_norm: 1.0
-    logging_steps: 5
+# ---- unused by the toy driver (defaults to satisfy config validation) ------ #
+train:
+  objective: sft
+  backend: zero2
+  max_seq_len: 18432
 
 loop:
-  iterations: 4
-  stages: [rollout, partition, anchor, improve, filters, build_dataset, train, eval, benchmark_eval]
+  iterations: 1
 
 eval:
-  # In-run holdout eval (cheap, every iteration): tracks EI progress on the
-  # training distribution. Absolute numbers come from benchmark_eval below.
   greedy_pass1: true
-  passk:
-    k: 8
-    temperature: 0.7
-    top_p: 0.95
   max_tokens: 8192
-
-  # ---- benchmark_eval stage: external competition benchmarks ------------- #
-  # Grading (math_strict) follows OPSD/literature conventions: strict last-
-  # \boxed extraction, pass@n / avg@n / maj@n / format rate. Sampling below is
-  # Qwen3 NON-thinking best practice (temp .7 / top_p .8 / top_k 20) to match
-  # the 2507 Instruct base; for hybrid-thinking bases use .6 / .95 / 20, raise
-  # max_tokens to ~32768, and set model.chat_template_kwargs {enable_thinking: true}.
-  # n=8 keeps per-iteration cost sane; paper-grade numbers (n=32) via
-  # scripts/eval_bench.sh + configs/bench_eval.yaml on chosen checkpoints.
-  benchmark_verifier: math_strict
-  benchmark_every: 1            # run every N iterations (skipped iters still write metrics.json)
-  benchmarks:
-    - {name: aime24, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
-    - {name: aime25, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
-    - {name: aime26, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
-    - {name: hmmt25, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
-    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 8192}

@@ -14,6 +14,8 @@
 #
 # Results land in runs/bench/<model-slug>_<ts>/iter_0/benchmark_eval/metrics.json —
 # a fresh timestamped dir per launch, so identical re-runs never overwrite.
+# <model-slug> names the model actually graded (the MODEL argument, else the
+# config's model.base), so the dir and its wandb run are never mislabelled.
 # To RESUME a partial run (finished benchmarks skip via .done markers):
 #   bash scripts/eval_bench.sh MODEL -r runs/bench/<model-slug>_<ts> [-g ...]
 set -euo pipefail
@@ -62,23 +64,48 @@ if [ -z "${NCCL_P2P_DISABLE:-}" ] && command -v nvidia-smi >/dev/null; then
   fi
 fi
 
+# The model that will actually be graded: the MODEL argument when given, else
+# the config's model.base (after --override). benchmark_eval.py applies exactly
+# this fallback, so resolving it here keeps the run-dir slug — and the wandb run
+# name, which is the dir basename — honest about which model produced the
+# numbers, instead of naming the dir "default" whenever MODEL was omitted.
+CONFIG_MODEL="$(.venv/bin/python - "$CONFIG" "$@" <<'PY'
+import sys
+
+from expert_iter.config import Config
+
+cfg_path, argv, overrides, i = sys.argv[1], sys.argv[2:], [], 0
+while i < len(argv):
+    if argv[i] == "--override" and i + 1 < len(argv):
+        overrides.append(argv[i + 1]); i += 2
+    elif argv[i].startswith("--override="):
+        overrides.append(argv[i].split("=", 1)[1]); i += 1
+    else:
+        i += 1
+print(Config.load(cfg_path, overrides=overrides).model.base)
+PY
+)"
+if [ -n "$MODEL" ] && [ "$MODEL" != "$CONFIG_MODEL" ]; then
+  echo ">>> NOTE: MODEL argument wins over the config's model.base ($CONFIG_MODEL)"
+fi
+MODEL="${MODEL:-$CONFIG_MODEL}"
+
 # Fresh timestamped run dir per launch so identical re-runs never overwrite
 # results; the frozen config snapshot stays truthful. To RESUME a partial run
 # (per-benchmark .done markers skip finished benchmarks), pass -r <run_dir>.
-SLUG="$(echo "${MODEL:-default}_$(basename "$CONFIG" .yaml)" | tr '/ ' '__')"
+SLUG="$(echo "${MODEL%/}_$(basename "$CONFIG" .yaml)" | tr '/ ' '__')"
 if [ -n "$RESUME_DIR" ]; then
   [ -d "$RESUME_DIR" ] || { echo "resume dir not found: $RESUME_DIR" >&2; exit 1; }
   RUN_DIR="$RESUME_DIR"
 else
   RUN_DIR="runs/bench/${SLUG}_$(date +%Y%m%d_%H%M%S)"
 fi
-echo ">>> model=${MODEL:-<config model.base>}  config=$CONFIG  run_dir=$RUN_DIR  GPUs=${CUDA_VISIBLE_DEVICES:-<all visible>}"
+echo ">>> model=$MODEL  config=$CONFIG  run_dir=$RUN_DIR  GPUs=${CUDA_VISIBLE_DEVICES:-<all visible>}"
 
+# --model-path is always explicit now that MODEL is resolved, so the model named
+# in the run dir is the model the stage loads and records in metrics.json.
 CMD=(.venv/bin/python -m expert_iter.benchmark_eval
-     --config "$CONFIG" --run-dir "$RUN_DIR" --iter 0)
-if [ -n "$MODEL" ]; then
-  CMD+=(--model-path "$MODEL")
-fi
+     --config "$CONFIG" --run-dir "$RUN_DIR" --iter 0 --model-path "$MODEL")
 CMD+=("$@")
 
 if $BACKGROUND; then

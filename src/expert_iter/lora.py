@@ -57,6 +57,52 @@ def resolve_model_path(model_path: str, dtype: str = "bfloat16") -> str:
     return str(merged)
 
 
+def fmt_alpha(alpha: float) -> str:
+    """Directory-name form of a scaling factor: 0.05 -> '0.05', 1.0 -> '1'."""
+    return f"{alpha:g}"
+
+
+def make_alpha_variant(adapter_dir: str | Path, alpha: float) -> Path:
+    """Materialize q_alpha = pi_{theta + alpha*phi} as an adapter dir.
+
+    LoRA's effective scale is lora_alpha / r, so an adapter_config.json copy
+    with lora_alpha multiplied by alpha IS the alpha-scaled adapter — the
+    weight files are shared via hardlink (fallback: copy). alpha == 1.0
+    returns the base dir untouched. Variants live under
+    <adapter_dir>/alpha/<alpha>/ so the content-addressed parent path keeps
+    engine pool cache keys honest. Idempotent."""
+    import shutil
+
+    adapter_dir = Path(adapter_dir)
+    if alpha == 1.0:
+        return adapter_dir
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be in (0, 1]: {alpha}")
+    config_path = adapter_dir / "adapter_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"not an adapter dir: {adapter_dir}")
+    out = adapter_dir / "alpha" / fmt_alpha(alpha)
+    cfg = json.loads(config_path.read_text())
+    scaled = cfg["lora_alpha"] * alpha
+    out_cfg = out / "adapter_config.json"
+    if out_cfg.exists() and json.loads(out_cfg.read_text()).get("lora_alpha") == scaled:
+        return out
+    out.mkdir(parents=True, exist_ok=True)
+    for p in adapter_dir.iterdir():
+        if not p.is_file() or p.name == "adapter_config.json":
+            continue
+        dst = out / p.name
+        if dst.exists():
+            continue
+        try:
+            dst.hardlink_to(p)
+        except OSError:
+            shutil.copy2(p, dst)
+    cfg["lora_alpha"] = scaled
+    out_cfg.write_text(json.dumps(cfg, indent=2))
+    return out
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:

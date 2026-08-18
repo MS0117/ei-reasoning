@@ -15,6 +15,9 @@ Outputs under --run-dir:
   samples.jsonl         graded generations, same schema as benchmark_eval
   question_stats.jsonl  {qid, n, c, pass_rate, class, n_truncated, final_answer}
   metrics.json          histogram + class counts + pass@k/avg@n and rates
+  cliff_questions.jsonl the c == 0 questions as QuestionRecords (gold solutions
+                        and all), stamped with passrate_{c,k,run,model} — the
+                        curated cliff set, ready for the local_jsonl adapter
 
 Launcher: data/run_passrate.sh. Hyperparameters live in the config YAML
 (data/configs/passrate.yaml); class thresholds are CLI flags here.
@@ -191,6 +194,29 @@ def summarize(rows: list[dict], k: int, grader, gold_by_qid: dict[str, str],
     return metrics, question_stats
 
 
+def write_cliff_set(path: Path, questions: list[QuestionRecord], question_stats: list[dict],
+                    *, k: int, run_name: str, model_path: str) -> int:
+    """The c == 0 questions, as QuestionRecords with provenance stamped into
+    meta. This is the curated artifact the whole experiment exists to produce:
+    data/cliff_sets/*.jsonl are copies of this file, read back by the
+    local_jsonl adapter. A pure function of already-computed data, so it is
+    rewritten on every run rather than .done-marked."""
+    by_qid = {q.qid: q for q in questions}
+    rows = []
+    for stat in question_stats:
+        if stat["c"] != 0:
+            continue
+        q = by_qid[stat["qid"]]
+        rows.append(QuestionRecord(
+            qid=q.qid, question=q.question, final_answer=q.final_answer, domain=q.domain,
+            # adapter meta first (hf_name/row_idx/gold_solution/gold_solutions_alt
+            # all ride along), then how this question earned its cliff label
+            meta={**q.meta, "passrate_c": 0, "passrate_k": k,
+                  "passrate_run": run_name, "passrate_model": model_path},
+        ))
+    return QuestionRecord.dump_jsonl(path, rows)
+
+
 def print_table(metrics: dict, question_stats: list[dict], k: int) -> None:
     n_q = metrics["n_questions"]
     hist = metrics["hist"]
@@ -279,6 +305,9 @@ def main(argv: list[str] | None = None) -> None:
                **metrics}
     write_jsonl(run_dir / "question_stats.jsonl", question_stats)
     write_json(run_dir / "metrics.json", metrics)
+    cliff_path = run_dir / "cliff_questions.jsonl"
+    n_cliff = write_cliff_set(cliff_path, questions, question_stats,
+                              k=cfg.rollout.n, run_name=run_dir.name, model_path=model_path)
 
     wb = stage_wandb(
         cfg, name=run_dir.name, id_file=run_dir / "wandb_id.txt", job_type="passrate",
@@ -295,6 +324,7 @@ def main(argv: list[str] | None = None) -> None:
     print_table(metrics, question_stats, cfg.rollout.n)
     print(f"[passrate] metrics: {metrics}")
     print(f"[passrate] wrote {run_dir / 'metrics.json'}")
+    print(f"[passrate] wrote {cliff_path} ({n_cliff} cliff questions, c=0/{cfg.rollout.n})")
 
 
 if __name__ == "__main__":

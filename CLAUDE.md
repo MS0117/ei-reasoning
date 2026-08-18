@@ -28,6 +28,13 @@ bash scripts/setup.sh --skip-lean          # math-only; omit flag for Lean/kimin
 
 # end-to-end smoke test: 1 iteration, Qwen3-0.6B, 50 questions, 1 GPU
 bash scripts/smoke.sh [GPU_ID]
+# same, but through the full new-method path (lora_sft + privileged_divergence
+# + project-back + C(y) selection)
+bash scripts/smoke.sh [GPU_ID] configs/methods/smoke_lora.yaml
+
+# one-time: attach OpenR1 gold solutions to the committed cliff set (CPU+network)
+.venv/bin/python scripts/backfill_gold_solutions.py \
+    --input data/cliff_sets/openr1_qwen3-4b-2507_n2000.jsonl
 
 # standalone benchmark eval (AIME24/25/26, HMMT25, MATH-500-hard) of any model:
 # HF hub id, EI checkpoint, or LoRA adapter dir (auto-merged)
@@ -56,6 +63,10 @@ bash scripts/eval_bench.sh Qwen/Qwen3-4B-Instruct-2507 [-c configs/bench_eval.ya
 - (IV) training objective (`train.py`) — region-weighted SFT and/or anchor-conditioned DPO
 
 Dataset adapters (`data.py`) and verifiers (`verifier.py`) use the same registry mechanism. The lean verifier is imported lazily so math-only machines never touch kimina.
+
+**Improvement-operator family** (all mix-and-match via config; toy presets under `data/configs/`): `lora_sft` (gold y\* pairs), `bridge_sft` (`bridge_sft.py` — fits on self-generated bridge trajectories z\* from a privileged y\*-showing prompt, verifier-accepted, optional G5 leakage rules/judge both default off; `BRIDGE.yaml` mirrors `LSPO.yaml` for paired comparison), plus two optional phases shared by both LoRA operators: adaptive τ_E fit termination (`improve.lora_sft.fit.adaptive` — rounds of `lora_fit --init-adapter` warm-starts probed until the solved-fraction clears tau_e or the ~10-step cap) and post-SFT RL (`improve.rl` — trl GRPOTrainer/RLOOTrainer on LoRA params only in the `lora_rl.py` subprocess, colocate vLLM + sleep mode, budget in `epochs` over the question set; "ppo" is rejected at config validation — grpo's epsilon IS the PPO clip). The RL phase is GPU-verified but **two trl defaults are wrong for long CoT and are overridden here**: `vllm_importance_sampling_mode` must be token-level (`sequence_mask` underflows to a zero gradient past ~4k completion tokens) and `vllm_max_model_length` must be set (else the colocate engine boots at the model's native 262k context) — see `docs/api_notes.md` findings 23–26 before touching it. `improve.rl.prompt_filter` (default off) is the DAPO-style zero-variance filter: without it ~74% of groups are all-wrong and contribute no gradient.
+
+**Cliff-improvement method stack (`configs/methods/` — one preset YAML per method).** Cliff = a question routed to improvement by `partition.cliff_max_correct` (default 0 = all rollouts failed). Components, all mix-and-match via config: the `lora_sft` operator (`lora_sft.py`) fits a transient LoRA on (x → y\*) via the `lora_fit.py` GPU subprocess and samples from it through per-request vLLM adapters (`engine.py` `GenRequest.lora_path`; `engine.enable_lora`); project-back samples α-scaled adapters (`lora.make_alpha_variant` — a `lora_alpha`-scaled config copy with hardlinked weights) and keeps the per-problem α\* = min{α : P̂ ≥ τ}; the `privileged_divergence` anchor cuts at step boundaries (`steps.py`) where the y\*-conditioned teacher-forcing pass diverges from the base pass; `filters.py` adds C(y) = S_mean + λ·S_tail + γ·D_tail candidate selection and leakage gates. Gold solutions y\* are **opt-in** (`data.adapter_args.include_solution` for hf_math, or `scripts/backfill_gold_solutions.py` for local sets), live only in `questions/train.jsonl` meta, and must never reach rollout/eval prompts or training text — they flow through adapter weights and privileged scoring contexts only. The vLLM LoRA / `max_logprobs` / prompt_logprobs-top-K surfaces have GPU probes in `check_env.py` (`gpu_lora_probes`); run them before relying on those paths on a new environment.
 
 **Token-id splicing invariant (load-bearing everywhere).** Token ids are the source of truth; text fields are for human inspection only. Anchors are always id-slices of the original rollout's `response_token_ids`, and prompts/training inputs are built by concatenating id lists — never by re-tokenizing decoded text, because BPE merges across a splice point silently shift region boundaries. `templates.py` is the ONE place text becomes token ids.
 

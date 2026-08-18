@@ -44,6 +44,9 @@ class ImprovementOperator(ABC):
         model_paths: dict[str, str],        # {"policy": path, "teacher": path?}
         work_dir,
         iteration: int,
+        gold_solutions: dict[str, str] | None = None,  # qid -> y* (privileged; weights/
+        # scoring channels ONLY — an operator that shows y* in a prompt must
+        # record that in external_context)
     ) -> list[ImprovedCandidate]:
         ...
 
@@ -54,7 +57,8 @@ class SelfResampleOperator(ImprovementOperator):
     improve.temperature. No external information — external_context is None
     by construction, so every candidate passes the learnability gate."""
 
-    def propose(self, questions, anchors, prompts, cfg, *, model_paths, work_dir, iteration):
+    def propose(self, questions, anchors, prompts, cfg, *, model_paths, work_dir,
+                iteration, gold_solutions=None):
         anchors_by_qid = {a.qid: a for a in anchors}
         usable = [q for q in questions if q.qid in anchors_by_qid]
         requests = [
@@ -156,6 +160,9 @@ def main(argv: list[str] | None = None) -> None:
         for u in unsolved
     }
 
+    from . import bridge_sft, lora_sft  # noqa: F401 — @register side effects (deferred: circular import)
+    from .data import load_gold_solutions
+
     operator: ImprovementOperator = build(OPERATORS, cfg.improve.operator)
     model_paths = {"policy": args.model_path}
     if "teacher" in operator.required_models:
@@ -168,6 +175,7 @@ def main(argv: list[str] | None = None) -> None:
         model_paths=model_paths,
         work_dir=it_dir / "improve" / "pool",
         iteration=args.iteration,
+        gold_solutions=load_gold_solutions(args.run_dir),
     )
     n = ImprovedCandidate.dump_jsonl(out_path, candidates)
     mark_done(out_path, count=n, config_hash=cfg.hash())

@@ -24,6 +24,26 @@ LOOP_STAGES = (
     "build_dataset", "train", "eval", "benchmark_eval",
 )
 
+# Registered improvement operators (registry.OPERATORS is populated by import
+# side effects, which config.py cannot trigger without a cycle — so the names
+# are mirrored here to fail a typo at CONFIG LOAD instead of an hour into the
+# run). The operator decides what the transient LoRA is fitted on; the
+# optional post-SFT RL phase is NOT an operator (improve.rl.enabled).
+IMPROVE_OPERATORS = ("self_resample", "lora_sft", "bridge_sft", "teacher")
+
+# anchor.params is a free-form dict, so a key belonging to a DIFFERENT policy
+# would otherwise be read by nobody and leave the active policy silently on its
+# hardcoded defaults (observed: a privileged_divergence run carrying
+# fixed_fraction's fraction/min_tokens/max_tokens). Mirrored here for the same
+# reason as IMPROVE_OPERATORS — registry.ANCHOR_POLICIES cannot be imported
+# without a cycle.
+ANCHOR_POLICY_PARAMS = {
+    "none": set(),
+    "fixed_fraction": {"fraction", "min_tokens", "max_tokens"},
+    "privileged_divergence": {"signal", "top_k", "c_sigma", "search_frac",
+                              "min_steps", "max_frac"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Sections
@@ -62,8 +82,29 @@ class EngineCfg:
     gpu_memory_utilization: float = 0.90
     max_model_len: int = 12288         # must cover the longest scored sequence
     score_batch_size: int = 256
+    # Score-mode utilization cap: prompt_logprobs materializes a full-vocab
+    # fp32 log_softmax per prefill chunk (~8192 tokens x 151k vocab x 4B ~= 5
+    # GiB spike ON TOP of the utilization budget). At 0.90 this OOMed on 16k
+    # sequences (A100 80GB, 2026-08-14); score pools therefore run at
+    # min(gpu_memory_utilization, this).
+    score_gpu_memory_utilization: float = 0.80
+    # vLLM's prefill chunk in SCORE mode. The full-vocab fp32 log_softmax is
+    # materialized per chunk, so the spike is chunk x vocab x 4 bytes — 4.64 GiB
+    # at vLLM's 8192 default on a 152k vocab, which OOMed even at 0.80
+    # utilization once the KV cache was sized ("Tried to allocate 4.58 GiB",
+    # A100 80GB, 2026-08-16). Halving the chunk halves the spike and leaves the
+    # KV cache untouched, which is cheaper than lowering the utilization.
+    score_max_num_batched_tokens: int = 4096
     enable_prefix_caching: bool = True
     enforce_eager: bool = False
+    # ---- LoRA serving (needed by the lora_sft improvement operator) ----
+    # All default-off: a non-LoRA run constructs a byte-identical vLLM engine.
+    enable_lora: bool = False
+    max_loras: int = 8                 # adapters co-resident per vLLM batch
+    max_lora_rank: int = 16            # must cover improve.lora_sft.fit.r
+    # vLLM cap on per-position logprob entries; raise to >= anchor top_k for
+    # the privileged_divergence topk_kl signal (vLLM default is 20).
+    max_logprobs: int = 20
 
 
 @dataclass
@@ -91,6 +132,11 @@ class PartitionCfg:
     verifier: str = "math"
     solved_keep_max: int = 4           # cap correct trajectories kept per question
     solved_selection: str = "shortest"  # shortest | first | random
+    # Route a question to improvement (unsolved.jsonl) iff its clean-correct
+    # count <= this. 0 == the classic cliff rule (all rollouts failed). With
+    # >=1 a question can be BOTH solved (keeps native trajectories) and
+    # improvement-eligible.
+    cliff_max_correct: int = 0
 
 
 @dataclass
@@ -108,6 +154,263 @@ class TeacherCfg:
 
 
 @dataclass
+class AdaptiveStopCfg:
+    """tau_E fit termination (applies to lora_sft AND bridge_sft fits): fit
+    eval_every gradient steps -> probe m_rollouts samples per question from the
+    round adapter -> stop when the criterion clears tau_e or the hard step cap
+    is reached. Disabled (default) = today's fixed fit.steps behavior. Each
+    round costs one lora_fit subprocess + one engine boot for the probe."""
+
+    enabled: bool = False
+    tau_e: float = 0.5
+    max_steps: int = 10                # hard cap on TOTAL gradient steps (spec ~10)
+    eval_every: int = 2                # gradient steps per round
+    m_rollouts: int = 4                # probe samples per question per round
+    criterion: str = "frac_solved"     # frac_solved (confirmed) | mean_p_hat
+
+
+@dataclass
+class LoraFitCfg:
+    """Transient LoRA SFT on (x -> y*) pairs (lora_fit.py subprocess)."""
+
+    r: int = 16
+    lora_alpha: int = 32
+    lr: float = 1.0e-4
+    steps: int = 3                     # full-batch gradient steps (spec: 2-4)
+    dropout: float = 0.0
+    target_modules: list[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+    ])
+    micro_batch_size: int = 1          # grad-accum reaches the full batch each step
+    max_grad_norm: float = 1.0         # 0 disables clipping
+    max_pair_tokens: int = 8192        # drop (x -> y*) pairs longer than this
+    bf16: bool = True
+    # Data-parallel ranks for the fit: null -> all engine GPUs (accelerate DDP,
+    # capped at the pair count); 1 forces the single-GPU launcher. The update is
+    # mathematically identical either way (DDP averaging is compensated), but
+    # not bitwise — so the topology is part of the fit cache key.
+    num_processes: int | None = None
+    # DDP only: all-reduce every K micro-batches instead of once per step. 0 =
+    # once per step, which makes the gap between collectives the whole shard —
+    # 264 s at 313 pairs on 2 GPUs, but 1264 s at 1500 pairs, past NCCL's 600 s
+    # watchdog, so a healthy large fit would abort. The update is identical
+    # either way (averaging running sums == averaging the totals).
+    sync_every: int = 8
+    adaptive: AdaptiveStopCfg = field(default_factory=AdaptiveStopCfg)
+
+
+@dataclass
+class ProjectBackCfg:
+    """Project-back / LoRA scaling (methodology filter 6a; executed in improve):
+    sample q_alpha = pi_{theta + alpha*phi} over the alpha grid, pick per problem
+    alpha* = min{alpha : P_hat(correct) >= tau_p} (else 1.0); candidates are the
+    correct samples at alpha* only."""
+
+    enabled: bool = False
+    alphas: list[float] = field(default_factory=lambda: [
+        0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+    ])
+    tau_p: float = 0.25
+    m_rollouts: int = 16               # samples per (problem, alpha) for P_hat
+    granularity: str = "per_problem"   # per_problem (C2-1 default) | per_batch
+
+
+@dataclass
+class BridgeCfg:
+    """bridge_sft operator: LoRA-fit targets are self-generated bridge
+    trajectories z+ (base policy prompted WITH y* — privileged, generation-time
+    only) instead of gold y*. Default acceptance check is verifier correctness
+    only (confirmed); the G5 leakage screens are opt-in."""
+
+    n: int = 8                          # N_B bridge samples per cliff
+    temperature: float | None = None    # null -> improve.temperature
+    retry_temperature: float = 1.5      # ONE hotter retry pass for B+-empty cliffs
+    max_keep: int = 4                   # bridge pairs kept per question (shortest-first)
+    leakage_rules: bool = False         # G5 regex screen over z+ text (patterns from
+                                        # filter.leakage.patterns); default OFF
+    judge_enabled: bool = False         # G5 LLM-judge screen over z+ text; default OFF
+    max_tokens: int | None = None       # null -> improve.max_tokens
+    sample_skipped: bool = True         # B+-empty cliffs still sampled from the
+                                        # pooled chunk adapter (confirmed)
+
+
+@dataclass
+class LoraSftCfg:
+    fit: LoraFitCfg = field(default_factory=LoraFitCfg)
+    adapter_scope: str = "pooled"      # pooled | per_problem
+    chunk_size: int = 0                # 0 = one pooled chunk; >0 = n problems per adapter
+    refit_budget: int = 0              # per-problem refits for cliffs the pooled
+                                       # adapter failed to resolve (0 = off)
+    project_back: ProjectBackCfg = field(default_factory=ProjectBackCfg)
+    bridge: BridgeCfg = field(default_factory=BridgeCfg)
+
+
+@dataclass
+class PlateauCfg:
+    """Reward-plateau early stop for the RL phase. DEFAULT OFF: trl logs the
+    mean reward of the CURRENT step's questions, and every step draws different
+    questions, so the raw per-step series tracks question difficulty rather than
+    learning progress — with window=1 the default patience fires at a median of
+    step 5 of 53 (simulated over the cliff difficulty distribution, see
+    tests/test_lora_rl.py::test_plateau_window_survives_question_noise).
+    Averaging over `window` logs is what makes the comparison meaningful."""
+
+    enabled: bool = False
+    patience: int = 3                  # windows without reward improvement
+    min_delta: float = 0.01
+    # Logs averaged before comparing. null -> one epoch of steps under an epochs
+    # budget (i.e. "did this epoch beat the last?"), 1 under a raw steps budget.
+    window: int | None = None
+
+
+@dataclass
+class RlPromptFilterCfg:
+    """Zero-variance prompt filtering before RL (DAPO's "dynamic sampling",
+    done ONCE offline instead of by resampling). A group whose rewards are all
+    equal has advantage 0 and contributes NO gradient; on the first real cliff
+    run 74.2% of groups were all-wrong, so most of the budget bought nothing.
+    Every published long-CoT recipe drops these prompts — DAPO resamples until
+    0 < correct < G (its single largest ablation win), Skywork-OR1 filters
+    pass-rate 0 or 1 offline, ScaleRL calls it zero-variance filtering — and trl
+    implements none of it, so it lives here.
+
+    DEFAULT OFF, which keeps a run byte-comparable with the pre-filter arms;
+    flipping it on is the paired comparison. Cost is one probe pool
+    (m_rollouts samples per question) off the freshly fitted adapter.
+
+    NOTE a cliff set is DEFINED by pass rate 0, i.e. exactly what these recipes
+    exclude. What makes the filter meaningful here is that it probes the
+    TRANSIENT LoRA, not the base policy: only questions the fit already lifted
+    off the floor are trainable by RL."""
+
+    enabled: bool = False
+    m_rollouts: int = 8                # probe samples per question (denominator)
+    # Keep a question iff min_pass_rate < n_correct/m_rollouts < max_pass_rate.
+    # The exclusive defaults drop all-wrong and all-right groups = DAPO's rule;
+    # (0.2, 0.8) reproduces the literature's pass-rate-band heuristic.
+    min_pass_rate: float = 0.0
+    max_pass_rate: float = 1.0
+
+
+@dataclass
+class RlCfg:
+    """Optional post-SFT RL on the LoRA params only (improve.rl): runs after
+    the fit (and adaptive stop), before candidate sampling. Prompts show NO
+    y* — the true target state (x [+ anchor]); reward = answer matching via
+    the partition verifier. phi_E replaces the fit adapter for the tail
+    (project-back and candidate sampling operate on it)."""
+
+    enabled: bool = False
+    algo: str = "grpo"                 # grpo (trl GRPOTrainer) | reinforce (trl RLOOTrainer)
+    group_size: int = 8                # G = num_generations
+    # Training budget: set EXACTLY ONE of epochs / steps.
+    #   epochs — passes over the chunk's question set; trl gets
+    #            num_train_epochs (max_steps=-1) and transformers derives the
+    #            step count from the dataloader, so the budget scales with the
+    #            cliff set instead of silently covering a fixed slice of it.
+    #   steps  — raw optimizer-step budget (an escape hatch / hard cap).
+    # One optimizer step consumes num_processes questions x group_size
+    # rollouts, so an epoch over N questions is floor(N / num_processes) steps
+    # (trl's RepeatSampler drops the N mod num_processes remainder; it reshuffles
+    # per epoch, so the dropped questions rotate).
+    epochs: float | None = 1.0
+    steps: int | None = None
+    # Questions per optimizer step = num_processes x grad_accum (per_device_train_
+    # batch_size is pinned to group_size = ONE group per device slot, so the GPU
+    # count alone would otherwise decide the batch). Raising this makes each
+    # update average over more questions; trl ties steps_per_generation to it, so
+    # the GENERATION batch grows the same way (grad_accum=4, G=8 -> 32 rollouts
+    # generated per step) — it costs memory, not extra generation.
+    grad_accum: int = 1
+    # Sequences per forward/backward (trl's per_device_train_batch_size), i.e.
+    # the activation-memory knob — NOT the number of questions per update.
+    # null -> group_size, the only value that keeps EVERY (world_size,
+    # grad_accum) pair legal (see resolve_batch_shape). Smaller values cut
+    # activation memory at long max_completion_length but constrain grad_accum.
+    micro_batch_size: int | None = None
+    # On by default (as in lora_fit): without it a 4B policy storing full
+    # activations for a multi-thousand-token completion dwarfs the colocate vLLM
+    # share. trl calls enable_input_require_grads() for PEFT models when this is
+    # set, so the LoRA path is safe.
+    gradient_checkpointing: bool = True
+    # 1e-6 is what both long-CoT math-RL studies at this completion length used
+    # (Tina; the LoRA-alpha study, which reported that RAISING it degraded
+    # results) and matches DAPO/Skywork full-parameter values. TRL/verl's
+    # "LoRA wants 10x the full-FT lr" guidance points at 1e-5 instead — this is
+    # a genuine split in the literature, so treat lr as the thing to sweep.
+    lr: float = 1.0e-6
+    epsilon: float = 0.2               # PPO clip range
+    kl_beta: float = 0.0               # 0 (no ref model) or <= 1e-3
+    temperature: float | None = None   # null -> improve.temperature
+    max_completion_length: int | None = None  # null -> improve.max_tokens
+    # ---- vLLM <-> training logprob mismatch correction (GRPO only) ----------
+    # The rollouts come out of vLLM but the gradient is computed by a
+    # transformers forward, and the two disagree on logprobs for the SAME tokens
+    # (different kernels, attention impl, bf16 rounding). trl corrects for it
+    # with exp(log pi_train - log pi_vllm).
+    #
+    # trl's DEFAULT MODE IS UNUSABLE FOR LONG CoT. "sequence_*" exponentiates
+    # the SUM over the completion, so the small per-token gaps (measured
+    # 0.0002-0.10) compound: ratio 0.983 at 73 tokens, 1.1e-33 at 3755, and 0
+    # past ~4k, which multiplies the whole sequence's loss by zero. A 62-step
+    # 16k-completion run produced grad_norm == 0 on every step over ~4k tokens
+    # (docs/api_notes.md finding 24). Token-level ratios stay near exp(+-0.1),
+    # inside the cap, with no accumulation.
+    #
+    # cap 2.0, not trl's 3.0: corroborated by verl's rollout_is_threshold
+    # default, TRL's own recipe configs, and the "Diagnosing TIM" tau_tok.
+    vllm_importance_sampling_correction: bool = True
+    vllm_importance_sampling_mode: str = "token_truncate"
+    vllm_importance_sampling_cap: float = 2.0
+    prompt_filter: RlPromptFilterCfg = field(default_factory=RlPromptFilterCfg)
+    plateau: PlateauCfg = field(default_factory=PlateauCfg)
+    vllm_gpu_memory_utilization: float = 0.3   # colocate vLLM share (per rank)
+    # Data-parallel ranks: null -> all engine GPUs (accelerate launch, one
+    # colocate vLLM per rank — GPU-verified); 1 forces the single-GPU path.
+    num_processes: int | None = None
+    backend: str = "trl"               # trl (colocate vLLM) | pool (reserved fallback)
+    seam_strict: bool = False          # anchored prompt retokenization seam:
+                                       # true = hard-fail on any mismatch, false = count+warn
+    seed: int | None = None            # null -> stable_seed(run.seed, "lora_rl", iter, chunk)
+
+
+def resolve_batch_shape(*, group_size: int, micro_batch_size: int | None,
+                        grad_accum: int, world_size: int) -> dict:
+    """The RL batch shape trl will actually run, or a ValueError naming the fix.
+
+    trl generates WHOLE groups per optimizer step, so its only hard constraint is
+
+        generation_batch_size = micro_batch x world_size x grad_accum
+        must be divisible by group_size
+
+    (rewards are gathered across processes before advantage normalization, so a
+    group may straddle ranks). micro_batch is transformers' per_device_train_
+    batch_size = sequences per forward/backward = the activation-memory knob;
+    questions per optimizer step is generation_batch_size / group_size. At
+    micro_batch == group_size the constraint is satisfied for every world_size
+    and grad_accum, which is why that is the default.
+    """
+    micro_batch = micro_batch_size or group_size
+    generation_batch_size = micro_batch * world_size * grad_accum
+    if generation_batch_size % group_size:
+        legal = [g for g in range(1, group_size + 1)
+                 if (micro_batch * world_size * g) % group_size == 0]
+        raise ValueError(
+            f"improve.rl batch shape rejected by trl: micro_batch_size({micro_batch}) x "
+            f"world_size({world_size}) x grad_accum({grad_accum}) = {generation_batch_size} "
+            f"is not divisible by group_size({group_size}) — trl generates whole groups. "
+            f"Legal grad_accum here: {legal or 'none'}; or set "
+            f"improve.rl.micro_batch_size=null (= group_size), which makes every "
+            f"grad_accum legal at any GPU count."
+        )
+    return {
+        "micro_batch": micro_batch,
+        "generation_batch_size": generation_batch_size,
+        "questions_per_step": generation_batch_size // group_size,
+    }
+
+
+@dataclass
 class ImproveCfg:
     operator: str = "self_resample"    # ⚗ extension point II
     n: int = 8                         # continuations sampled per anchor
@@ -116,6 +419,8 @@ class ImproveCfg:
     max_tokens: int = 8192
     rounds: int = 1                    # ⚗ multi-round retry budget for future operators
     teacher: TeacherCfg = field(default_factory=TeacherCfg)
+    lora_sft: LoraSftCfg = field(default_factory=LoraSftCfg)
+    rl: RlCfg = field(default_factory=RlCfg)
 
 
 @dataclass
@@ -126,11 +431,52 @@ class LogprobGateCfg:
 
 
 @dataclass
+class SelectionCfg:
+    """Per-question candidate selection (the CVaR component, methodology 6b).
+
+    Among verified-correct candidates keep the top max_per_question by
+    C(y) = S_mean + lambda_tail * S_tail + gamma_dtail * D_tail, computed under
+    the STUDENT policy (S_*) and the candidate's generating policy (D_tail).
+    method=shortest keeps the legacy shortest-first quota byte-for-byte."""
+
+    method: str = "shortest"           # shortest | c_score | random
+    # Measure C(y) even when the method does not rank by it, so arms that select
+    # differently (random / shortest) still report comparable C statistics.
+    # Costs one extra scoring pass over the survivors.
+    always_score: bool = False
+    lambda_tail: float = 1.0           # weight on S_tail (0 -> S_mean-only)
+    gamma_dtail: float = 0.0           # weight on D_tail (0 -> no q_P scoring pass)
+    tail_fraction: float = 0.1         # CVaR tail: mean of the worst ceil(f*T) tokens
+    scope: str = "continuation"        # continuation | full (= anchor+continuation)
+
+
+@dataclass
+class LeakageCfg:
+    """Leakage filter (methodology 6c), default OFF. The rule gate activates by
+    listing "leakage_rules" in filter.gates; the LLM judge is a batched
+    generation pass controlled by judge_enabled."""
+
+    judge_enabled: bool = False
+    judge_model: str | None = None     # null -> current policy
+    judge_max_tokens: int = 16
+    judge_temperature: float = 0.0
+    # \b-anchored: unanchored "as given" fired on benign substrings ("was given
+    # 5 candies"), inflating the measured floor ~2x on the 107-cliff toy runs.
+    patterns: list[str] = field(default_factory=lambda: [
+        r"주어진 풀이", r"참고 풀이", r"\breference solution\b", r"\bgiven solution\b",
+        r"\bprovided solution\b", r"\bmodel solution\b", r"\bofficial solution\b",
+        r"\bas given\b", r"\bthe hint\b", r"\baccording to the (solution|reference)\b",
+    ])
+
+
+@dataclass
 class FilterCfg:
     gates: list[str] = field(default_factory=lambda: ["correctness", "no_external_context", "length", "dedup"])
     max_total_tokens: int = 10240      # prompt+anchor+continuation cap (must fit train.max_seq_len)
     max_per_question: int = 2          # quota of improved trajectories kept per qid
     logprob_gate: LogprobGateCfg = field(default_factory=LogprobGateCfg)
+    selection: SelectionCfg = field(default_factory=SelectionCfg)
+    leakage: LeakageCfg = field(default_factory=LeakageCfg)
 
 
 @dataclass
@@ -293,8 +639,12 @@ class Config:
                 raise ValueError("engine.tensor_parallel must divide len(engine.gpus)")
         if not 0 < e.gpu_memory_utilization <= 1:
             raise ValueError("engine.gpu_memory_utilization must be in (0, 1]")
+        if e.score_max_num_batched_tokens < 1:
+            raise ValueError("engine.score_max_num_batched_tokens must be >= 1")
         if e.max_model_len < 1 or e.score_batch_size < 1:
             raise ValueError("engine max_model_len/score_batch_size must be >= 1")
+        if e.max_loras < 1 or e.max_lora_rank < 1 or e.max_logprobs < 1:
+            raise ValueError("engine max_loras/max_lora_rank/max_logprobs must be >= 1")
         if self.rollout.n < 1 or self.rollout.max_tokens < 1:
             raise ValueError("rollout.n/max_tokens must be >= 1")
         if self.rollout.temperature < 0 or not 0 < self.rollout.top_p <= 1:
@@ -305,23 +655,254 @@ class Config:
             raise ValueError("partition.solved_keep_max must be >= 1")
         if self.partition.solved_selection not in ("shortest", "first", "random"):
             raise ValueError(f"partition.solved_selection: {self.partition.solved_selection!r}")
-        if self.anchor.base_selection not in ("first_failed", "longest", "random"):
+        if not 0 <= self.partition.cliff_max_correct < self.rollout.n:
+            raise ValueError(
+                f"partition.cliff_max_correct ({self.partition.cliff_max_correct}) must be "
+                f"in [0, rollout.n) = [0, {self.rollout.n})"
+            )
+        if self.anchor.base_selection not in ("first_failed", "longest", "random", "min_mean_nll"):
             raise ValueError(f"anchor.base_selection: {self.anchor.base_selection!r}")
+        # Only EXPLICIT params are checked: AnchorCfg's default dict is
+        # fixed_fraction's, so every config that never writes a params block
+        # carries it regardless of policy — and each policy reads its own keys
+        # with its own defaults, so that case is legible-but-harmless rather
+        # than wrong. Truthiness on `known` skips policy "none" (reads nothing)
+        # and any unregistered policy (the registry rejects it later).
+        known = ANCHOR_POLICY_PARAMS.get(self.anchor.policy)
+        if known and self.anchor.params != AnchorCfg().params:
+            stray = sorted(set(self.anchor.params) - known)
+            if stray:
+                owners = {k: pol for pol, keys in ANCHOR_POLICY_PARAMS.items()
+                          for k in keys if k in stray}
+                raise ValueError(
+                    f"anchor.params {stray} are not read by "
+                    f"anchor.policy={self.anchor.policy!r} (it takes "
+                    f"{sorted(known) or 'no params'}). "
+                    + (f"They belong to {owners}. " if owners else "")
+                    + "Leaving them would silently run the active policy on its "
+                    "hardcoded defaults — swap the params block with the policy."
+                )
+        if self.anchor.policy == "privileged_divergence":
+            signal = self.anchor.params.get("signal", "realized_logratio")
+            if signal not in ("realized_logratio", "topk_kl", "matched_minus_shuffled"):
+                raise ValueError(f"anchor.params.signal: {signal!r}")
+            top_k = int(self.anchor.params.get("top_k", 100))
+            if signal == "topk_kl" and self.engine.max_logprobs < top_k:
+                raise ValueError(
+                    f"anchor.params.signal=topk_kl needs engine.max_logprobs >= "
+                    f"anchor.params.top_k ({top_k}), got {self.engine.max_logprobs}"
+                )
+            if self.data.adapter == "hf_math" and not self.data.adapter_args.get("include_solution"):
+                raise ValueError(
+                    "anchor.policy=privileged_divergence needs gold solutions: set "
+                    "data.adapter_args.include_solution=true (hf_math), or use a "
+                    "local_jsonl file with meta.gold_solution "
+                    "(scripts/backfill_gold_solutions.py)"
+                )
         if self.improve.n < 1 or self.improve.max_tokens < 1:
             raise ValueError("improve.n/max_tokens must be >= 1")
         if self.improve.temperature < 0 or not 0 < self.improve.top_p <= 1:
             raise ValueError("improve temperature must be >= 0 and top_p in (0, 1]")
         if self.improve.rounds != 1:
             raise ValueError("improve.rounds other than 1 is not implemented")
+        if self.improve.operator not in IMPROVE_OPERATORS:
+            hint = ""
+            if self.improve.operator in ("rl", "grpo", "reinforce", "ppo"):
+                hint = (" — RL is not an operator: it is an optional phase that "
+                        "refines whatever the operator fitted, enabled with "
+                        "improve.rl.enabled=true (+ improve.rl.algo=grpo|reinforce)")
+            raise ValueError(
+                f"improve.operator: {self.improve.operator!r} is not one of "
+                f"{list(IMPROVE_OPERATORS)}{hint}"
+            )
         teacher_values = dataclasses.asdict(self.improve.teacher)
         if self.improve.operator == "teacher" or any(v is not None for v in teacher_values.values()):
             raise ValueError("the teacher improvement operator/options are not implemented")
+        ls = self.improve.lora_sft
+        fit = ls.fit
+        if fit.r < 1 or fit.lora_alpha <= 0 or fit.lr <= 0:
+            raise ValueError("improve.lora_sft.fit r/lora_alpha/lr must be positive")
+        if not 1 <= fit.steps <= 32:
+            raise ValueError("improve.lora_sft.fit.steps must be in [1, 32]")
+        if not 0 <= fit.dropout < 1:
+            raise ValueError("improve.lora_sft.fit.dropout must be in [0, 1)")
+        if not fit.target_modules:
+            raise ValueError("improve.lora_sft.fit.target_modules must be non-empty")
+        if fit.micro_batch_size < 1 or fit.max_grad_norm < 0 or fit.max_pair_tokens < 1:
+            raise ValueError(
+                "improve.lora_sft.fit micro_batch_size/max_grad_norm/max_pair_tokens invalid"
+            )
+        if fit.num_processes is not None and fit.num_processes < 1:
+            raise ValueError(
+                "improve.lora_sft.fit.num_processes must be >= 1 or null (all GPUs)"
+            )
+        if ls.adapter_scope not in ("pooled", "per_problem"):
+            raise ValueError(f"improve.lora_sft.adapter_scope: {ls.adapter_scope!r}")
+        if ls.chunk_size < 0 or ls.refit_budget < 0:
+            raise ValueError("improve.lora_sft chunk_size/refit_budget must be >= 0")
+        pb = ls.project_back
+        if (not pb.alphas or sorted(pb.alphas) != list(pb.alphas)
+                or len(set(pb.alphas)) != len(pb.alphas)
+                or any(not 0 < a <= 1 for a in pb.alphas)):
+            raise ValueError(
+                "improve.lora_sft.project_back.alphas must be strictly increasing in (0, 1]"
+            )
+        if 1.0 not in pb.alphas:
+            raise ValueError(
+                "improve.lora_sft.project_back.alphas must contain 1.0 (the alpha*=1 fallback)"
+            )
+        if not 0 < pb.tau_p <= 1 or pb.m_rollouts < 1:
+            raise ValueError("improve.lora_sft.project_back tau_p/m_rollouts invalid")
+        if pb.granularity not in ("per_problem", "per_batch"):
+            raise ValueError(f"improve.lora_sft.project_back.granularity: {pb.granularity!r}")
+        ad = fit.adaptive
+        if not 0 < ad.tau_e <= 1:
+            raise ValueError("improve.lora_sft.fit.adaptive.tau_e must be in (0, 1]")
+        if not 1 <= ad.eval_every <= ad.max_steps <= 64:
+            raise ValueError(
+                "improve.lora_sft.fit.adaptive needs 1 <= eval_every <= max_steps <= 64"
+            )
+        if fit.sync_every < 0:
+            raise ValueError("improve.lora_sft.fit.sync_every must be >= 0 (0 = once per step)")
+        if ad.m_rollouts < 1:
+            raise ValueError("improve.lora_sft.fit.adaptive.m_rollouts must be >= 1")
+        if ad.criterion not in ("frac_solved", "mean_p_hat"):
+            raise ValueError(f"improve.lora_sft.fit.adaptive.criterion: {ad.criterion!r}")
+        br = ls.bridge
+        if br.n < 1 or br.max_keep < 1:
+            raise ValueError("improve.lora_sft.bridge n/max_keep must be >= 1")
+        if br.retry_temperature < 0 or (br.temperature is not None and br.temperature < 0):
+            raise ValueError("improve.lora_sft.bridge temperatures must be >= 0")
+        if br.max_tokens is not None and br.max_tokens < 1:
+            raise ValueError("improve.lora_sft.bridge.max_tokens must be >= 1 or null")
+        if self.improve.operator in ("lora_sft", "bridge_sft"):
+            if not self.engine.enable_lora:
+                raise ValueError(
+                    f"improve.operator={self.improve.operator} needs engine.enable_lora=true"
+                )
+            if self.engine.max_lora_rank < fit.r:
+                raise ValueError(
+                    f"engine.max_lora_rank ({self.engine.max_lora_rank}) < "
+                    f"improve.lora_sft.fit.r ({fit.r})"
+                )
+        rl = self.improve.rl
+        if rl.algo == "ppo":
+            raise ValueError(
+                "improve.rl.algo=ppo is not supported: grpo's epsilon IS the PPO clip "
+                "(true value-model PPO is deferred) — use improve.rl.algo=grpo"
+            )
+        if rl.algo not in ("grpo", "reinforce"):
+            raise ValueError(f"improve.rl.algo: {rl.algo!r} (grpo | reinforce)")
+        if not 0 <= rl.kl_beta <= 1e-3:
+            raise ValueError("improve.rl.kl_beta must be 0 or <= 1e-3 (methodology: no/tiny KL)")
+        if rl.group_size < 2 or rl.epsilon <= 0 or rl.lr <= 0:
+            raise ValueError("improve.rl group_size>=2, epsilon>0, lr>0 required")
+        if (rl.epochs is None) == (rl.steps is None):
+            raise ValueError(
+                "improve.rl: set exactly one of epochs / steps "
+                f"(got epochs={rl.epochs!r}, steps={rl.steps!r}) — epochs scales the "
+                "budget with the cliff set, steps pins it to a fixed count"
+            )
+        if rl.epochs is not None and rl.epochs <= 0:
+            raise ValueError("improve.rl.epochs must be > 0 or null (then set steps)")
+        if rl.steps is not None and rl.steps < 1:
+            raise ValueError("improve.rl.steps must be >= 1 or null (then set epochs)")
+        if not 0 < rl.vllm_gpu_memory_utilization < 1:
+            raise ValueError("improve.rl.vllm_gpu_memory_utilization must be in (0, 1)")
+        if rl.num_processes is not None and rl.num_processes < 1:
+            raise ValueError("improve.rl.num_processes must be >= 1 or null (all GPUs)")
+        if rl.grad_accum < 1:
+            raise ValueError("improve.rl.grad_accum must be >= 1")
+        if rl.micro_batch_size is not None and rl.micro_batch_size < 1:
+            raise ValueError("improve.rl.micro_batch_size must be >= 1 or null (= group_size)")
+        # World size is only known here when it is pinned; otherwise the same
+        # check runs in _launch_lora_rl, before any GPU work starts.
+        if rl.num_processes is not None:
+            resolve_batch_shape(group_size=rl.group_size,
+                                micro_batch_size=rl.micro_batch_size,
+                                grad_accum=rl.grad_accum,
+                                world_size=rl.num_processes)
+        if rl.plateau.patience < 1 or rl.plateau.min_delta < 0:
+            raise ValueError("improve.rl.plateau patience>=1 and min_delta>=0 required")
+        if rl.plateau.window is not None and rl.plateau.window < 1:
+            raise ValueError("improve.rl.plateau.window must be >= 1 or null (one epoch)")
+        is_modes = ("token_truncate", "token_mask", "sequence_truncate", "sequence_mask")
+        if rl.vllm_importance_sampling_mode not in is_modes:
+            raise ValueError(
+                f"improve.rl.vllm_importance_sampling_mode: "
+                f"{rl.vllm_importance_sampling_mode!r} (one of {list(is_modes)}). "
+                "Prefer a token_* mode for long completions — sequence_* "
+                "exponentiates the SUM of per-token logprob gaps and underflows "
+                "to zero past a few thousand tokens (api_notes finding 24)"
+            )
+        if rl.vllm_importance_sampling_cap <= 1:
+            raise ValueError(
+                "improve.rl.vllm_importance_sampling_cap must be > 1 "
+                "(verl/TRL recipes and the Diagnosing-TIM paper all use 2.0)"
+            )
+        pf = rl.prompt_filter
+        if pf.m_rollouts < 2:
+            raise ValueError(
+                "improve.rl.prompt_filter.m_rollouts must be >= 2 — a single "
+                "sample cannot distinguish a mixed group from a uniform one"
+            )
+        if not 0 <= pf.min_pass_rate < pf.max_pass_rate <= 1:
+            raise ValueError(
+                "improve.rl.prompt_filter needs 0 <= min_pass_rate < max_pass_rate <= 1 "
+                f"(got {pf.min_pass_rate}, {pf.max_pass_rate})"
+            )
+        if rl.max_completion_length is not None and rl.max_completion_length < 1:
+            raise ValueError("improve.rl.max_completion_length must be >= 1 or null")
+        # The colocate engine is capped at engine.max_model_len, so the completion
+        # budget plus its prompt has to fit inside it.
+        rl_completion = rl.max_completion_length or self.improve.max_tokens
+        if rl.enabled and rl_completion >= self.engine.max_model_len:
+            raise ValueError(
+                f"improve.rl completion budget ({rl_completion}) >= engine.max_model_len "
+                f"({self.engine.max_model_len}) — the RL vLLM engine is capped at "
+                "max_model_len and still has to fit the prompt; lower "
+                "improve.rl.max_completion_length or raise engine.max_model_len"
+            )
+        if rl.temperature is not None and rl.temperature < 0:
+            raise ValueError("improve.rl.temperature must be >= 0 or null")
+        if rl.backend != "trl":
+            raise ValueError(
+                "improve.rl.backend=pool is reserved for the engine-pool fallback "
+                "(lands only if the trl<->vllm probe fails) — use backend=trl"
+            )
+        if rl.enabled and self.improve.operator not in ("lora_sft", "bridge_sft"):
+            raise ValueError(
+                "improve.rl.enabled needs a LoRA operator "
+                "(improve.operator=lora_sft|bridge_sft)"
+            )
         if self.filter.max_total_tokens < 1 or self.filter.max_per_question < 1:
             raise ValueError("filter token/per-question limits must be >= 1")
         if not self.filter.gates or len(set(self.filter.gates)) != len(self.filter.gates):
             raise ValueError("filter.gates must be a non-empty list without duplicates")
         if self.filter.logprob_gate.scope not in ("continuation", "full"):
             raise ValueError(f"filter.logprob_gate.scope: {self.filter.logprob_gate.scope!r}")
+        sel = self.filter.selection
+        if sel.method not in ("shortest", "c_score", "random"):
+            raise ValueError(f"filter.selection.method: {sel.method!r}")
+        if sel.lambda_tail < 0 or sel.gamma_dtail < 0:
+            raise ValueError("filter.selection lambda_tail/gamma_dtail must be >= 0")
+        if not 0 < sel.tail_fraction <= 1:
+            raise ValueError("filter.selection.tail_fraction must be in (0, 1]")
+        if sel.scope not in ("continuation", "full"):
+            raise ValueError(f"filter.selection.scope: {sel.scope!r}")
+        if sel.method == "c_score" and sel.gamma_dtail > 0:
+            if self.improve.operator not in ("lora_sft", "bridge_sft") or not self.engine.enable_lora:
+                raise ValueError(
+                    "filter.selection.gamma_dtail > 0 needs a LoRA operator "
+                    "(improve.operator=lora_sft|bridge_sft) and engine.enable_lora=true "
+                    "(D_tail scores under the generating LoRA policy; for self_resample "
+                    "q == pi_theta makes D_tail identically 0)"
+                )
+        lk = self.filter.leakage
+        if lk.judge_max_tokens < 1 or lk.judge_temperature < 0:
+            raise ValueError("filter.leakage judge_max_tokens/judge_temperature invalid")
+        if "leakage_rules" in self.filter.gates and not lk.patterns:
+            raise ValueError("filter.gates includes leakage_rules but filter.leakage.patterns is empty")
         if self.loop.iterations < 1:
             raise ValueError("loop.iterations must be >= 1")
         if not self.loop.stages or len(set(self.loop.stages)) != len(self.loop.stages):

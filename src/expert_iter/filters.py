@@ -2,16 +2,25 @@
 candidates.
 
 A candidate must be (a) correct where the base policy failed and (b) trainable:
-nothing in it may depend on information absent at inference time. Cheap gates
-run per-candidate in the config-ordered chain; the optional logprob gate runs
-as one batched vLLM scoring pass over the survivors; a per-question quota is
-applied last.
+nothing in it may depend on information absent at inference time. Pass order:
 
-Outputs under iter_k/filtered/: kept.jsonl (ImprovedCandidate), report.json.
+  1. cheap per-candidate gates in the config-ordered chain (filter.gates);
+  2. optional batched scoring passes over the survivors — logprob gate,
+     leakage LLM judge;
+  3. per-question selection LAST (so kept slots hold fully-vetted candidates):
+     either the legacy shortest-first quota or C(y) ranking
+     (filter.selection.method=c_score) — C(y) = S_mean + lambda*S_tail +
+     gamma*D_tail under the student, keep the top max_per_question by min C.
+
+Outputs under iter_k/filtered/: kept.jsonl (ImprovedCandidate), report.json,
+and candidate_scores.jsonl when C(y) selection ran.
 """
 
 from __future__ import annotations
 
+import math
+import random
+import re
 import sys
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -20,7 +29,16 @@ from dataclasses import dataclass, field
 from .config import Config, load_stage_config, stage_argparser
 from .records import ImprovedCandidate, QuestionRecord, UnsolvedQuestion
 from .registry import GATES, VERIFIERS, build, register
-from .utils import is_done, iter_dir, mark_done, read_json, stable_hash, write_json
+from .utils import (
+    is_done,
+    iter_dir,
+    mark_done,
+    read_json,
+    stable_hash,
+    stable_seed,
+    write_json,
+    write_jsonl,
+)
 from . import verifier  # noqa: F401 — imported for its @register side effect on VERIFIERS
 
 
@@ -89,6 +107,35 @@ class DedupGate(Gate):
         return (True, "")
 
 
+@register(GATES, "leakage_rules")
+class LeakageRulesGate(Gate):
+    """Rule half of the leakage filter (methodology 6c): reject continuations
+    that textually presuppose an external reference solution/hint. Patterns
+    come from filter.leakage.patterns (regex, case-insensitive). Activated by
+    listing "leakage_rules" in filter.gates; NOT in the default list. The
+    anchor needs no scanning — it is a slice of the pre-privileged rollout."""
+
+    _compiled: list[re.Pattern] | None = None
+
+    def check(self, cand, ctx):
+        if self._compiled is None:
+            self._compiled = [
+                re.compile(p, re.IGNORECASE) for p in ctx.cfg.filter.leakage.patterns
+            ]
+        for rx in self._compiled:
+            if rx.search(cand.continuation_text):
+                return (False, "pattern")
+        return (True, "")
+
+
+def cvar(values: list[float], tail_fraction: float) -> float:
+    """CVaR_{f}: mean of the worst (largest) ceil(f*T) values (methodology §CVaR)."""
+    if not values:
+        raise ValueError("cvar of an empty sequence")
+    k = max(1, math.ceil(tail_fraction * len(values)))
+    return sum(sorted(values, reverse=True)[:k]) / k
+
+
 def main(argv: list[str] | None = None) -> None:
     args = stage_argparser("EI filters stage").parse_args(argv)
     cfg = load_stage_config(args)
@@ -126,17 +173,46 @@ def main(argv: list[str] | None = None) -> None:
         survivors, n_rej = _logprob_gate(survivors, cfg, args.model_path, it_dir)
         rejects["logprob:below_threshold"] = n_rej
 
-    # Per-question quota, preferring the shortest total sequence (cheapest to
-    # learn, least room for degenerate rambling).
-    by_qid: dict[str, list[ImprovedCandidate]] = defaultdict(list)
-    for c in survivors:
-        by_qid[c.qid].append(c)
-    kept: list[ImprovedCandidate] = []
-    for qid, cands in by_qid.items():
-        ranked = sorted(cands, key=lambda c: len(c.anchor_token_ids) + len(c.continuation_token_ids))
-        quota = ranked[:cfg.filter.max_per_question]
-        rejects["quota:over_max_per_question"] += len(ranked) - len(quota)
-        kept.extend(quota)
+    leakage_report: dict = {}
+    if cfg.filter.leakage.judge_enabled and survivors:
+        survivors, n_flagged, leakage_report = _leakage_judge(
+            survivors, cfg, args.model_path, it_dir,
+        )
+        rejects["leakage_judge:flagged"] = n_flagged
+
+    # C(y) SCORING is deliberately separate from SELECTION: c_score ranks by it,
+    # but any method can measure it (filter.selection.always_score) so arms with
+    # different selection rules stay comparable on the same yardstick. Survivors
+    # here have cleared the gate chain — with the default gates that means
+    # verifier-correct — so these statistics describe exactly Y+.
+    sel_cfg = cfg.filter.selection
+    scores: dict[str, dict] = {}
+    selection_report: dict = {"method": sel_cfg.method, "n_survivors": len(survivors)}
+    if survivors and (sel_cfg.method == "c_score" or sel_cfg.always_score):
+        scores, score_report = _score_candidates(survivors, cfg, args.model_path, it_dir)
+        selection_report.update(score_report)
+
+    # Per-question selection runs LAST so the kept slots hold fully-vetted candidates.
+    if sel_cfg.method == "c_score" and survivors:
+        kept, n_over = _rank_by_c_score(survivors, cfg, scores)
+        rejects["selection:over_max_per_question"] = n_over
+    elif sel_cfg.method == "random" and survivors:
+        kept, n_over = _random_selection(survivors, cfg)
+        rejects["selection:over_max_per_question"] = n_over
+    else:
+        # Quota preferring the shortest total sequence (cheapest to learn,
+        # least room for degenerate rambling).
+        by_qid: dict[str, list[ImprovedCandidate]] = defaultdict(list)
+        for c in survivors:
+            by_qid[c.qid].append(c)
+        kept = []
+        for qid, cands in by_qid.items():
+            ranked = sorted(cands, key=lambda c: len(c.anchor_token_ids) + len(c.continuation_token_ids))
+            quota = ranked[:cfg.filter.max_per_question]
+            rejects["quota:over_max_per_question"] += len(ranked) - len(quota)
+            kept.extend(quota)
+    if scores:
+        _write_candidate_scores(scores, kept, it_dir)
 
     n = ImprovedCandidate.dump_jsonl(out_path, kept)
     part_stats_path = it_dir / "partition" / "stats.json"
@@ -150,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
         "n_questions_unsolved": len(unsolved),
         "improve_yield": round(len({c.qid for c in kept}) / len(unsolved), 4) if unsolved else 0.0,
         "rejects": dict(rejects),
+        **({"selection": selection_report} if selection_report else {}),
+        **({"leakage": leakage_report} if leakage_report else {}),
         **cliff_stats(candidates, unsolved, ctx, n_total_questions),
         # trainability/* metrics (D_mean, D_p95, D_max, per_token_max_deficit —
         # sequence/token-level log-ratio of a trajectory under the current policy
@@ -191,6 +269,211 @@ def cliff_stats(candidates: list[ImprovedCandidate], unsolved: dict[str, Unsolve
     if n_total_questions:
         stats["cliff/ratio"] = round(n_cliff / n_total_questions, 4)
     return stats
+
+
+def _cand_key(c: ImprovedCandidate) -> str:
+    return f"{c.qid}:{c.base_sample_idx}:{c.attempt_idx}"
+
+
+def _random_selection(survivors, cfg: Config):
+    """Uniform random pick of max_per_question survivors per question (the
+    survivors already cleared the gate chain — with the default gates that
+    means they are verifier-correct). Deterministic per (run.seed, qid), and
+    independent of candidate order. Returns (kept, n_over_quota)."""
+    by_qid: dict[str, list[ImprovedCandidate]] = defaultdict(list)
+    for c in survivors:
+        by_qid[c.qid].append(c)
+    kept: list[ImprovedCandidate] = []
+    n_over = 0
+    for qid, cands in by_qid.items():
+        ranked = sorted(cands, key=lambda c: (c.base_sample_idx, c.attempt_idx))
+        rng = random.Random(stable_seed(cfg.run.seed, "selection", qid))
+        picks = rng.sample(ranked, min(cfg.filter.max_per_question, len(ranked)))
+        n_over += len(ranked) - len(picks)
+        kept.extend(sorted(picks, key=lambda c: (c.base_sample_idx, c.attempt_idx)))
+    return kept, n_over
+
+
+def _score_candidates(survivors, cfg: Config, model_path: str, it_dir):
+    """C(y) scoring (methodology 6b): score every survivor under the student
+    pi_theta (S_mean, S_tail) and — when gamma_dtail > 0 — under its generating
+    policy q_P via op_meta.lora_path (D_tail), giving
+    C = S_mean + lambda*S_tail + gamma*D_tail. Pure MEASUREMENT: selection is a
+    separate step, so these numbers are comparable across arms that select
+    differently. Returns ({cand_key: {s_mean, s_tail, d_tail, c}}, report)."""
+    from .engine import GenRequest, run_pool
+
+    sel = cfg.filter.selection
+    tail = sel.tail_fraction
+    reqs: list[GenRequest] = []
+    n_missing_lora_ref = 0
+    for c in survivors:
+        seq = c.prompt_token_ids + c.anchor_token_ids + c.continuation_token_ids
+        score_from = (len(c.prompt_token_ids) + len(c.anchor_token_ids)
+                      if sel.scope == "continuation" else len(c.prompt_token_ids))
+        key = _cand_key(c)
+        reqs.append(GenRequest(rid=f"{key}:s", prompt_token_ids=seq,
+                               score_from=score_from))
+        if sel.gamma_dtail > 0:
+            lora_path = (c.op_meta or {}).get("lora_path")
+            if lora_path:
+                reqs.append(GenRequest(rid=f"{key}:d", prompt_token_ids=seq,
+                                       score_from=score_from, lora_path=lora_path))
+            else:
+                n_missing_lora_ref += 1
+    results = run_pool(
+        reqs, mode="score", model_path=model_path,
+        sampling={"return_token_logprobs": True},
+        engine_cfg=cfg.engine, work_dir=it_dir / "filtered" / "pool_selection",
+        dtype=cfg.model.dtype,
+    )
+    by_rid = {r.rid: r for r in results}
+
+    scored: dict[str, dict] = {}
+    for c in survivors:
+        key = _cand_key(c)
+        lp_s = by_rid[f"{key}:s"].token_logprobs or []
+        nll = [-v for v in lp_s if v is not None]
+        d_tail = None
+        r_d = by_rid.get(f"{key}:d")
+        if r_d is not None:
+            lp_q = r_d.token_logprobs or []
+            deltas = [q - s for q, s in zip(lp_q, lp_s)
+                      if q is not None and s is not None]
+            if deltas:
+                d_tail = cvar(deltas, tail)
+        if nll:
+            s_mean = sum(nll) / len(nll)
+            s_tail = cvar(nll, tail)
+            c_score = s_mean + sel.lambda_tail * s_tail
+            if d_tail is not None:
+                c_score += sel.gamma_dtail * d_tail
+        else:  # nothing scorable — deprioritize without crashing
+            s_mean = s_tail = None
+            c_score = math.inf
+        scored[key] = {
+            "qid": c.qid, "key": key,
+            "s_mean": _r4(s_mean), "s_tail": _r4(s_tail), "d_tail": _r4(d_tail),
+            "c": _r4(c_score if c_score != math.inf else None),
+            "_c_raw": c_score,          # unrounded, inf for unscorable; not persisted
+        }
+
+    report = {
+        "lambda_tail": sel.lambda_tail,
+        "gamma_dtail": sel.gamma_dtail,
+        "tail_fraction": tail,
+        "scope": sel.scope,
+        "n_scored": len(scored),
+        "n_missing_lora_ref": n_missing_lora_ref,
+    }
+    for metric in ("s_mean", "s_tail", "d_tail", "c"):
+        vals = sorted(row[metric] for row in scored.values() if row[metric] is not None)
+        if vals:
+            report[metric] = {
+                "mean": round(sum(vals) / len(vals), 4),
+                "p50": _pct(vals, 0.50), "p90": _pct(vals, 0.90),
+                "p95": _pct(vals, 0.95), "p99": _pct(vals, 0.99),
+                "max": vals[-1],
+            }
+    return scored, report
+
+
+def _rank_by_c_score(survivors, cfg: Config, scores: dict[str, dict]):
+    """Keep the max_per_question candidates with the SMALLEST C(y) per question
+    (ties: shorter first, then attempt order). Returns (kept, n_over_quota)."""
+    by_qid: dict[str, list[ImprovedCandidate]] = defaultdict(list)
+    for c in survivors:
+        by_qid[c.qid].append(c)
+    kept: list[ImprovedCandidate] = []
+    n_over = 0
+    for qid, cands in by_qid.items():
+        ranked = sorted(cands, key=lambda c: (
+            scores.get(_cand_key(c), {}).get("_c_raw", math.inf),
+            len(c.anchor_token_ids) + len(c.continuation_token_ids),
+            c.attempt_idx,
+        ))
+        quota = ranked[:cfg.filter.max_per_question]
+        n_over += len(ranked) - len(quota)
+        kept.extend(quota)
+    return kept, n_over
+
+
+def _write_candidate_scores(scores: dict[str, dict], kept, it_dir) -> None:
+    """Persist per-candidate C(y) rows with the ACTUAL kept flags (whatever
+    selection method produced them), so every arm's scores stay comparable."""
+    kept_keys = {_cand_key(c) for c in kept}
+    rows = []
+    for key in sorted(scores):
+        row = {k: v for k, v in scores[key].items() if not k.startswith("_")}
+        row["kept"] = key in kept_keys
+        rows.append(row)
+    write_jsonl(it_dir / "filtered" / "candidate_scores.jsonl", rows)
+
+
+def _r4(v):
+    return round(v, 4) if isinstance(v, float) and math.isfinite(v) else (v if v is None else None)
+
+
+def _pct(sorted_vals: list[float], q: float) -> float:
+    idx = min(len(sorted_vals) - 1, max(0, math.ceil(q * len(sorted_vals)) - 1))
+    return sorted_vals[idx]
+
+
+_JUDGE_PROMPT = (
+    "You are auditing a math solution for information leakage. Does the text "
+    "below presuppose, mention, or rely on an EXTERNAL reference solution, "
+    "provided answer, or hint (e.g. phrases like \"the given solution\", "
+    "\"as provided\", \"the reference\", \"according to the hint\")? "
+    "Answer with exactly one word: YES or NO.\n\n---\n{body}\n---"
+)
+
+
+def _leakage_judge(survivors, cfg: Config, model_path: str, it_dir, *, pool_dir=None):
+    """LLM half of the leakage filter: one batched generation pass asking a
+    judge (filter.leakage.judge_model, default = current policy) whether each
+    continuation presupposes external material. YES => rejected; anything
+    unparsable => conservatively kept and counted. Also reused by bridge_sft
+    at bridge-generation time (pool_dir points into the improve stage)."""
+    from transformers import AutoTokenizer
+
+    from .engine import GenRequest, run_pool
+    from .templates import render_question_prompt
+
+    lk = cfg.filter.leakage
+    pool_dir = pool_dir if pool_dir is not None else it_dir / "filtered" / "pool_leakage"
+    judge_model = lk.judge_model or model_path
+    tokenizer = AutoTokenizer.from_pretrained(judge_model)
+    reqs = []
+    for c in survivors:
+        prompt = render_question_prompt(
+            tokenizer, _JUDGE_PROMPT.format(body=c.continuation_text),
+            system_prompt=None, question_suffix="",
+            chat_template_kwargs=cfg.model.chat_template_kwargs if judge_model == model_path else None,
+        )
+        reqs.append(GenRequest(rid=_cand_key(c), prompt_token_ids=prompt.token_ids))
+    results = run_pool(
+        reqs, mode="generate", model_path=judge_model,
+        sampling={
+            "temperature": lk.judge_temperature,
+            "top_p": 1.0,
+            "max_tokens": lk.judge_max_tokens,
+        },
+        engine_cfg=cfg.engine, work_dir=pool_dir,
+        dtype=cfg.model.dtype,
+    )
+    kept, n_flagged, n_unparsed = [], 0, 0
+    for c, r in zip(survivors, results):
+        text = (r.samples[0]["text"] if r.samples else "").strip().upper()
+        verdict = next((w for w in ("YES", "NO") if text.startswith(w)), None)
+        if verdict == "YES":
+            n_flagged += 1
+        else:
+            if verdict is None:
+                n_unparsed += 1
+            kept.append(c)
+    report = {"judge_model": judge_model, "n_judged": len(survivors),
+              "n_flagged": n_flagged, "n_unparsed_kept": n_unparsed}
+    return kept, n_flagged, report
 
 
 def _logprob_gate(survivors, cfg: Config, model_path: str, it_dir):

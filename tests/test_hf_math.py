@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from expert_iter.config import Config
-from expert_iter.data import HFMathAdapter
+from expert_iter.data import HF_MATH_PRESETS, HFMathAdapter
 from expert_iter.verifier import StrictMathVerifier
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -193,6 +193,158 @@ def test_exclude_question_regex(fake_load):
     assert [r.final_answer for r in records] == ["2"]
 
 
+DEEPMATH_ANSWER_RE = HF_MATH_PRESETS["deepmath"]["exclude_answer_regex"]
+
+
+def test_exclude_answer_regex_drops_coinflip_golds(fake_load):
+    fake_load["rows"] = [
+        {"problem": "Does it converge?", "answer": "Yes"},
+        {"problem": "Is it prime?", "answer": "No"},
+        {"problem": "Which option?", "answer": "B"},
+        {"problem": r"\text{} form?", "answer": r"\text{True}"},
+        # `e` is Euler's number, not MCQ choice (e): 406 DeepMath golds are
+        # exactly this, so the letter half of the pattern is uppercase-only.
+        {"problem": "Limit of (1+1/n)^n?", "answer": "e"},
+        {"problem": "How many?", "answer": "927"},
+    ]
+    records = HFMathAdapter().load(
+        {"hf_name": "org/ds", "exclude_answer_regex": DEEPMATH_ANSWER_RE})
+    assert [r.final_answer for r in records] == ["e", "927"]
+
+
+def test_exclude_answer_regex_applies_to_extracted_gold(fake_load):
+    # The filter must see the post-_extract_final_answer string, not the raw
+    # column, so it also works where gold is a whole worked solution.
+    fake_load["rows"] = [
+        {"problem": "Q1?", "solution": r"Therefore \boxed{Yes}."},
+        {"problem": "Q2?", "solution": r"Therefore \boxed{42}."},
+    ]
+    records = HFMathAdapter().load(
+        {"hf_name": "org/ds", "exclude_answer_regex": DEEPMATH_ANSWER_RE})
+    assert [r.final_answer for r in records] == ["42"]
+
+
+def test_deepmath_preset_filters_and_strips_think(fake_load):
+    trace = "Okay so I ramble for ages.</think>\n\nClean worked solution. \\boxed{4}"
+    fake_load["rows"] = [
+        {"question": "Q1?", "final_answer": "4", "difficulty": 7.5, "topic": "Algebra",
+         "r1_solution_1": trace,
+         "r1_solution_2": "Second ramble.</think>\nSecond derivation. \\boxed{4}",
+         "r1_solution_3": "Third ramble.</think>\nThird derivation. \\boxed{4}"},
+        {"question": "Q2?", "final_answer": "Yes",     # coin-flip gold -> dropped
+         "difficulty": 3.0, "topic": "Calculus",
+         "r1_solution_1": trace, "r1_solution_2": trace, "r1_solution_3": trace},
+    ]
+    records = HFMathAdapter().load({"preset": "deepmath", "include_solution": True})
+    assert [r.final_answer for r in records] == ["4"]
+    meta = records[0].meta
+    # y* is the post-</think> half only: no tag, no reasoning text.
+    assert meta["gold_solution"] == "Clean worked solution. \\boxed{4}"
+    assert meta["gold_solutions_alt"] == ["Second derivation. \\boxed{4}",
+                                          "Third derivation. \\boxed{4}"]
+    for s in [meta["gold_solution"], *meta["gold_solutions_alt"]]:
+        assert "</think>" not in s and "ramble" not in s
+    # curation columns ride along into the cliff set
+    assert (meta["difficulty"], meta["topic"]) == (7.5, "Algebra")
+    assert fake_load["calls"][-1] == (("zwhe99/DeepMath-103K", "default"), {"split": "train"})
+
+
+def test_deepmath_preset_expands():
+    from expert_iter.data import resolve_adapter_args
+
+    expanded = resolve_adapter_args("hf_math", {"preset": "deepmath", "n_questions": 2000})
+    assert expanded["hf_name"] == "zwhe99/DeepMath-103K"
+    assert expanded["solution_col"] == "r1_solution_1"
+    assert expanded["solution_alt_cols"] == ["r1_solution_2", "r1_solution_3"]
+    assert expanded["solution_strip_think"] is True
+    assert expanded["meta_cols"] == ["difficulty", "topic"]
+    assert expanded["exclude_answer_regex"]
+    assert expanded["n_questions"] == 2000
+    # Explicit keys still win over the preset (e.g. an alternate reference).
+    assert resolve_adapter_args(
+        "hf_math", {"preset": "deepmath", "solution_col": "r1_solution_2"}
+    )["solution_col"] == "r1_solution_2"
+
+
+def test_strip_think_off_keeps_trace_and_no_marker_passes_through(fake_load):
+    fake_load["rows"] = [
+        {"problem": "Q1?", "answer": "4", "solution": "Ramble.</think>\nClean."},
+        {"problem": "Q2?", "answer": "5", "solution": "Already clean, no tag."},
+    ]
+    kept = HFMathAdapter().load({"hf_name": "org/ds", "include_solution": True})
+    assert kept[0].meta["gold_solution"] == "Ramble.</think>\nClean."
+
+    stripped = HFMathAdapter().load(
+        {"hf_name": "org/ds", "include_solution": True, "solution_strip_think": True})
+    assert stripped[0].meta["gold_solution"] == "Clean."
+    # No marker => nothing to strip; the text is untouched, not blanked.
+    assert stripped[1].meta["gold_solution"] == "Already clean, no tag."
+
+
+def test_strip_think_keeps_only_after_the_last_marker(fake_load):
+    # Every other fixture has exactly one </think>, which cannot tell rsplit
+    # from split — a mutation to split() passes those. Pin the LAST-marker rule.
+    fake_load["rows"] = [{"problem": "Q?", "answer": "4",
+                          "solution": "A</think>B</think>Answer. \\boxed{4}"}]
+    (rec,) = HFMathAdapter().load(
+        {"hf_name": "org/ds", "include_solution": True, "solution_strip_think": True})
+    assert rec.meta["gold_solution"] == "Answer. \\boxed{4}"
+
+
+def test_exclude_answer_regex_is_case_insensitive_for_words_only(fake_load):
+    # 5 DeepMath golds are all-caps (YES/NO/TRUE/FALSE); the words must fold,
+    # but the MCQ letters must NOT — lowercase a-e are real algebraic answers.
+    fake_load["rows"] = [
+        {"problem": "Q1?", "answer": "YES"},
+        {"problem": "Q2?", "answer": "FALSE"},
+        {"problem": "Q3?", "answer": "e"},
+        {"problem": "Q4?", "answer": "d"},
+    ]
+    records = HFMathAdapter().load(
+        {"hf_name": "org/ds", "exclude_answer_regex": DEEPMATH_ANSWER_RE})
+    assert [r.final_answer for r in records] == ["e", "d"]
+
+
+def test_meta_cols_passthrough(fake_load):
+    rows = _rows(2)
+    for row, d, t in zip(rows, [5.5, 8.0], ["Algebra", "Calculus"]):
+        row["difficulty"], row["topic"] = d, t
+    fake_load["rows"] = rows
+    records = HFMathAdapter().load(
+        {"hf_name": "org/ds", "meta_cols": ["difficulty", "topic"]})
+    assert [(r.meta["difficulty"], r.meta["topic"]) for r in records] == [
+        (5.5, "Algebra"), (8.0, "Calculus")]
+    # meta_cols is a passthrough, NOT a filter: nothing is dropped by it.
+    assert len(records) == 2
+
+
+def test_missing_meta_col_raises(fake_load):
+    fake_load["rows"] = _rows(1)
+    with pytest.raises(KeyError):
+        HFMathAdapter().load({"hf_name": "org/ds", "meta_cols": ["nope"]})
+
+
+def test_missing_solution_alt_col_raises(fake_load):
+    fake_load["rows"] = _rows(1)
+    with pytest.raises(KeyError):
+        HFMathAdapter().load({"hf_name": "org/ds", "include_solution": True,
+                              "solution_alt_cols": ["nope"]})
+
+
+def test_row_idx_recorded_for_backfill(fake_load):
+    # scripts/backfill_gold_solutions.py re-joins positionally on meta.row_idx,
+    # so it must be the ORIGINAL dataset index. Rows 1 and 2 are filtered out
+    # below, which is what distinguishes the original index from a kept-record
+    # counter — with no dropped rows the two are indistinguishable.
+    rows = _rows(4)
+    for i, row in enumerate(rows):
+        row["question_type"] = "MCQ" if i in (1, 2) else "math-word-problem"
+    fake_load["rows"] = rows
+    records = HFMathAdapter().load(
+        {"hf_name": "org/ds", "where": {"question_type": ["math-word-problem"]}})
+    assert [r.meta["row_idx"] for r in records] == [0, 3]
+
+
 def test_unknown_preset_raises(fake_load):
     fake_load["rows"] = _rows(1)
     with pytest.raises(KeyError):
@@ -297,3 +449,30 @@ def test_passrate_counts_truncated_correct_as_raw_only():
     assert stats[0]["c"] == 0 and stats[0]["c_raw"] == 1
     assert metrics["solve_rate"] == 0
     assert metrics["raw_solve_rate"] == 1
+
+
+def test_write_cliff_set(tmp_path):
+    from expert_iter.records import QuestionRecord
+
+    passrate = _load_passrate()
+    questions = [
+        QuestionRecord(qid="q0", question="hard?", final_answer="1", domain="math",
+                       meta={"hf_name": "org/ds", "row_idx": 7,
+                             "gold_solution": "y* one", "gold_solutions_alt": ["y* two"]}),
+        QuestionRecord(qid="q1", question="easy?", final_answer="2", domain="math",
+                       meta={"hf_name": "org/ds", "row_idx": 8}),
+    ]
+    stats = [{"qid": "q0", "c": 0}, {"qid": "q1", "c": 5}]
+    path = tmp_path / "cliff_questions.jsonl"
+    n = passrate.write_cliff_set(path, questions, stats, k=32,
+                                 run_name="run_x", model_path="org/model")
+    assert n == 1
+    (row,) = list(QuestionRecord.load_jsonl(path))
+    assert row.qid == "q0" and row.question == "hard?" and row.final_answer == "1"
+    # adapter meta rides along, provenance is stamped on top
+    assert row.meta["gold_solution"] == "y* one"
+    assert row.meta["gold_solutions_alt"] == ["y* two"]
+    assert row.meta["row_idx"] == 7
+    assert row.meta["passrate_c"] == 0 and row.meta["passrate_k"] == 32
+    assert row.meta["passrate_run"] == "run_x"
+    assert row.meta["passrate_model"] == "org/model"
