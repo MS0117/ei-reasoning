@@ -294,7 +294,7 @@ def _random_selection(survivors, cfg: Config):
     return kept, n_over
 
 
-def _score_candidates(survivors, cfg: Config, model_path: str, it_dir):
+def _score_candidates(survivors, cfg: Config, model_path: str, it_dir, *, pool_dir=None):
     """C(y) scoring (methodology 6b): score every survivor under the student
     pi_theta (S_mean, S_tail) and — when gamma_dtail > 0 — under its generating
     policy q_P via op_meta.lora_path (D_tail), giving
@@ -324,7 +324,8 @@ def _score_candidates(survivors, cfg: Config, model_path: str, it_dir):
     results = run_pool(
         reqs, mode="score", model_path=model_path,
         sampling={"return_token_logprobs": True},
-        engine_cfg=cfg.engine, work_dir=it_dir / "filtered" / "pool_selection",
+        engine_cfg=cfg.engine,
+        work_dir=pool_dir if pool_dir is not None else it_dir / "filtered" / "pool_selection",
         dtype=cfg.model.dtype,
     )
     by_rid = {r.rid: r for r in results}

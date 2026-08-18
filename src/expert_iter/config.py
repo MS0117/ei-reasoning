@@ -29,7 +29,8 @@ LOOP_STAGES = (
 # are mirrored here to fail a typo at CONFIG LOAD instead of an hour into the
 # run). The operator decides what the transient LoRA is fitted on; the
 # optional post-SFT RL phase is NOT an operator (improve.rl.enabled).
-IMPROVE_OPERATORS = ("self_resample", "lora_sft", "bridge_sft", "teacher")
+IMPROVE_OPERATORS = ("self_resample", "lora_sft", "bridge_sft", "staged_bridge_sft",
+                     "teacher")
 
 # anchor.params is a free-form dict, so a key belonging to a DIFFERENT policy
 # would otherwise be read by nobody and leave the active policy silently on its
@@ -235,6 +236,30 @@ class BridgeCfg:
 
 
 @dataclass
+class StagedCfg:
+    """staged_bridge_sft operator: stage-1 bridge LoRA fit (steps = fit.steps)
+    -> rollout (b) off the adapter (correct samples = converted cliffs, pooled)
+    -> num_stages stage-2 fits (unsolved: bridge pairs, reused or regenerated
+    through the adapter; solved: self-generated rollouts, when train_scope is
+    full_pool) -> final rollout. Emitted candidates are the pooled rollout
+    samples; per-question selection stays in filter.selection."""
+
+    rollout_n: int = 8                 # (b) samples per cliff off the stage-1 adapter
+    num_stages: int = 1                # stage-2 fit passes
+    chain_adapter: bool = True         # warm-start each stage-2 fit from the previous adapter
+    unsolved_targets: str = "reuse_bridge"   # reuse_bridge | regen_bridge (bridge
+                                             # regenerated THROUGH the current adapter)
+    solved_targets: str = "self_wash_min_c"  # self_wash_min_c | bridge | random |
+                                             # longest | shortest (read only when
+                                             # train_scope: full_pool)
+    train_scope: str = "unsolved_only"       # unsolved_only | full_pool
+    stage2_steps: int = 2              # full-batch gradient steps per stage-2 fit
+    final_rollout_n: int = 16
+    final_rollout_scope: str = "unsolved"    # unsolved | all
+    emit: str = "all"                  # all | final_only (which pool rounds reach filters)
+
+
+@dataclass
 class LoraSftCfg:
     fit: LoraFitCfg = field(default_factory=LoraFitCfg)
     adapter_scope: str = "pooled"      # pooled | per_problem
@@ -243,6 +268,7 @@ class LoraSftCfg:
                                        # adapter failed to resolve (0 = off)
     project_back: ProjectBackCfg = field(default_factory=ProjectBackCfg)
     bridge: BridgeCfg = field(default_factory=BridgeCfg)
+    staged: StagedCfg = field(default_factory=StagedCfg)
 
 
 @dataclass
@@ -775,7 +801,44 @@ class Config:
             raise ValueError("improve.lora_sft.bridge temperatures must be >= 0")
         if br.max_tokens is not None and br.max_tokens < 1:
             raise ValueError("improve.lora_sft.bridge.max_tokens must be >= 1 or null")
-        if self.improve.operator in ("lora_sft", "bridge_sft"):
+        st = ls.staged
+        if st.rollout_n < 1 or st.final_rollout_n < 1 or st.num_stages < 1:
+            raise ValueError(
+                "improve.lora_sft.staged rollout_n/final_rollout_n/num_stages must be >= 1"
+            )
+        if not 1 <= st.stage2_steps <= 32:
+            raise ValueError("improve.lora_sft.staged.stage2_steps must be in [1, 32]")
+        if st.unsolved_targets not in ("reuse_bridge", "regen_bridge"):
+            raise ValueError(f"improve.lora_sft.staged.unsolved_targets: {st.unsolved_targets!r}")
+        if st.solved_targets not in ("self_wash_min_c", "bridge", "random", "longest", "shortest"):
+            raise ValueError(f"improve.lora_sft.staged.solved_targets: {st.solved_targets!r}")
+        if st.train_scope not in ("unsolved_only", "full_pool"):
+            raise ValueError(f"improve.lora_sft.staged.train_scope: {st.train_scope!r}")
+        if st.final_rollout_scope not in ("unsolved", "all"):
+            raise ValueError(
+                f"improve.lora_sft.staged.final_rollout_scope: {st.final_rollout_scope!r}"
+            )
+        if st.emit not in ("all", "final_only"):
+            raise ValueError(f"improve.lora_sft.staged.emit: {st.emit!r}")
+        if self.improve.operator == "staged_bridge_sft":
+            # v1 scope: the intermediate rollout IS the fit probe, alpha stays 1.0,
+            # and propose() is overridden wholesale — these phases would silently
+            # not run, so reject them loudly at load.
+            unsupported = [
+                ("improve.lora_sft.fit.adaptive.enabled", ad.enabled),
+                ("improve.lora_sft.project_back.enabled", pb.enabled),
+                ("improve.lora_sft.refit_budget > 0", ls.refit_budget > 0),
+                ("improve.lora_sft.adapter_scope != 'pooled'", ls.adapter_scope != "pooled"),
+                ("improve.lora_sft.chunk_size != 0", ls.chunk_size != 0),
+                ("improve.rl.enabled", self.improve.rl.enabled),
+            ]
+            bad = [name for name, hit in unsupported if hit]
+            if bad:
+                raise ValueError(
+                    "not implemented for improve.operator=staged_bridge_sft yet: "
+                    + ", ".join(bad)
+                )
+        if self.improve.operator in ("lora_sft", "bridge_sft", "staged_bridge_sft"):
             if not self.engine.enable_lora:
                 raise ValueError(
                     f"improve.operator={self.improve.operator} needs engine.enable_lora=true"

@@ -164,7 +164,9 @@ def _collect_metrics(run_dir: Path, it_dir: Path, k: int) -> dict:
     for rel, keys in [
         ("partition/stats.json", ["solve_rate", "sample_accuracy", "n_unsolved_questions"]),
         ("improve/stats.json", ["lora_yield", "alpha_star_mean", "n_fits", "n_refits",
-                                "n_resolved_pool", "n_resolved_refit"]),
+                                "n_resolved_pool", "n_resolved_refit",
+                                "n_resolved_stage1", "n_resolved_by_stage",
+                                "n_resolved_final", "n_stages_run", "pool_size"]),
         ("filtered/report.json", ["n_kept", "improve_yield", "cliff/count", "cliff/ratio",
                                   "cliff/conversion_rate", "cliff/conversion_histogram"]),
         ("dataset/stats.json", ["sft_total", "dpo_total"]),

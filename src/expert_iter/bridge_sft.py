@@ -96,13 +96,21 @@ class BridgeSftOperator(_ls.LoraSftOperator):
                 break
             if pass_name == "bridge_retry":
                 n_retried = len(pending)
+            # staged_bridge_sft seam: when set, bridges are regenerated THROUGH
+            # the current adapter with a per-stage seed salt. Both default to
+            # None, keeping this operator's requests (and seeds) byte-identical.
+            bridge_lora = getattr(self, "_bridge_lora_path", None)
+            seed_salt = getattr(self, "_bridge_seed_salt", None)
             results = _ls.run_pool(
                 [GenRequest(
                     rid=f"{qid}:{pass_name}",
                     prompt_token_ids=gen_prompt[qid],
                     n=br.n,
-                    seed=stable_seed(cfg.run.seed, pass_name, iteration, qid),
+                    seed=(stable_seed(cfg.run.seed, pass_name, iteration, qid)
+                          if seed_salt is None
+                          else stable_seed(cfg.run.seed, pass_name, iteration, qid, seed_salt)),
                     max_tokens=gen_max[qid],
+                    lora_path=bridge_lora,
                 ) for qid in pending],
                 mode="generate", model_path=policy,
                 sampling={

@@ -1,0 +1,353 @@
+# STAGED baseline: staged bridge SFT — identical to BRIDGE.yaml except the
+# operator and its schedule: stage-1 bridge LoRA fit (fit.steps=2, no anchor)
+# -> rollout_n samples per cliff (correct ones enter the candidate pool) ->
+# num_stages stage-2 fits (unsolved: reuse/regen bridges; solved: self-wash,
+# only with train_scope: full_pool) warm-started from the previous adapter ->
+# final_rollout_n over the still-unsolved cliffs. Paired comparison partner of
+# BRIDGE/LSPO:
+#
+#   bash data/run_toy_cliff.sh -c data/configs/STAGED.yaml -b \
+#       -- --reuse-rollout runs/toy_cliff/<BRIDGE or LSPO run dir>
+#
+# v1 constraints (rejected at config load): fit.adaptive, project_back,
+# refit_budget, per_problem/chunked adapters, and rl are not supported with
+# this operator yet.
+
+run:
+  name: staged_toy_cliff      # wandb group
+  output_root: runs
+  seed: 17
+  wandb:
+    project: ei_reasoning
+    mode: online
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+
+engine:
+  gpus: null
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.90
+  max_model_len: 20480
+  enable_lora: true
+  max_loras: 8
+  max_lora_rank: 16
+  max_logprobs: 20
+  score_gpu_memory_utilization: 0.80   # C(y)/anchor scoring pools run at this
+                              # instead of the value above: prompt_logprobs
+                              # materializes a full-vocab fp32 log_softmax
+                              # (~5 GiB spike) and 0.90 OOMs at 16k tokens
+  score_max_num_batched_tokens: 4096   # score-mode prefill chunk. The
+                              # full-vocab fp32 log_softmax is materialized per
+                              # chunk, so the spike is chunk x vocab x 4 bytes:
+                              # 4.64 GiB at vLLM's 8192 default on a 152k vocab,
+                              # which OOMed even at 0.80 utilization once the KV
+                              # cache was sized. Halving the chunk halves the
+                              # spike and leaves the KV cache alone.
+
+data:
+  adapter: local_jsonl
+  adapter_args:
+    path: data/cliff_sets/openr1_qwen3-4b-2507_n2000_with_gold.jsonl
+  question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  eval_holdout: 0
+  accumulate: true
+
+rollout:
+  n: 8
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+
+partition:
+  verifier: math
+  solved_keep_max: 4
+  solved_selection: shortest
+  cliff_max_correct: 0
+
+anchor:
+  # ---- WHERE IMPROVEMENT STARTS: x alone, or x + a prefix of a failure ------
+  # Two independent choices: WHICH failed rollout to cut (base_selection) and
+  # WHERE to cut it (policy). The anchor is always an ID-SLICE of the original
+  # rollout — never re-tokenized text — and it becomes a conditioning prefix:
+  # the operator continues from x + a, and training puts loss only after it.
+  #
+  # policy:
+  #   none                   empty anchor. The operator resamples the WHOLE
+  #                          response from x. Rejection-sampling / STaR
+  #                          ablation, and what every arm has run so far.
+  #   fixed_fraction         keep the first `fraction` of the failure, clamped
+  #                          to [min_tokens, max_tokens]. Simplest baseline.
+  #   privileged_divergence  cut where the reference solution stops endorsing
+  #                          the failure. Two teacher-forcing passes over the
+  #                          failed response y- with the SAME policy —
+  #                          privileged context prompt(x, y*) vs base context
+  #                          prompt(x) — give a per-token signal
+  #                              g_t = lp_base(y-_t) - lp_priv(y-_t)
+  #                          which rises where KNOWING the reference LOWERS the
+  #                          probability of the failure's own next token, i.e.
+  #                          at the first reference-detectable wrong turn.
+  #                          Averaged per step, thresholded at mu + c_sigma*sigma.
+  #                          NEEDS gold y* (backfilled into questions/train.jsonl).
+  #
+  # base_selection: which of the K failed rollouts to cut
+  #   first_failed   the first one (cheapest, no extra pass)
+  #   longest        the longest response
+  #   random         seeded by run.seed
+  #   min_mean_nll   the failure the policy finds MOST typical (lowest mean
+  #                  NLL) — the methodology's G4 choice, one extra batched
+  #                  scoring pass
+  #
+  # WHAT THE ANCHOR ACTUALLY CHANGES depends on the operator:
+  #   self_resample  q_phi samples from x + a instead of x
+  #   lora_sft       NOTHING in the fit — its pair is gold (x -> y*), and y* is
+  #                  not a continuation of a failed prefix, so there is nowhere
+  #                  to put the anchor. Only the sampling start moves. This is
+  #                  why anchored lora_sft is a weak variant.
+  #   bridge_sft     the anchor enters the FIT PAIR: (x + a -> z+), loss on z+
+  #                  only, and the bridge is GENERATED as a continuation of a.
+  #                  This is the coherent anchored method.
+  policy: none                # staged spec: NO anchor — plain bridge prompt,
+                              # rollouts from the bare question
+  base_selection: min_mean_nll   # first_failed | longest | random | min_mean_nll
+
+improve:
+  operator: staged_bridge_sft # <- the methodological difference vs BRIDGE/LSPO
+  n: 16                       # samples per question from q_phi
+  temperature: 1.2
+  top_p: 0.98
+  max_tokens: 16384
+  lora_sft:
+    # ---- HOW MANY TRANSIENT ADAPTERS FOR THE CLIFF BATCH ------------------
+    # The operator's premise is a TRANSIENT adapter that overfits THIS batch
+    # hard enough to make its questions solvable — not a general SFT. How many
+    # questions share one adapter is therefore a methodology knob, not a
+    # performance one, and it is the first thing to revisit as the cliff set
+    # grows.
+    #
+    #   pooled + chunk_size 0  ONE adapter for every cliff question (current)
+    #   pooled + chunk_size N  one adapter per N-question chunk; each question
+    #                          is then sampled from its own chunk's adapter
+    #   per_problem            one adapter per question (chunk_size ignored) —
+    #                          maximal per-question signal, one lora_fit
+    #                          subprocess per question
+    #
+    # MEASURED at 107 cliffs / 313 bridge pairs, r=16 (~33.0M trainable params,
+    # 1.6% of the 4B), 3 full-batch steps: fit took 26 min and produced 42%
+    # conversion. Cost is linear in RESPONSE TOKENS (1.47M here, ~2800 tok/s),
+    # plus ~50 s of subprocess overhead (model load) per adapter.
+    #
+    # WHEN THE CLIFF SET GROWS, the code does not break — the methodology does.
+    # One rank-16 adapter absorbing 3 gradient steps over ~5800 pairs (a
+    # 2000-cliff run) dilutes the per-question signal that makes a question
+    # solvable, so P_hat falls even though nothing errors. Rough guide:
+    #
+    #     cliffs   pairs    chunk_size    adapters   fit time (1 GPU)
+    #       ~100    ~300    0 (pooled)           1   ~30 min
+    #       ~500   ~1500    100-200            3-5   ~2 h + ~4 min overhead
+    #      ~2000   ~5800    100-200          10-20   ~8 h + ~15 min overhead
+    #
+    # Total FLOPs are the same whichever way it is chunked — chunking only adds
+    # the per-adapter model load. Two things to check before chunking at scale:
+    #   * engine.max_loras (currently 8) caps how many adapters vLLM keeps
+    #     co-resident per batch; with more chunks than that it swaps them in and
+    #     out during the candidate pass. Raise it, or expect swap overhead.
+    #   * chunk_size has NEVER been run above 0 here — every result so far is
+    #     single-adapter. Validate it cheaply first by re-running the current
+    #     107-cliff set with chunk_size 25 (4 adapters) and comparing conversion
+    #     against the pooled arm; --reuse-rollout makes that a paired test.
+    #
+    # NOTE this is unrelated to improve.rl.grad_accum / micro_batch_size, which
+    # shape the RL batch, and to improve.n, which is the sampling budget.
+    adapter_scope: pooled     # pooled | per_problem
+    chunk_size: 0             # pooled only: 0 = ONE adapter for all questions
+    refit_budget: 0           # per-problem refits for cliffs the pooled adapter
+                              # failed to resolve (0 = off; they simply pass)
+    fit:
+      r: 16
+      lora_alpha: 32
+      lr: 1.0e-4
+      steps: 2                # STAGE-1 fit steps (staged spec default)
+      max_pair_tokens: 16384
+      dropout: 0.0
+      micro_batch_size: 1     # grad-accum reaches the full batch each step
+      max_grad_norm: 1.0      # 0 disables clipping
+      bf16: true
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+      num_processes: null     # DDP ranks for the fit: null -> all engine GPUs
+                              # (the update is GPU-count invariant, not bitwise,
+                              # so the topology is part of the fit cache key).
+                              # A 2-GPU fit of 313 pairs once hung on an NCCL
+                              # collective mismatch (ranks enqueued 1132 vs 1126
+                              # works, 600 s watchdog -> SIGABRT). Cause: DDP
+                              # without static_graph while gradient checkpointing
+                              # re-runs the forward, so hooks fire twice. Fixed
+                              # in lora_fit.py (static_graph=True + equal
+                              # micro-batch counts + sync_every) — but every
+                              # result BEFORE 2026-08-15 came from the
+                              # single-process path, so treat DDP as newly
+                              # verified rather than long-proven.
+      sync_every: 8           # DDP only: all-reduce every K micro-batches. 0 =
+                              # once per step, which makes the collective gap the
+                              # whole shard (264 s at 313 pairs, 1264 s at 1500 —
+                              # past NCCL's 600 s watchdog). Same update either
+                              # way; this just keeps the ranks in lockstep.
+      adaptive:               # tau_E early fit stop (off = the fixed steps above)
+        enabled: false
+        tau_e: 0.5            # stop once this fraction of the chunk is solved
+        max_steps: 10         # hard cap on TOTAL gradient steps
+        eval_every: 2         # gradient steps per round (each round = 1 engine boot)
+        m_rollouts: 4         # probe samples per question per round
+        criterion: frac_solved   # frac_solved | mean_p_hat
+    project_back:
+      enabled: false
+      alphas: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+      tau_p: 0.25
+      m_rollouts: 16
+      granularity: per_problem
+    bridge:                   # ---- bridge generation knobs ----
+      n: 8                    # N_B bridge samples per cliff (base policy + y* prompt)
+      temperature: null       # null -> improve.temperature
+      retry_temperature: 1.5  # ONE hotter retry for B+-empty cliffs
+      max_keep: 4             # bridge fit pairs kept per question (shortest-first)
+      max_tokens: null        # null -> improve.max_tokens
+      leakage_rules: false    # G5 regex screen (default OFF — confirmed)
+      judge_enabled: false    # G5 LLM judge screen (default OFF — confirmed)
+      sample_skipped: true    # skipped cliffs still sampled from the pooled adapter
+    staged:                   # ---- staged_bridge_sft schedule (this operator) ----
+      rollout_n: 8            # (b) samples per cliff off the stage-1 adapter
+      num_stages: 1           # stage-2 fit passes
+      chain_adapter: true     # warm-start stage-2 fits from the previous adapter
+      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge
+      solved_targets: self_wash_min_c  # self_wash_min_c | bridge | random |
+                              # longest | shortest (train_scope: full_pool only)
+      train_scope: unsolved_only       # unsolved_only | full_pool
+      stage2_steps: 2         # gradient steps per stage-2 fit
+      final_rollout_n: 16
+      final_rollout_scope: unsolved    # unsolved | all
+      emit: all               # all (should be pair with final_rollout_scope: all) | final_only
+  rl:                         # ---- optional post-SFT RL phase (NOT an operator) ----
+    enabled: false           # runs AFTER the fit (lora_sft or bridge_sft), BEFORE
+                              # candidate sampling; trains the LoRA params only and
+                              # its output adapter phi_E replaces the fit adapter.
+                              # Rollout prompts = the true target state with NO y*:
+                              #   anchor.policy none -> x ; an anchor policy -> x + a
+    algo: grpo                # grpo (trl GRPOTrainer) | reinforce (trl RLOOTrainer)
+                              # "ppo" is rejected: grpo's epsilon IS the PPO clip
+    group_size: 8             # G rollouts per question (the advantage group)
+    # Budget: set EXACTLY ONE of epochs / steps.
+    epochs: 1.0               # passes over the chunk's questions (null -> use steps)
+    steps: null               # raw optimizer-step cap (null -> use epochs)
+    grad_accum: 4            # questions per optimizer step =
+                              # micro_batch_size x num_processes x grad_accum
+                              #   / group_size
+    micro_batch_size: 1    # = per_device_train_batch_size: sequences per
+                              # forward/backward (ACTIVATION MEMORY). null ->
+                              # group_size, the only value legal at every
+                              # (num_processes, grad_accum); lower it if a long
+                              # max_completion_length OOMs
+    gradient_checkpointing: true   # recompute activations instead of storing
+                              # them: without it a long max_completion_length
+                              # dwarfs the colocate vLLM share
+    lr: 1.0e-6              # long-CoT math RL value (Tina, LoRA-alpha
+                              # study); TRL/verl's '10x for LoRA' says 1e-5
+    epsilon: 0.2              # PPO clip range
+    kl_beta: 0.0              # 0 (no reference model) or <= 1e-3
+    # ---- vLLM <-> training logprob mismatch correction (grpo only) ------
+    # Rollouts come from vLLM but gradients from a transformers forward, and the
+    # two disagree on logprobs for the SAME tokens. trl corrects with
+    # exp(log pi_train - log pi_vllm). Its DEFAULT "sequence_mask" sums that gap
+    # over the whole completion, so it underflows to 0 past a few thousand
+    # tokens and zeroes the gradient — measured on a real 16k run, grad_norm was
+    # 0 for every completion over ~4k (docs/api_notes.md finding 24). Token-level
+    # ratios stay near exp(+-0.1) with no accumulation.
+    vllm_importance_sampling_correction: true
+    vllm_importance_sampling_mode: token_truncate   # token_truncate | token_mask
+                              # | sequence_truncate | sequence_mask (trl default,
+                              # unusable for long CoT)
+    vllm_importance_sampling_cap: 2.0   # verl's rollout_is_threshold, TRL's recipe
+                              # configs and the Diagnosing-TIM paper all use 2.0
+    temperature: null         # null -> improve.temperature
+    max_completion_length: null   # null -> improve.max_tokens (lower it, e.g. 8192,
+                                  # to keep RL generation affordable)
+    num_processes: null       # null -> all engine GPUs (accelerate DDP, GPU-verified);
+                              # 1 forces the single-GPU launcher
+    vllm_gpu_memory_utilization: 0.5   # colocate vLLM share per rank
+    backend: trl              # trl (colocate vLLM, GPU-probed green) | pool (reserved)
+    seam_strict: false        # anchored prompts are re-rendered as TEXT for trl:
+                              # true = hard-fail on a retokenization seam mismatch,
+                              # false = count + warn (candidate ids stay spliced)
+    seed: null                # null -> stable_seed(run.seed, "lora_rl", iter, chunk)
+    prompt_filter:            # DAPO-style zero-variance prompt filtering — OFF
+      enabled: false          # by default, so a run stays comparable with the
+                              # pre-filter arms; flipping it on is the paired
+                              # comparison. A group whose 8 rollouts are ALL
+                              # wrong has advantage 0 and yields NO gradient —
+                              # measured 74.2% of groups on the cliff set.
+      m_rollouts: 8           # probe samples per question, off the FIT adapter
+      min_pass_rate: 0.0      # keep questions with pass rate STRICTLY between
+      max_pass_rate: 1.0      # these (exclusive 0/1 = drop all-wrong and
+                              # all-right = DAPO's rule; 0.2/0.8 = the
+                              # literature's pass-rate-band heuristic)
+    plateau:                  # reward-plateau early stop — OFF by default
+      enabled: false          # trl logs the CURRENT step's question rewards and
+                              # every step draws different questions, so the raw
+                              # series tracks difficulty, not learning: with
+                              # window 1 the patience below fires at step ~5 of 53
+      patience: 3             # windows without improvement >= min_delta
+      min_delta: 0.01
+      window: null            # logs averaged before comparing; null -> one epoch
+                              # of steps ("did this epoch beat the last?")
+  rounds: 1                   # improvement passes per iteration
+  teacher:                    # read only by improve.operator: teacher (stub)
+    model: null
+    gpus: null
+    quantization: null
+
+filter:
+  gates: [correctness, no_external_context, length, dedup]
+  max_total_tokens: 18432
+  max_per_question: 1         # keep exactly ONE per question
+  selection:
+    method: random            # uniform random among verifier-passing candidates
+    always_score: true        # measure C(y) even though selection ignores it, so
+                              # arms that select differently stay comparable
+    lambda_tail: 1.0
+    gamma_dtail: 0.0
+    tail_fraction: 0.1
+    scope: continuation
+  logprob_gate:               # drop candidates the student finds too unlikely
+    enabled: false
+    min_mean_logprob: -1.5
+    scope: continuation       # continuation | full
+  leakage:                    # used by the `leakage_rules` gate (add it to gates
+                              # above) and by improve.lora_sft.bridge.leakage_rules
+    judge_enabled: false      # extra LLM judge pass over the screened text
+    judge_model: null         # null -> current policy
+    judge_max_tokens: 16
+    judge_temperature: 0.0
+    patterns:                 # \b-anchored: bare "as given" fired on benign text
+                              # ("was given 5 candies") and doubled the floor
+
+      - '\breference solution\b'
+      - '\bgiven solution\b'
+      - '\bprovided solution\b'
+      - '\bmodel solution\b'
+      - '\bofficial solution\b'
+      - '\bas given\b'
+      - '\bthe hint\b'
+      - '\baccording to the (solution|reference)\b'
+
+# ---- unused by the toy driver (defaults to satisfy config validation) ------ #
+train:
+  objective: sft
+  backend: zero2
+  max_seq_len: 18432
+
+loop:
+  iterations: 1
+
+eval:
+  greedy_pass1: true
+  max_tokens: 8192

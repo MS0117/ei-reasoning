@@ -160,7 +160,7 @@ def main(argv: list[str] | None = None) -> None:
         for u in unsolved
     }
 
-    from . import bridge_sft, lora_sft  # noqa: F401 — @register side effects (deferred: circular import)
+    from . import bridge_sft, lora_sft, staged_bridge_sft  # noqa: F401 — @register side effects (deferred: circular import)
     from .data import load_gold_solutions
 
     operator: ImprovementOperator = build(OPERATORS, cfg.improve.operator)
