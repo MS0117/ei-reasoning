@@ -223,8 +223,8 @@ improve:
       solved_targets: self_wash_min_c  # self_wash_min_c | bridge | random |
                               # longest | shortest (train_scope: full_pool only)
       train_scope: unsolved_only       # unsolved_only | full_pool
-      stage2_steps: 2         # gradient steps per stage-2 fit
-      final_rollout_n: 16
+      stage2_steps: 1         # gradient steps per stage-2 fit
+      final_rollout_n: 8
       final_rollout_scope: unsolved    # unsolved | all
       emit: all               # all (should be pair with final_rollout_scope: all) | final_only
   rl:                         # ---- optional post-SFT RL phase (NOT an operator) ----

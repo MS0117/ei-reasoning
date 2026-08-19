@@ -387,12 +387,29 @@ def test_sampling_draws_from_filtered_pool(fake_load):
 # passrate.py: classification + summary
 # ---------------------------------------------------------------------------
 
-def test_passrate_config_parses():
-    cfg = Config.load(REPO_ROOT / "data" / "configs" / "passrate.yaml")
+@pytest.mark.parametrize("name", [
+    "passrate.yaml",
+    "passrate_openr1_default.yaml",
+    "passrate_openr1_extended.yaml",
+])
+def test_passrate_config_parses(name):
+    cfg = Config.load(REPO_ROOT / "data" / "configs" / name)
     assert cfg.data.adapter == "hf_math"
-    # N/K are experiment knobs the user retunes freely — assert shape, not values.
-    assert cfg.data.adapter_args["n_questions"] > 0
+    # N/K are experiment knobs the user retunes freely — assert shape, not
+    # values. n_questions: null means a FULL sweep (no subsampling).
+    n = cfg.data.adapter_args["n_questions"]
+    assert n is None or n > 0
     assert cfg.rollout.n > 0
+
+
+def test_passrate_openr1_configs_differ_only_by_dataset_config():
+    # The default/extended pair must stay paired: identical knobs except
+    # data.adapter_args.config, or their pass-rate tables aren't comparable.
+    load = lambda n: Config.load(REPO_ROOT / "data" / "configs" / n)
+    a, b = load("passrate_openr1_default.yaml"), load("passrate_openr1_extended.yaml")
+    assert a.data.adapter_args.pop("config") == "default"
+    assert b.data.adapter_args.pop("config") == "extended"
+    assert a.hash() == b.hash()
 
 
 def test_classify_thresholds():

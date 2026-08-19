@@ -1,0 +1,61 @@
+# FULL pass-rate sweep over OpenR1-Math-220k `extended` (~131k rows before
+# filters) — companion of passrate_openr1_default.yaml, identical except for
+# data.adapter_args.config. `extended` is the non-curated remainder (mostly
+# cn_k12), flagged lower-quality/easier by the dataset card, so expect a lower
+# cliff yield per GPU-hour than `default`; it exists to grow the absolute cliff
+# pool if `default` alone can't fill the sampling quota.
+#
+#   bash data/run_passrate.sh -c data/configs/passrate_openr1_extended.yaml -- --dry-run
+#   bash data/run_passrate.sh -c data/configs/passrate_openr1_extended.yaml -g 0,1 -b
+#
+# Verified 2026-08-19: kept 86987 / seen 131396 (where-filtered 44406,
+# no-true-filtered 0 — extended's question_type survivors are all upstream
+# math-verify confirmed). Filtering is deterministic; --dry-run only earns its
+# minute if the dataset revision moves.
+# Ship back runs/passrate/<slug>/{question_stats.jsonl,questions.jsonl} only.
+#
+# THE EXPENSIVE HALF: 87k x K=16 = 1.39M samples ~= 890 GPU-h ~= 112h on 8 GPUs,
+# nearly 1.5x the `default` sweep for a lower expected cliff yield. Run `default`
+# first and only start this one if that table can't fill the sampling quota.
+#
+# NOTE both configs share qid space (qid hashes hf_name + question text): if a
+# problem text appears in both configs, its qid collides — dedup by qid when
+# merging the two joined tables.
+
+run:
+  name: passrate
+  seed: 17
+  wandb:
+    mode: disabled
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  chat_template_kwargs:
+    enable_thinking: false        # ignored by the 2507 Instruct template; off for hybrids
+
+engine:
+  gpus: null                      # CUDA_VISIBLE_DEVICES -> all visible
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.75    # shared GPUs: size to free memory at launch
+  max_model_len: 12288            # auto-raised by the runner to fit prompt+max_tokens
+
+data:
+  adapter: hf_math
+  adapter_args:
+    preset: openr1                # same filters as the default sweep
+    config: extended              # explicit key overrides the preset's `default`
+    n_questions: null             # FULL sweep — no subsampling
+    seed: 17
+    include_solution: true        # y* -> meta.gold_solution in questions.jsonl,
+                                  # so downstream sets need no backfill join.
+                                  # Never reaches a prompt: passrate renders q.question only.
+  eval_holdout: 0
+
+rollout:
+  n: 16                           # K — must match the default sweep's K to compare
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+
+partition:
+  verifier: math

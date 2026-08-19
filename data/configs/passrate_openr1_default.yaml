@@ -1,0 +1,58 @@
+# FULL pass-rate sweep over OpenR1-Math-220k `default` (93.7k rows -> ~59.3k
+# after the preset filters; n_questions: null = no subsampling). Companion of
+# passrate_openr1_extended.yaml — same knobs, different dataset config. The
+# config-file basename lands in the run-dir slug, which is what keeps the two
+# sweeps' outputs apart.
+#
+#   bash data/run_passrate.sh -c data/configs/passrate_openr1_default.yaml -- --dry-run
+#   bash data/run_passrate.sh -c data/configs/passrate_openr1_default.yaml -g 0,1 -b
+#
+# Verified 2026-08-19: kept 59344 / seen 93733 (where-filtered 16115,
+# no-true-filtered 18268). Filtering is deterministic, so --dry-run is only
+# worth re-running if the dataset revision moves — the real run does the same
+# load first and dies in the same place within minutes if anything is off.
+# Ship back runs/passrate/<slug>/{question_stats.jsonl,questions.jsonl} only —
+# samples.jsonl is multi-GB and nothing downstream needs it.
+#
+# K=16 doubles the committed cliff sets' basis (cliff137 was 0/8, cliff107 0/16)
+# — a stricter cliff definition, and the pass_rate resolution the stratified
+# sampler needs. Cost scales linearly in K: measured ~2.3 GPU-s per sample, so
+# 59.3k x 16 = 950k samples ~= 610 GPU-h ~= 76h on 8 GPUs.
+
+run:
+  name: passrate
+  seed: 17
+  wandb:
+    mode: disabled
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  chat_template_kwargs:
+    enable_thinking: false        # ignored by the 2507 Instruct template; off for hybrids
+
+engine:
+  gpus: null                      # CUDA_VISIBLE_DEVICES -> all visible
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.75    # shared GPUs: size to free memory at launch
+  max_model_len: 12288            # auto-raised by the runner to fit prompt+max_tokens
+
+data:
+  adapter: hf_math
+  adapter_args:
+    preset: openr1                # open-r1/OpenR1-Math-220k + MCQ/unverifiable-gold filters
+    config: default               # the curated 93.7k half (see ..._extended.yaml)
+    n_questions: null             # FULL sweep — no subsampling
+    seed: 17
+    include_solution: true        # y* -> meta.gold_solution in questions.jsonl,
+                                  # so downstream sets need no backfill join.
+                                  # Never reaches a prompt: passrate renders q.question only.
+  eval_holdout: 0
+
+rollout:
+  n: 16                           # K — cliff = 0/16, matching data/cliff_sets/*cliff107*
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+
+partition:
+  verifier: math

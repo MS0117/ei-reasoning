@@ -373,8 +373,13 @@ class HFMathAdapter(DatasetAdapter):
             # scripts/backfill_gold_solutions.py can positionally re-join later.
             # NB that script has no strip-think step: re-joining a solution_strip_think
             # dataset through it would write the raw R1 trace back over a clean y*.
-            meta = {"hf_name": hf_name, "row_source": str(row.get("source") or ""),
-                    "row_idx": row_idx}
+            # config/split ride along so positional re-joins (backfill_gold_
+            # solutions.py, data/join_passrate.py) load the SAME dataset slice:
+            # row_idx 46513 in `default` and `extended` are different problems,
+            # and without these keys a re-join silently defaults to `default`
+            # (the question-text guard catches it, but only by aborting).
+            meta = {"hf_name": hf_name, "config": config or "default", "split": split,
+                    "row_source": str(row.get("source") or ""), "row_idx": row_idx}
             # Passthrough curation columns (deepmath: difficulty/topic). These
             # ride into the cliff set, which is what makes "which topics and
             # difficulties does the model fall off?" answerable without a re-join.

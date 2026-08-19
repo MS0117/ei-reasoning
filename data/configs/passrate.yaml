@@ -66,7 +66,7 @@ data:
     # Each launch gets a fresh timestamped runs/passrate/<slug>_<ts>/ dir;
     # resume a partial run with run_passrate.sh -r <dir>.
     preset: deepmath              # openr1 | openthoughts | deepmath
-    n_questions: 2000             # N: 100 / 200 / 1000 / ...
+    n_questions: null            # N: 100 / 200 / 1000 / ...
     seed: 17                      # seeded (seed, qid)-hash sampling, order-independent
     include_solution: true        # y* -> meta.gold_solution; carried into the cliff set.
                                   # Never reaches a prompt: passrate renders q.question only.

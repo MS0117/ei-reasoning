@@ -219,7 +219,7 @@ improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
                               # longest | shortest — read only when
                               # train_scope: full_pool
       train_scope: unsolved_only       # unsolved_only | full_pool
-      stage2_steps: 2         # gradient steps per stage-2 fit
+      stage2_steps: 1         # gradient steps per stage-2 fit
       final_rollout_n: 16
       final_rollout_scope: unsolved    # unsolved | all
       emit: all               # all (should be pair with final_rollout_scope: all) | final_only (which pool rounds reach filters)
