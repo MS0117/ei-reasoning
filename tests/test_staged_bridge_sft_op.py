@@ -318,12 +318,125 @@ def test_num_stages_two(monkeypatch, tmp_path):
 
 
 def test_emit_final_only(monkeypatch, tmp_path):
-    cfg = _cfg("improve.lora_sft.staged.emit=final_only")
+    # final_only requires final_rollout_scope=all (the unsolved combination is
+    # rejected at config load — see test below)
+    cfg = _cfg("improve.lora_sft.staged.emit=final_only",
+               "improve.lora_sft.staged.final_rollout_scope=all")
     _, _ = _setup(monkeypatch, _default_responder)
     cands = _propose(cfg, tmp_path, _fixtures())
     assert cands and all(c.op_meta["stage"] == "stage2" for c in cands)
     stats = json.loads((tmp_path / "stats.json").read_text())
     assert stats["n_emitted"] == len(cands) < stats["pool_size"]
+
+
+def test_emit_final_only_with_unsolved_scope_rejected():
+    with pytest.raises(ValueError, match="final_rollout_scope"):
+        _cfg("improve.lora_sft.staged.emit=final_only")
+
+
+def test_regen_bridge_falls_back_to_stage1_bridges(monkeypatch, tmp_path):
+    """A question whose regen pass produces no accepted bridge keeps its
+    stage-1 bridge pairs instead of dropping out of the stage-2 fit."""
+    cfg = _cfg("improve.lora_sft.staged.unsolved_targets=regen_bridge")
+
+    def responder(qid, kind, r, stage):
+        if stage == "bridge":                       # stage-1: both get bridges
+            return [_sample(101)] if qid == "q1" else [_sample(104)]
+        if stage == "stage1_bridge":                # regen FAILS for q2
+            assert qid == "q2"
+            return [_sample(102)]
+        if kind == "a1" and stage == "stage1":
+            return [_sample(101)] if qid == "q1" else [_sample(102)]
+        return [_sample(104)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures())
+    # q2 still fits on its stage-1 bridge pair
+    assert [p["input_ids"] for p in fits["pairs"]["stage2"]] == [[1, 2, 104, 0]]
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage1_regen_fallback"] == 1
+
+
+def test_add_bridge_merges_old_and_new(monkeypatch, tmp_path):
+    """add_bridge: union of stage-1 and regenerated bridges, deduped by
+    input_ids, re-ranked shortest-first, capped at stage_max_keep."""
+    cfg = _cfg("improve.lora_sft.staged.unsolved_targets=add_bridge",
+               "improve.lora_sft.staged.stage_max_keep=2",
+               "improve.lora_sft.staged.stage_bridge_n=3")
+
+    def responder(qid, kind, r, stage):
+        if stage == "bridge":
+            assert r.n == 2                          # bridge.n untouched
+            return [_sample(101)] if qid == "q1" else [_sample(104)]
+        if stage == "stage1_bridge":
+            assert qid == "q2"
+            assert r.n == 3                          # stage_bridge_n seam
+            # one exact duplicate of the stage-1 bridge + one longer new one
+            return [_sample(104), _sample(104, ids=[104, 104])]
+        if kind == "a1" and stage == "stage1":
+            return [_sample(101)] if qid == "q1" else [_sample(102)]
+        return [_sample(104)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    op = StagedBridgeSftOperator()
+    _propose(cfg, tmp_path, _fixtures(), op=op)
+    q2_pairs = [p["input_ids"] for p in fits["pairs"]["stage2"]]
+    assert q2_pairs == [[1, 2, 104, 0], [1, 2, 104, 104, 0]]   # dedup + shortest rank
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage1_pairs_old"] == 1 and stats["stage1_pairs_new"] == 1
+    # seams released after the regen call
+    assert op._bridge_n is None and op._bridge_max_keep is None
+
+
+def test_add_bridge_stage_max_keep_caps_merge(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.unsolved_targets=add_bridge",
+               "improve.lora_sft.staged.stage_max_keep=1")
+
+    def responder(qid, kind, r, stage):
+        if stage == "bridge":
+            return [_sample(101)] if qid == "q1" else [_sample(104)]
+        if stage == "stage1_bridge":
+            return [_sample(104, ids=[104, 104])]
+        if kind == "a1" and stage == "stage1":
+            return [_sample(101)] if qid == "q1" else [_sample(102)]
+        return [_sample(104)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures())
+    # shortest wins the single slot: the stage-1 bridge
+    assert [p["input_ids"] for p in fits["pairs"]["stage2"]] == [[1, 2, 104, 0]]
+
+
+def test_keep_selection_longest(monkeypatch, tmp_path):
+    """bridge.keep_selection=longest flips the max_keep quota ordering (applies
+    to the base bridge_sft operator too)."""
+    cfg = Config.load(None, overrides=[
+        "improve.operator=bridge_sft", "engine.enable_lora=true",
+        "improve.lora_sft.bridge.n=2", "improve.lora_sft.bridge.max_keep=1",
+        "improve.lora_sft.bridge.keep_selection=longest",
+    ])
+
+    def responder(qid, kind, r, stage):
+        if kind in ("bridge", "bridge_retry"):
+            if qid == "q1":
+                return [_sample(101), _sample(105, ids=[105, 105, 105])]
+            return [_sample(104)]
+        return [_sample(102)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures(), op=BridgeSftOperator())
+    q1 = [p for p in fits["pairs"]["pooled_c0"] if p["qid"] == "q1"]
+    assert [p["input_ids"] for p in q1] == [[1, 2, 105, 105, 105, 0]]   # LONGEST kept
+
+
+@pytest.mark.parametrize("bad,match", [
+    ("improve.lora_sft.bridge.keep_selection=nope", "keep_selection"),
+    ("improve.lora_sft.staged.stage_bridge_n=0", "stage_bridge_n"),
+    ("improve.lora_sft.staged.stage_max_keep=0", "stage_max_keep"),
+])
+def test_new_knob_validation(bad, match):
+    with pytest.raises(ValueError, match=match):
+        _cfg(bad)
 
 
 @pytest.mark.parametrize("bad", [

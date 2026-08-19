@@ -27,6 +27,7 @@ through the lora_sft module object so tests can fake one `run_pool`.
 
 from __future__ import annotations
 
+import random
 import re
 
 from .config import Config
@@ -96,16 +97,18 @@ class BridgeSftOperator(_ls.LoraSftOperator):
                 break
             if pass_name == "bridge_retry":
                 n_retried = len(pending)
-            # staged_bridge_sft seam: when set, bridges are regenerated THROUGH
-            # the current adapter with a per-stage seed salt. Both default to
-            # None, keeping this operator's requests (and seeds) byte-identical.
+            # staged_bridge_sft seams: when set, bridges are regenerated THROUGH
+            # the current adapter with a per-stage seed salt and (optionally) a
+            # per-stage sample count. All default to None, keeping this
+            # operator's requests (and seeds) byte-identical.
             bridge_lora = getattr(self, "_bridge_lora_path", None)
             seed_salt = getattr(self, "_bridge_seed_salt", None)
+            bridge_n = getattr(self, "_bridge_n", None) or br.n
             results = _ls.run_pool(
                 [GenRequest(
                     rid=f"{qid}:{pass_name}",
                     prompt_token_ids=gen_prompt[qid],
-                    n=br.n,
+                    n=bridge_n,
                     seed=(stable_seed(cfg.run.seed, pass_name, iteration, qid)
                           if seed_salt is None
                           else stable_seed(cfg.run.seed, pass_name, iteration, qid, seed_salt)),
@@ -164,11 +167,18 @@ class BridgeSftOperator(_ls.LoraSftOperator):
         # ---- fit pairs: PLAIN prompt [+ anchor] -> z+ (id concat) -----------
         targets: dict[str, list[dict]] = {}
         n_pairs_kept = 0
+        max_keep = getattr(self, "_bridge_max_keep", None) or br.max_keep
         for qid, items in accepted.items():
             anchor_ids = list(anchors_by_qid[qid].anchor_token_ids)
-            items = sorted(items, key=lambda it: len(it["sample"]["token_ids"]))
+            if br.keep_selection == "random":
+                items = sorted(items, key=lambda it: it["sample_idx"])
+                rng = random.Random(stable_seed(cfg.run.seed, "bridge_keep", iteration, qid))
+                rng.shuffle(items)
+            else:
+                items = sorted(items, key=lambda it: len(it["sample"]["token_ids"]),
+                               reverse=(br.keep_selection == "longest"))
             pairs = []
-            for it in items[:br.max_keep]:
+            for it in items[:max_keep]:
                 ids, plen = bridge_pair_ids(
                     prompts[qid], anchor_ids, it["sample"]["token_ids"], eos)
                 pairs.append({"qid": qid, "input_ids": ids, "prompt_len": plen})

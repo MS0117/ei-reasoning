@@ -2,6 +2,35 @@
 
 Expert Iteration with pluggable improvement operators, for math (and later Lean) reasoning.
 
+## Install
+
+```bash
+git clone https://github.com/MS0117/ei-reasoning.git && cd ei-reasoning
+bash scripts/setup.sh --skip-lean
+```
+
+`--skip-lean` gives the math-only environment; drop it for the full setup including Lean
+proof verification (kimina/Mathlib). Everything runs out of the project venv
+(`.venv/bin/python`) — the launcher scripts call it directly, so no `activate` needed.
+
+## Pass-rate sweeps
+
+Measure, for every question in a dataset, how many of `K` rollouts the policy gets right —
+the table the cliff sets and the stratified sampler are drawn from.
+
+```bash
+bash data/run_passrate.sh -c data/configs/passrate_openr1_default.yaml -b
+
+bash data/run_passrate.sh -c data/configs/passrate_openr1_extended.yaml -b
+```
+
+`-b` runs in the background (nohup) and prints the log path; add `-g 0,1` to pin GPUs
+(the default is every visible device). Each launch creates a fresh timestamped
+`runs/passrate/<slug>_<ts>/`; resume a partial run with `-r <that dir>`. Results are
+`metrics.json` (histogram + cliff/frontier/solved counts), `question_stats.jsonl`
+(per-question `c`/`pass_rate`/`class`) and `samples.jsonl` (every graded generation).
+Join the stats back onto the source dataset with `data/join_passrate.py`.
+
 The loop, per iteration `k`:
 
 1. **rollout** — the policy samples `n` responses per question (vLLM, data-parallel workers).
@@ -21,13 +50,6 @@ The loop, per iteration `k`:
 architecture, the run-directory data flow, every module's role, and how to add new
 anchor policies / operators / gates. API quirks of the pinned bleeding-edge deps are
 in [`docs/api_notes.md`](docs/api_notes.md).
-
-## Setup
-
-```bash
-bash scripts/setup.sh --skip-lean    # math-only (no Lean/kimina/Mathlib)
-bash scripts/setup.sh                # full setup including Lean proof verification
-```
 
 ## Running
 

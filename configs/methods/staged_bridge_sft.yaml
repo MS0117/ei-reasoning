@@ -203,6 +203,9 @@ improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
       temperature: null       # null -> improve.temperature
       retry_temperature: 1.5
       max_keep: 4
+      keep_selection: shortest   # shortest | longest | random — which accepted
+                              # bridges fill the max_keep quota (also the
+                              # add_bridge merge re-rank rule)
       max_tokens: null        # null -> improve.max_tokens
       leakage_rules: false    # G5 regex screen (default OFF — confirmed)
       judge_enabled: false    # G5 LLM judge screen (default OFF — confirmed)
@@ -213,8 +216,13 @@ improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
                               # the still-unsolved cliffs)
       chain_adapter: true     # warm-start each stage-2 fit from the previous
                               # adapter (false = fresh adapter from base)
-      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge (bridges
-                              # regenerated THROUGH the current adapter)
+      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge | add_bridge
+                              # regen/add generate THROUGH the current adapter;
+                              # regen falls back to stage-1 bridges on failure,
+                              # add merges old+new (dedup + keep_selection re-rank)
+      stage_bridge_n: null    # stage-2+ bridge samples per question (null -> bridge.n)
+      stage_max_keep: null    # per-question pair cap for stage-2 fits, applied
+                              # after the add_bridge merge (null -> bridge.max_keep)
       solved_targets: self_wash_min_c  # self_wash_min_c | bridge | random |
                               # longest | shortest — read only when
                               # train_scope: full_pool
@@ -222,7 +230,8 @@ improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
       stage2_steps: 1         # gradient steps per stage-2 fit
       final_rollout_n: 16
       final_rollout_scope: unsolved    # unsolved | all
-      emit: all               # all (should be pair with final_rollout_scope: all) | final_only (which pool rounds reach filters)
+      emit: all               # all | final_only (final_only requires
+                              # final_rollout_scope: all — validated at load)
   rl:                         # ---- axis 3: optional post-SFT RL (NOT an operator) ----
     enabled: false            # runs AFTER the fit, BEFORE candidate sampling;
                               # trains LoRA params only, phi_E replaces the adapter

@@ -114,7 +114,7 @@ anchor:
 
 improve:
   operator: staged_bridge_sft # <- the methodological difference vs BRIDGE/LSPO
-  n: 16                       # samples per question from q_phi
+  n: 16                       # not used in staged_bridge_sft! samples per question from q_phi 
   temperature: 1.2
   top_p: 0.98
   max_tokens: 16384
@@ -211,6 +211,9 @@ improve:
       temperature: null       # null -> improve.temperature
       retry_temperature: 1.5  # ONE hotter retry for B+-empty cliffs
       max_keep: 4             # bridge fit pairs kept per question (shortest-first)
+      keep_selection: shortest   # shortest | longest | random — which accepted
+                              # bridges fill the max_keep quota (also the
+                              # add_bridge merge re-rank rule)
       max_tokens: null        # null -> improve.max_tokens
       leakage_rules: false    # G5 regex screen (default OFF — confirmed)
       judge_enabled: false    # G5 LLM judge screen (default OFF — confirmed)
@@ -219,14 +222,21 @@ improve:
       rollout_n: 8            # (b) samples per cliff off the stage-1 adapter
       num_stages: 1           # stage-2 fit passes
       chain_adapter: true     # warm-start stage-2 fits from the previous adapter
-      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge
+      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge | add_bridge
+                              # regen/add generate THROUGH the current adapter;
+                              # regen falls back to stage-1 bridges on failure,
+                              # add merges old+new (dedup + keep_selection re-rank)
+      stage_bridge_n: null    # stage-2+ bridge samples per question (null -> bridge.n)
+      stage_max_keep: null    # per-question pair cap for stage-2 fits, applied
+                              # after the add_bridge merge (null -> bridge.max_keep)
       solved_targets: self_wash_min_c  # self_wash_min_c | bridge | random |
                               # longest | shortest (train_scope: full_pool only)
       train_scope: unsolved_only       # unsolved_only | full_pool
       stage2_steps: 1         # gradient steps per stage-2 fit
-      final_rollout_n: 8
+      final_rollout_n: 16
       final_rollout_scope: unsolved    # unsolved | all
-      emit: all               # all (should be pair with final_rollout_scope: all) | final_only
+      emit: all               # all | final_only (final_only requires
+                              # final_rollout_scope: all — validated at load)
   rl:                         # ---- optional post-SFT RL phase (NOT an operator) ----
     enabled: false           # runs AFTER the fit (lora_sft or bridge_sft), BEFORE
                               # candidate sampling; trains the LoRA params only and

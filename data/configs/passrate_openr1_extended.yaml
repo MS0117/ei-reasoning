@@ -12,7 +12,11 @@
 # no-true-filtered 0 — extended's question_type survivors are all upstream
 # math-verify confirmed). Filtering is deterministic; --dry-run only earns its
 # minute if the dataset revision moves.
-# Ship back runs/passrate/<slug>/{question_stats.jsonl,questions.jsonl} only.
+# Ship back runs/passrate/<slug>/question_stats.jsonl ONLY (~11 MB; gzip ~3 MB).
+# questions.jsonl is 123.3 MB here — over GitHub's 100 MB hard limit, and
+# unnecessary: the question set is deterministic, so the receiving side
+# regenerates it from this config and passes it via
+# `join_passrate.py --questions`. See passrate_openr1_default.yaml.
 #
 # THE EXPENSIVE HALF: 87k x K=16 = 1.39M samples ~= 890 GPU-h ~= 112h on 8 GPUs,
 # nearly 1.5x the `default` sweep for a lower expected cliff yield. Run `default`

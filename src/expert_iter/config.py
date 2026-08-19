@@ -226,7 +226,10 @@ class BridgeCfg:
     n: int = 8                          # N_B bridge samples per cliff
     temperature: float | None = None    # null -> improve.temperature
     retry_temperature: float = 1.5      # ONE hotter retry pass for B+-empty cliffs
-    max_keep: int = 4                   # bridge pairs kept per question (shortest-first)
+    max_keep: int = 4                   # bridge pairs kept per question
+    keep_selection: str = "shortest"    # shortest | longest | random — which accepted
+                                        # bridges fill the max_keep quota (also the
+                                        # re-rank rule for staged add_bridge merges)
     leakage_rules: bool = False         # G5 regex screen over z+ text (patterns from
                                         # filter.leakage.patterns); default OFF
     judge_enabled: bool = False         # G5 LLM-judge screen over z+ text; default OFF
@@ -247,8 +250,18 @@ class StagedCfg:
     rollout_n: int = 8                 # (b) samples per cliff off the stage-1 adapter
     num_stages: int = 1                # stage-2 fit passes
     chain_adapter: bool = True         # warm-start each stage-2 fit from the previous adapter
-    unsolved_targets: str = "reuse_bridge"   # reuse_bridge | regen_bridge (bridge
-                                             # regenerated THROUGH the current adapter)
+    unsolved_targets: str = "reuse_bridge"   # reuse_bridge | regen_bridge | add_bridge
+                                             # regen/add generate bridges THROUGH the
+                                             # current adapter; regen falls back to the
+                                             # stage-1 bridges when generation fails,
+                                             # add merges old+new (dedup, re-ranked by
+                                             # bridge.keep_selection, capped at
+                                             # stage_max_keep)
+    stage_bridge_n: int | None = None        # stage-2+ bridge samples per question
+                                             # (null -> bridge.n)
+    stage_max_keep: int | None = None        # per-question pair cap for stage-2 fits,
+                                             # applied after the add_bridge merge
+                                             # (null -> bridge.max_keep)
     solved_targets: str = "self_wash_min_c"  # self_wash_min_c | bridge | random |
                                              # longest | shortest (read only when
                                              # train_scope: full_pool)
@@ -801,6 +814,8 @@ class Config:
             raise ValueError("improve.lora_sft.bridge temperatures must be >= 0")
         if br.max_tokens is not None and br.max_tokens < 1:
             raise ValueError("improve.lora_sft.bridge.max_tokens must be >= 1 or null")
+        if br.keep_selection not in ("shortest", "longest", "random"):
+            raise ValueError(f"improve.lora_sft.bridge.keep_selection: {br.keep_selection!r}")
         st = ls.staged
         if st.rollout_n < 1 or st.final_rollout_n < 1 or st.num_stages < 1:
             raise ValueError(
@@ -808,8 +823,12 @@ class Config:
             )
         if not 1 <= st.stage2_steps <= 32:
             raise ValueError("improve.lora_sft.staged.stage2_steps must be in [1, 32]")
-        if st.unsolved_targets not in ("reuse_bridge", "regen_bridge"):
+        if st.unsolved_targets not in ("reuse_bridge", "regen_bridge", "add_bridge"):
             raise ValueError(f"improve.lora_sft.staged.unsolved_targets: {st.unsolved_targets!r}")
+        if st.stage_bridge_n is not None and st.stage_bridge_n < 1:
+            raise ValueError("improve.lora_sft.staged.stage_bridge_n must be >= 1 or null")
+        if st.stage_max_keep is not None and st.stage_max_keep < 1:
+            raise ValueError("improve.lora_sft.staged.stage_max_keep must be >= 1 or null")
         if st.solved_targets not in ("self_wash_min_c", "bridge", "random", "longest", "shortest"):
             raise ValueError(f"improve.lora_sft.staged.solved_targets: {st.solved_targets!r}")
         if st.train_scope not in ("unsolved_only", "full_pool"):
@@ -821,6 +840,13 @@ class Config:
         if st.emit not in ("all", "final_only"):
             raise ValueError(f"improve.lora_sft.staged.emit: {st.emit!r}")
         if self.improve.operator == "staged_bridge_sft":
+            if st.emit == "final_only" and st.final_rollout_scope == "unsolved":
+                raise ValueError(
+                    "improve.lora_sft.staged: emit=final_only with "
+                    "final_rollout_scope=unsolved silently drops early-solved "
+                    "questions from the training data (they are absent from the "
+                    "final round) — use final_rollout_scope: all"
+                )
             # v1 scope: the intermediate rollout IS the fit probe, alpha stays 1.0,
             # and propose() is overridden wholesale — these phases would silently
             # not run, so reject them loudly at load.

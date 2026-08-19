@@ -129,34 +129,16 @@ anchor:
   #   bridge_sft     the anchor enters the FIT PAIR: (x + a -> z+), loss on z+
   #                  only, and the bridge is GENERATED as a continuation of a.
   #                  This is the coherent anchored method.
-  policy: privileged_divergence               # none | fixed_fraction | privileged_divergence
+  policy: none                # budget control arm vs STAGED: no anchor, like
+                              # every STAGED run and the 0.421 BRIDGE baseline.
+                              # (For the anchored variant swap back to
+                              # privileged_divergence WITH its params block —
+                              # params is validated against the active policy.)
   base_selection: min_mean_nll   # first_failed | longest | random | min_mean_nll
-  # params is validated AGAINST THE ACTIVE POLICY, so a key belonging to a
-  # different policy is a config error instead of a silent default. Swap this
-  # block when you swap the policy (fixed_fraction wants fraction / min_tokens
-  # / max_tokens; none wants nothing).
-  params:                     # privileged_divergence
-    signal: matched_minus_shuffled
-                              # matched_minus_shuffled (recommended) — the
-                              #   control pass shows ANOTHER question's
-                              #   reference, so "a reference was shown at all"
-                              #   cancels and only problem-specific
-                              #   disagreement survives
-                              # realized_logratio — control is the bare
-                              #   prompt(x). MEASURED to fire on a response's
-                              #   stylistic opening (a correct preamble scored
-                              #   g_bar 1.03 vs 0.26 elsewhere), cutting at 4%
-                              #   of the response; kept as the ablation baseline
-                              # topk_kl — needs engine.max_logprobs >= top_k
-    top_k: 100
-    c_sigma: 2.0              # threshold = mu + c_sigma*sigma over searched steps
-    search_frac: 0.333        # only inspect the first L/3 of the failed response
-    min_steps: 2              # j_a clamped into [min_steps, ceil(max_frac * J)]
-    max_frac: 0.8
 
 improve:
   operator: bridge_sft        # <- the ONLY methodological difference vs LSPO
-  n: 16                       # samples per question from q_phi
+  n: 24                      # samples per question from q_phi
   temperature: 1.2
   top_p: 0.98
   max_tokens: 16384
@@ -210,7 +192,7 @@ improve:
       r: 16
       lora_alpha: 32
       lr: 1.0e-4
-      steps: 3
+      steps: 4
       max_pair_tokens: 16384
       dropout: 0.0
       micro_batch_size: 1     # grad-accum reaches the full batch each step

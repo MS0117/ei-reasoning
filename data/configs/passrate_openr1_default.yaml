@@ -11,7 +11,12 @@
 # no-true-filtered 18268). Filtering is deterministic, so --dry-run is only
 # worth re-running if the dataset revision moves — the real run does the same
 # load first and dies in the same place within minutes if anything is off.
-# Ship back runs/passrate/<slug>/{question_stats.jsonl,questions.jsonl} only —
+# Ship back runs/passrate/<slug>/question_stats.jsonl ONLY (~7.5 MB; gzip ~2 MB).
+# Not questions.jsonl: it is 89.6 MB here (58 MB of it gold_solution) and the
+# question set is deterministic, so the receiving side regenerates a
+# byte-equivalent copy from this same config and passes it via
+# `join_passrate.py --questions`. qids are content hashes, so a revision drift
+# shows up as the join's missing-qid abort rather than a silent miscount.
 # samples.jsonl is multi-GB and nothing downstream needs it.
 #
 # K=16 doubles the committed cliff sets' basis (cliff137 was 0/8, cliff107 0/16)

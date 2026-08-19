@@ -183,10 +183,13 @@ class StagedBridgeSftOperator(BridgeSftOperator):
         for k in range(1, st.num_stages + 1):
             unsolved_k = [q for q in with_gold if q not in solved]
             # c-1: unsolved questions -> bridge pairs
-            if st.unsolved_targets == "regen_bridge" and unsolved_k:
+            if st.unsolved_targets in ("regen_bridge", "add_bridge") and unsolved_k:
                 regen_stats: dict = {}
+                cap = st.stage_max_keep or ls.bridge.max_keep
                 self._bridge_lora_path = str(adapter)
                 self._bridge_seed_salt = f"stage{k}"
+                self._bridge_n = st.stage_bridge_n
+                self._bridge_max_keep = st.stage_max_keep
                 try:
                     regen = self._build_targets(
                         unsolved_k, tokenizer=tokenizer, prompts=prompts,
@@ -201,11 +204,35 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                 finally:
                     self._bridge_lora_path = None
                     self._bridge_seed_salt = None
+                    self._bridge_n = None
+                    self._bridge_max_keep = None
                 stats[f"stage{k}_bridge"] = {
                     key: regen_stats[key] for key in _BRIDGE_STAT_KEYS
                     if key in regen_stats
                 }
-                pairs_k, dropped = _flatten_pairs(regen, unsolved_k, max_pair)
+                if st.unsolved_targets == "add_bridge":
+                    n_old = n_new = 0
+                    targets_k = {}
+                    for q in unsolved_k:
+                        merged = _merge_pairs(
+                            targets1.get(q, []), regen.get(q, []), cap,
+                            ls.bridge.keep_selection,
+                            stable_seed(cfg.run.seed, "bridge_merge", iteration, q, k),
+                        )
+                        targets_k[q] = merged
+                        old_ids = {tuple(p["input_ids"]) for p in targets1.get(q, [])}
+                        n_old += sum(1 for p in merged if tuple(p["input_ids"]) in old_ids)
+                        n_new += sum(1 for p in merged if tuple(p["input_ids"]) not in old_ids)
+                    stats[f"stage{k}_pairs_old"] = n_old
+                    stats[f"stage{k}_pairs_new"] = n_new
+                else:  # regen_bridge: successful regens replace, failures fall
+                    # back to the stage-1 bridges instead of losing the question
+                    targets_k = {q: (regen.get(q) or targets1.get(q, []))
+                                 for q in unsolved_k}
+                    stats[f"stage{k}_regen_fallback"] = sum(
+                        1 for q in unsolved_k
+                        if not regen.get(q) and targets1.get(q))
+                pairs_k, dropped = _flatten_pairs(targets_k, unsolved_k, max_pair)
             else:
                 pairs_k, dropped = _flatten_pairs(targets1, unsolved_k, max_pair)
             stats["n_dropped_long"] += dropped
@@ -326,6 +353,27 @@ class StagedBridgeSftOperator(BridgeSftOperator):
         stats["n_wash_dropped_long"] = stats.get("n_wash_dropped_long", 0) + n_dropped
         stats.setdefault("n_wash_pairs", {})[f"stage{k}"] = len(pairs)
         return pairs
+
+
+def _merge_pairs(old: list[dict], new: list[dict], cap: int, selection: str,
+                 rng_seed: int) -> list[dict]:
+    """add_bridge merge: union of a question's stage-1 and freshly generated
+    pairs, deduped by input_ids (same qid -> same prompt, so this equals
+    continuation dedup), re-ranked by bridge.keep_selection, capped at cap."""
+    seen: set[tuple] = set()
+    pool: list[dict] = []
+    for pair in list(old) + list(new):
+        key = tuple(pair["input_ids"])
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(pair)
+    if selection == "random":
+        random.Random(rng_seed).shuffle(pool)
+    else:
+        pool.sort(key=lambda p: len(p["input_ids"]),
+                  reverse=(selection == "longest"))
+    return pool[:cap]
 
 
 def _flatten_pairs(targets: dict[str, list[dict]], qids: list[str],
