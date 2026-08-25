@@ -33,9 +33,29 @@ cliff 집합은 "K=8 샘플이 전부 틀렸다"는 **한 번의 측정**으로 
 data, rollout, partition)를 **정확히 대조**해서 하나라도 다르면 거부한다. 즉 improve/filter/anchor만 바꾼
 arm은 안전하게 재사용할 수 있고, 모델이나 샘플 수를 바꾸면 자동으로 막힌다.
 
-> **다른 머신에서 시작한다면**: `runs/` 는 gitignore이고 공유 rollout 디렉토리는 218MB라 저장소에 없다.
-> srv04에서는 위 경로를 그대로 쓰면 되고, 그 외 환경에서는 `-c data/configs/LSPO.yaml`을
-> `--reuse-rollout` 없이 한 번 돌려 새 기준 rollout을 만든 뒤(=~1 GPU-h) 그 디렉토리를 계속 재사용하면 된다.
+### 다른 머신에서 시작한다면 (재사용 번들)
+
+`runs/`는 gitignore이고 rollout 원본이 55MB라 저장소에는 없다. 대신 `--reuse-rollout`이 요구하는
+최소 파일만 묶은 번들(**10.7MB**)을 따로 전달받아 풀면 된다:
+
+```bash
+mkdir -p runs/toy_cliff && tar xzf toy_cliff_reuse_bundle.tar.gz -C runs/toy_cliff
+bash data/run_toy_cliff.sh -c data/configs/STAGED.yaml -b \
+    -- --reuse-rollout runs/toy_cliff/default_LSPO_20260813_155520
+```
+
+번들 구성: `config.yaml`(reuse 가드가 대조하는 frozen config), `questions/train.jsonl`(137문제 + gold),
+`iter_0/rollout/rollouts.jsonl`, `iter_0/partition/{verdicts,solved,unsolved}.jsonl` + `stats.json`.
+
+번들 없이도 되는가? **분석은 된다**. 지금 모든 arm이 `anchor.policy: none`이라 개선 연산자는 rollout
+내용을 전혀 보지 않는다 — 쓰는 것은 질문 프롬프트, gold, 그리고 "이 문제가 cliff인가"(=커밋된
+`docs/results/toy_cliff/shared_rollout_cliff_qids.jsonl`) 뿐이다. 다만 **실행**하려면 rollout 파일이
+있어야 한다: `anchor` 스테이지가 policy=none이어도 실패 샘플을 모아 `base_selection`으로
+`base_sample_idx`를 고르기 때문이다([anchor.py:375](../src/expert_iter/anchor.py#L375)) — 그 값은
+policy=none에서 후보 메타데이터일 뿐 생성에는 영향이 없다. 번들을 못 받는 상황이면
+`-c data/configs/LSPO.yaml`을 `--reuse-rollout` 없이 한 번 돌려(~1 GPU-h) 자기 기준 rollout을 만들고
+이후 계속 재사용하면 된다. cliff 집합이 우리 107개와 정확히 같지는 않지만(재측정 변동),
+**그 안에서의 paired 비교는 동일하게 유효**하다. 우리 결과와 문제 단위로 대조할 때만 원본이 필요하다.
 
 ---
 
