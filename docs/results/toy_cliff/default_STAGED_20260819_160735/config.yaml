@@ -1,0 +1,253 @@
+run:
+  name: staged_toy_cliff
+  output_root: runs
+  seed: 17
+  wandb:
+    project: ei_reasoning
+    entity: null
+    mode: online
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  system_prompt: null
+  chat_template_kwargs: {}
+engine:
+  gpus: null
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.9
+  max_model_len: 20480
+  score_batch_size: 256
+  score_gpu_memory_utilization: 0.8
+  score_max_num_batched_tokens: 4096
+  enable_prefix_caching: true
+  enforce_eager: false
+  enable_lora: true
+  max_loras: 8
+  max_lora_rank: 16
+  max_logprobs: 20
+data:
+  adapter: local_jsonl
+  adapter_args:
+    path: data/cliff_sets/openr1_qwen3-4b-2507_n2000_with_gold.jsonl
+  question_suffix: '
+
+
+    Please reason step by step, and put your final answer within \boxed{}.'
+  eval_holdout: 0
+  accumulate: true
+rollout:
+  n: 8
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+  capture_logprobs: false
+partition:
+  verifier: math
+  solved_keep_max: 4
+  solved_selection: shortest
+  cliff_max_correct: 0
+anchor:
+  policy: none
+  params:
+    fraction: 0.3
+    min_tokens: 32
+    max_tokens: 2048
+  base_selection: min_mean_nll
+improve:
+  operator: staged_bridge_sft
+  n: 16
+  temperature: 1.2
+  top_p: 0.98
+  max_tokens: 16384
+  rounds: 1
+  teacher:
+    model: null
+    gpus: null
+    quantization: null
+  lora_sft:
+    fit:
+      r: 16
+      lora_alpha: 32
+      lr: 0.0001
+      steps: 2
+      dropout: 0.0
+      target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+      micro_batch_size: 1
+      max_grad_norm: 1.0
+      max_pair_tokens: 16384
+      bf16: true
+      num_processes: null
+      sync_every: 8
+      adaptive:
+        enabled: false
+        tau_e: 0.5
+        max_steps: 10
+        eval_every: 2
+        m_rollouts: 4
+        criterion: frac_solved
+    adapter_scope: pooled
+    chunk_size: 0
+    refit_budget: 0
+    project_back:
+      enabled: false
+      alphas:
+      - 0.05
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 1.0
+      tau_p: 0.25
+      m_rollouts: 16
+      granularity: per_problem
+    bridge:
+      n: 8
+      temperature: null
+      retry_temperature: 1.5
+      max_keep: 4
+      leakage_rules: false
+      judge_enabled: false
+      max_tokens: null
+      sample_skipped: true
+    staged:
+      rollout_n: 8
+      num_stages: 1
+      chain_adapter: true
+      unsolved_targets: reuse_bridge
+      solved_targets: self_wash_min_c
+      train_scope: unsolved_only
+      stage2_steps: 1
+      final_rollout_n: 8
+      final_rollout_scope: unsolved
+      emit: all
+  rl:
+    enabled: false
+    algo: grpo
+    group_size: 8
+    epochs: 1.0
+    steps: null
+    grad_accum: 4
+    micro_batch_size: 1
+    gradient_checkpointing: true
+    lr: 1.0e-06
+    epsilon: 0.2
+    kl_beta: 0.0
+    temperature: null
+    max_completion_length: null
+    vllm_importance_sampling_correction: true
+    vllm_importance_sampling_mode: token_truncate
+    vllm_importance_sampling_cap: 2.0
+    prompt_filter:
+      enabled: false
+      m_rollouts: 8
+      min_pass_rate: 0.0
+      max_pass_rate: 1.0
+    plateau:
+      enabled: false
+      patience: 3
+      min_delta: 0.01
+      window: null
+    vllm_gpu_memory_utilization: 0.5
+    num_processes: null
+    backend: trl
+    seam_strict: false
+    seed: null
+filter:
+  gates:
+  - correctness
+  - no_external_context
+  - length
+  - dedup
+  max_total_tokens: 18432
+  max_per_question: 1
+  logprob_gate:
+    enabled: false
+    min_mean_logprob: -1.5
+    scope: continuation
+  selection:
+    method: random
+    always_score: true
+    lambda_tail: 1.0
+    gamma_dtail: 0.0
+    tail_fraction: 0.1
+    scope: continuation
+  leakage:
+    judge_enabled: false
+    judge_model: null
+    judge_max_tokens: 16
+    judge_temperature: 0.0
+    patterns:
+    - \breference solution\b
+    - \bgiven solution\b
+    - \bprovided solution\b
+    - \bmodel solution\b
+    - \bofficial solution\b
+    - \bas given\b
+    - \bthe hint\b
+    - \baccording to the (solution|reference)\b
+train:
+  objective: sft
+  init_from: base
+  backend: zero2
+  max_seq_len: 18432
+  sft:
+    lr: 1.0e-05
+    epochs: 2.0
+    scheduler: cosine
+    warmup_ratio: 0.03
+    global_batch_size: 32
+    micro_batch_size: 1
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    bf16: true
+    gradient_checkpointing: true
+    packing: false
+    logging_steps: 5
+    region_weights:
+      prompt: 0.0
+      anchor: 0.0
+      continuation: 1.0
+      solution: 1.0
+  dpo:
+    lr: 5.0e-07
+    beta: 0.1
+    epochs: 1.0
+    global_batch_size: 16
+    micro_batch_size: 1
+    loss_type: sigmoid
+    max_grad_norm: 1.0
+    logging_steps: 5
+loop:
+  iterations: 1
+  stages:
+  - rollout
+  - partition
+  - anchor
+  - improve
+  - filters
+  - build_dataset
+  - train
+  - eval
+  - benchmark_eval
+eval:
+  greedy_pass1: true
+  passk:
+    k: 8
+    temperature: 0.7
+    top_p: 0.95
+  max_tokens: 8192
+  benchmarks: []
+  benchmark_every: 1
+  benchmark_verifier: math_strict

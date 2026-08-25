@@ -53,6 +53,21 @@
 #   --override anchor.params.signal=topk_kl --override engine.max_logprobs=100
 #   --override anchor.base_selection=random               # G4 ablation
 
+#
+# OBJECTIVE ARMS (L3 decision experiment — docs/objective_decision_20260823.md §3/§4/§8;
+# every arm = fresh run dir; cliff-on arms need always_score for the guard refs):
+#   S1  (status quo)   no overrides — cliff.enabled=false
+#   S1' (legacy share) --override train.sft.cliff.enabled=true \
+#                      --override train.sft.cliff.rho=0.06 \
+#                      --override filter.selection.always_score=true
+#   S3(rho)            S1' with train.sft.cliff.rho=0.1 | 0.3
+#   S3-tok             S3(0.3) + --override train.sft.cliff.per_question_norm=false
+#   S4-v0 (zero-code)  S3(rho*) + --override train.sft.cliff.negative.mode=v0 \
+#                      --override train.objective=sft+dpo \
+#                      --override train.dpo.rejected_selection=modal_wrong
+#   S4-v1 (in-SFT)     S3(rho*) + --override train.sft.cliff.negative.mode=v1 \
+#                      --override train.sft.cliff.negative.mu=0.1
+#
 run:
   name: ei_openr1_bridge_sft
   output_root: runs
@@ -71,7 +86,9 @@ engine:
   gpu_memory_utilization: 0.90
   max_model_len: 20480        # >= train.max_seq_len
   enable_lora: true           # LoRA operators serve q_phi via per-request adapters
-  max_loras: 8
+  max_loras: 24               # adapters vLLM keeps co-resident per rollout batch;
+                              # must cover improve.lora_sft.chunk_size's shard
+                              # count (2000 cliffs / chunk 100 = 20) or vLLM swaps.
   max_lora_rank: 16
   max_logprobs: 20            # raise to >= anchor.params.top_k for signal=topk_kl
   score_gpu_memory_utilization: 0.80   # C(y)/anchor scoring pools run at this
@@ -110,19 +127,20 @@ partition:
   cliff_max_correct: 0        # cliff = all K rollouts failed (spec default)
 
 anchor:                       # ---- axis 1: WHERE improvement starts ----
-  policy: privileged_divergence   # step-granular cut where the y*-conditioned pass diverges
-  base_selection: min_mean_nll    # G4: anchor the most policy-typical (min mean NLL) failure
-  params:
-    signal: realized_logratio     # realized_logratio | topk_kl (needs engine.max_logprobs >= top_k)
-    top_k: 100
-    c_sigma: 2.0
-    search_frac: 0.333            # inspect only the first L/3 of the response
-    min_steps: 2                  # 2 <= j_a <= ceil(max_frac * J)
-    max_frac: 0.8
+  policy: none                # MAIN-EXPERIMENT CONTROL ARM: no anchor. The
+                              # anchored variant (privileged_divergence) measured
+                              # 0.252 vs 0.421 un-anchored on the 107-cliff toy
+                              # set, so the prefix-cut methodology is retired;
+                              # every main arm (staged / bridge / gold / none)
+                              # runs anchor-free so the operator is the only
+                              # difference.
+  base_selection: min_mean_nll    # (policy=none: selects base_sample_idx only)
 
 improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
   operator: bridge_sft        # lora_sft | bridge_sft | self_resample
-  n: 16                       # samples per cliff from q_phi (researcher default)
+  n: 24                       # samples per cliff from q_phi. 24 = the same
+                              # per-question budget as the staged arm's 8+16
+                              # (toy: n16/3 steps 0.421 -> n24/4 steps 0.514).
   temperature: 1.2
   top_p: 0.98
   max_tokens: 16384
@@ -171,7 +189,8 @@ improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
       r: 16
       lora_alpha: 32
       lr: 1.0e-4
-      steps: 3                # spec: 2-4 gradient steps
+      steps: 4                # = the staged arm's 2+2 total. Step count was the
+                              # strongest lever on the toy set (3 -> 4: +9pp).
       max_pair_tokens: 16384
       dropout: 0.0
       micro_batch_size: 1     # grad-accum reaches the full batch each step
@@ -331,6 +350,25 @@ train:
       anchor: 1.0             # G3 default: anchor tokens are the student's own — train on them
       continuation: 1.0
       solution: 1.0
+    # ---- cliff objective (docs/objective_decision_20260823.md §3 + §8) ----
+    # L = (1-rho)·L_S + rho·(L_C + mu·L_N + L_G). Disabled = legacy loss,
+    # byte-identical. Enable via the OBJECTIVE ARMS cookbook in the header.
+    # NOTE: enabling requires filter.selection.always_score=true (guard refs),
+    # and any train.* change invalidates ALL .done markers of an existing run
+    # dir (global config hash) — launch arms into FRESH run dirs (run.sh does).
+    cliff:
+      enabled: false
+      rho: 0.1                # per-step share of the cliff bracket, (0,1)
+      per_question_norm: true # false = S3-tok ablation (token-normalized L_C)
+      m_per_batch: 1          # cliff rows per 32-example global batch window
+      negative:
+        mode: "off"           # off | v0 (sft+dpo + modal_wrong rejected) | v1 (unlikelihood)
+        mu: 0.1
+        m_per_batch: 1
+        max_per_question: 8
+        delta: 0.02
+      guard:
+        enabled: true         # displacement hinge vs the C(y) pass's s_mean
 
 loop:
   iterations: 4

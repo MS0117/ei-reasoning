@@ -1,0 +1,21 @@
+{
+  "operator": "lora_sft",
+  "n_eligible": 107,
+  "n_with_gold": 107,
+  "n_no_gold": 0,
+  "n_pairs": 107,
+  "n_dropped_long": 0,
+  "n_fits": 1,
+  "fit_seconds": [
+    176.9
+  ],
+  "n_budget_skipped": 0,
+  "n_resolved_pool": 33,
+  "n_refits": 0,
+  "n_resolved_refit": 0,
+  "lora_yield": 0.3084,
+  "alpha_star_hist": {
+    "1": 107
+  },
+  "alpha_star_mean": 1.0
+}

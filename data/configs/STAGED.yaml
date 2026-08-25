@@ -10,8 +10,10 @@
 #       -- --reuse-rollout runs/toy_cliff/<BRIDGE or LSPO run dir>
 #
 # v1 constraints (rejected at config load): fit.adaptive, project_back,
-# refit_budget, per_problem/chunked adapters, and rl are not supported with
-# this operator yet.
+# refit_budget, per_problem adapters, the GLOBAL lora_sft.chunk_size, and rl are
+# not supported with this operator yet. Stage-2 sharding IS supported — it has
+# its own knobs, staged.stage1_chunk_size / stage2_chunk_size (stage-2 shards are
+# sub-shards of their stage-1 shard, so stage2 <= stage1).
 
 run:
   name: staged_toy_cliff      # wandb group
@@ -67,50 +69,12 @@ partition:
   cliff_max_correct: 0
 
 anchor:
-  # ---- WHERE IMPROVEMENT STARTS: x alone, or x + a prefix of a failure ------
-  # Two independent choices: WHICH failed rollout to cut (base_selection) and
-  # WHERE to cut it (policy). The anchor is always an ID-SLICE of the original
-  # rollout — never re-tokenized text — and it becomes a conditioning prefix:
-  # the operator continues from x + a, and training puts loss only after it.
-  #
-  # policy:
-  #   none                   empty anchor. The operator resamples the WHOLE
-  #                          response from x. Rejection-sampling / STaR
-  #                          ablation, and what every arm has run so far.
-  #   fixed_fraction         keep the first `fraction` of the failure, clamped
-  #                          to [min_tokens, max_tokens]. Simplest baseline.
-  #   privileged_divergence  cut where the reference solution stops endorsing
-  #                          the failure. Two teacher-forcing passes over the
-  #                          failed response y- with the SAME policy —
-  #                          privileged context prompt(x, y*) vs base context
-  #                          prompt(x) — give a per-token signal
-  #                              g_t = lp_base(y-_t) - lp_priv(y-_t)
-  #                          which rises where KNOWING the reference LOWERS the
-  #                          probability of the failure's own next token, i.e.
-  #                          at the first reference-detectable wrong turn.
-  #                          Averaged per step, thresholded at mu + c_sigma*sigma.
-  #                          NEEDS gold y* (backfilled into questions/train.jsonl).
-  #
-  # base_selection: which of the K failed rollouts to cut
-  #   first_failed   the first one (cheapest, no extra pass)
-  #   longest        the longest response
-  #   random         seeded by run.seed
-  #   min_mean_nll   the failure the policy finds MOST typical (lowest mean
-  #                  NLL) — the methodology's G4 choice, one extra batched
-  #                  scoring pass
-  #
-  # WHAT THE ANCHOR ACTUALLY CHANGES depends on the operator:
-  #   self_resample  q_phi samples from x + a instead of x
-  #   lora_sft       NOTHING in the fit — its pair is gold (x -> y*), and y* is
-  #                  not a continuation of a failed prefix, so there is nowhere
-  #                  to put the anchor. Only the sampling start moves. This is
-  #                  why anchored lora_sft is a weak variant.
-  #   bridge_sft     the anchor enters the FIT PAIR: (x + a -> z+), loss on z+
-  #                  only, and the bridge is GENERATED as a continuation of a.
-  #                  This is the coherent anchored method.
-  policy: none                # staged spec: NO anchor — plain bridge prompt,
-                              # rollouts from the bare question
-  base_selection: min_mean_nll   # first_failed | longest | random | min_mean_nll
+  # DEPRECATED stage. The prefix-cut methodology (fixed_fraction /
+  # privileged_divergence + base_selection) was abandoned; every live preset
+  # runs `none`, so the operator resamples the WHOLE response from x and the
+  # stage only emits an empty anchor. Left in place so old run dirs load.
+  policy: none
+  base_selection: min_mean_nll    # unused with policy: none first_failed
 
 improve:
   operator: staged_bridge_sft # <- the methodological difference vs BRIDGE/LSPO
@@ -168,7 +132,7 @@ improve:
       r: 16
       lora_alpha: 32
       lr: 1.0e-4
-      steps: 2                # STAGE-1 fit steps (staged spec default)
+      steps: 2               # STAGE-1 fit steps (staged spec default)
       max_pair_tokens: 16384
       dropout: 0.0
       micro_batch_size: 1     # grad-accum reaches the full batch each step
@@ -201,7 +165,7 @@ improve:
         m_rollouts: 4         # probe samples per question per round
         criterion: frac_solved   # frac_solved | mean_p_hat
     project_back:
-      enabled: false
+      enabled: false 
       alphas: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
       tau_p: 0.25
       m_rollouts: 16
@@ -220,23 +184,60 @@ improve:
       sample_skipped: true    # skipped cliffs still sampled from the pooled adapter
     staged:                   # ---- staged_bridge_sft schedule (this operator) ----
       rollout_n: 8            # (b) samples per cliff off the stage-1 adapter
-      num_stages: 1           # stage-2 fit passes
+      num_stages: 1           # stage-2 fit passes 1스텝마다 rollout후 다시 샘플링한 데이터로 훈련
       chain_adapter: true     # warm-start stage-2 fits from the previous adapter
-      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge | add_bridge
-                              # regen/add generate THROUGH the current adapter;
-                              # regen falls back to stage-1 bridges on failure,
-                              # add merges old+new (dedup + keep_selection re-rank)
+      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge, make new bridge for cliff problems
+                              # (reuse_bridge | regen_bridge | add_bridge —
+                              # regen falls back to stage-1 bridges on failure;
+                              # add merges old+new: dedup + keep_selection re-rank)
       stage_bridge_n: null    # stage-2+ bridge samples per question (null -> bridge.n)
-      stage_max_keep: null    # per-question pair cap for stage-2 fits, applied
+      stage_max_keep: null       # per-question pair cap for stage-2 fits, applied
                               # after the add_bridge merge (null -> bridge.max_keep)
-      solved_targets: self_wash_min_c  # self_wash_min_c | bridge | random |
+      solved_targets: self_wash_min_c  # only work train_scope=fullpool,, self_wash_min_c | bridge | random |
                               # longest | shortest (train_scope: full_pool only)
       train_scope: unsolved_only       # unsolved_only | full_pool
-      stage2_steps: 1         # gradient steps per stage-2 fit
+      stage2_objective: dpo   # sft | dpo. dpo: chosen = the bridge, rejected = a
+                              # failure THIS adapter produced in the preceding
+                              # rollout (on-policy negative, no extra generation);
+                              # one pair per bridge so the chosen side equals the
+                              # SFT arm and the comparison isolates the objective.
+      dpo:
+        beta: 0.1             # DPO temperature
+        lr: null              # null -> fit.lr (DPO usually wants lower)
+        sft_weight: 0.0       # + w * NLL(chosen) in the same loss (RPO-style).
+                              # 1.0 = iterative-RPO's setting; Pang et al. 2024
+                              # found the NLL term essential on math reasoning.
+                              # Pure DPO only widens the gap and can push chosen
+                              # down too; raise (0.1-1.0) if fit_meta's
+                              # reward_margin climbs while conversion falls.
+        negative_selection: random   # random | longest | shortest
+        max_pairs_per_question: null # null -> one per kept bridge
+        reference: init       # init (= the adapter that made the negatives) |
+                              # base (adapter disabled); same thing when
+                              # chain_adapter: false
+      stage2_steps: 2         # gradient steps per stage-2 fit
+      stage1_chunk_size: 0    # 0 = ONE stage-1 adapter (pooled); N = one adapter per
+                              # N questions. Size shards by PAIRS PER ADAPTER
+                              # (~250-320 validated): at 107 cliffs, shards of 25
+                              # (~85 pairs) hurt; at 2000 cliffs chunk 100 restores
+                              # ~300 pairs/adapter. stage2_chunk_size must be <= this:
+                              # equal = one-to-one shards (a shard just shrinks as
+                              # questions get solved), smaller = each stage-1 shard
+                              # is sub-split (100 -> 5x20) with every child warm-
+                              # started from its parent adapter. A pooled stage 2
+                              # after a sharded stage 1 needs chain_adapter: false.
+      stage2_chunk_size: 0    # 0 = ONE stage-2 adapter (pooled, as every run so
+                              # far); N = one adapter per N questions of the
+                              # stage-2 fit set, so a question's gradient share
+                              # rises from 1/|fit set| to 1/N (concentration at
+                              # the cost of cross-question transfer). Stage 1 is
+                              # always pooled. Same total FLOPs; each extra
+                              # adapter adds ~50 s of model load, and more chunks
+                              # than engine.max_loras makes vLLM swap adapters
+                              # during the rollout.
       final_rollout_n: 16
       final_rollout_scope: unsolved    # unsolved | all
-      emit: all               # all | final_only (final_only requires
-                              # final_rollout_scope: all — validated at load)
+      emit: all               # all (should be pair with final_rollout_scope: all) | final_only
   rl:                         # ---- optional post-SFT RL phase (NOT an operator) ----
     enabled: false           # runs AFTER the fit (lora_sft or bridge_sft), BEFORE
                               # candidate sampling; trains the LoRA params only and

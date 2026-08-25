@@ -187,3 +187,65 @@ def test_frozen_run_config_rejects_mismatched_resume(tmp_path):
     changed = Config.load(None, overrides=["rollout.n=3"])
     with pytest.raises(ValueError, match="config mismatch"):
         freeze_run_config(changed, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# cliff objective (train.sft.cliff) — docs/objective_decision_20260823.md §3
+# ---------------------------------------------------------------------------
+
+def test_cliff_defaults_load():
+    cfg = Config.load(None)
+    cl = cfg.train.sft.cliff
+    assert cl.enabled is False
+    assert cl.rho == 0.1 and cl.per_question_norm is True and cl.m_per_batch == 1
+    assert cl.negative.mode == "off" and cl.negative.mu == 0.1
+    assert cl.negative.max_per_question == 8 and cl.negative.delta == 0.02
+    assert cl.guard.enabled is True
+    assert cfg.train.dpo.rejected_selection == "base_pick"
+
+
+_CLIFF_ON = "train.sft.cliff.enabled=true|filter.selection.always_score=true"
+
+
+@pytest.mark.parametrize("overrides", [
+    f"{_CLIFF_ON}|train.sft.cliff.rho=0",
+    f"{_CLIFF_ON}|train.sft.cliff.rho=1.0",
+    f"{_CLIFF_ON}|train.sft.cliff.m_per_batch=0",
+    f"{_CLIFF_ON}|train.sft.cliff.m_per_batch=20",          # > global_batch_size // 2
+    f"{_CLIFF_ON}|train.sft.cliff.negative.mode=bogus",
+    f"{_CLIFF_ON}|train.sft.cliff.negative.mode=v1|train.sft.cliff.negative.mu=-1",
+    f"{_CLIFF_ON}|train.sft.cliff.negative.mode=v1|train.sft.cliff.negative.delta=0",
+    f"{_CLIFF_ON}|train.sft.cliff.negative.mode=v1|train.objective=sft+dpo",  # double negative
+    f"{_CLIFF_ON}|train.sft.cliff.negative.mode=v0",        # v0 needs sft+dpo + modal_wrong
+    f"{_CLIFF_ON}|train.sft.cliff.negative.mode=v0|train.objective=sft+dpo",  # still no modal_wrong
+    "train.sft.cliff.negative.mode=v1",                     # negative without cliff.enabled
+    "train.dpo.rejected_selection=bogus",
+    # guard needs the C(y) scores file + matching scope
+    "train.sft.cliff.enabled=true",                         # shortest + always_score=false
+    f"{_CLIFF_ON}|filter.selection.scope=full",
+])
+def test_cliff_validations_reject(overrides):
+    with pytest.raises(ValueError):
+        Config.load(None, overrides=overrides.split("|"))
+
+
+def test_cliff_valid_arms_load():
+    # S3 / S3-tok / S4-v0 / S4-v1 override combos from the preset cookbook
+    Config.load(None, overrides=_CLIFF_ON.split("|") + ["train.sft.cliff.rho=0.3"])
+    Config.load(None, overrides=_CLIFF_ON.split("|") + ["train.sft.cliff.per_question_norm=false"])
+    Config.load(None, overrides=_CLIFF_ON.split("|") + [
+        "train.sft.cliff.negative.mode=v0", "train.objective=sft+dpo",
+        "train.dpo.rejected_selection=modal_wrong"])
+    Config.load(None, overrides=_CLIFF_ON.split("|") + ["train.sft.cliff.negative.mode=v1"])
+    # guard off lifts the always_score requirement
+    Config.load(None, overrides=[
+        "train.sft.cliff.enabled=true", "train.sft.cliff.guard.enabled=false"])
+
+
+def test_cliff_unknown_key_and_hash():
+    with pytest.raises(KeyError):
+        Config.load(None, overrides=["train.sft.cliff.bogus=1"])
+    with pytest.raises(KeyError):
+        Config.load(None, overrides=["train.sft.cliff.negative.bogus=1"])
+    assert Config.load(None).hash() != Config.load(
+        None, overrides=["train.sft.cliff.rho=0.2"]).hash()

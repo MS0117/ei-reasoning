@@ -43,7 +43,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from .config import EngineCfg
-from .utils import is_done, mark_done, read_jsonl, stable_hash, visible_gpus, write_jsonl
+from .utils import (append_jsonl, is_done, mark_done, read_jsonl, stable_hash,
+                    visible_gpus, write_jsonl)
 
 
 @dataclass
@@ -107,7 +108,10 @@ def run_pool(
             for r in requests
         )
     else:
-        required_context = max(len(r.prompt_token_ids) for r in requests)
+        # +1: score mode sends the whole sequence as the prompt and asks for
+        # one token, and vLLM rejects a prompt whose length EQUALS
+        # max_model_len on a generate runner.
+        required_context = max(len(r.prompt_token_ids) for r in requests) + 1
         # Leave headroom for the full-vocab logprobs spike (see EngineCfg).
         if engine_cfg.score_gpu_memory_utilization < engine_cfg.gpu_memory_utilization:
             engine_cfg = replace(
@@ -179,6 +183,8 @@ def run_pool(
                 "max_loras": engine_cfg.max_loras,
                 "max_lora_rank": engine_cfg.max_lora_rank,
                 "max_logprobs": engine_cfg.max_logprobs,
+                "score_max_num_batched_tokens": engine_cfg.score_max_num_batched_tokens,
+                "generate_chunk_size": engine_cfg.generate_chunk_size,
             }),
         ]
         log_f = log_path.open("w")
@@ -196,6 +202,32 @@ def run_pool(
     if missing:
         raise RuntimeError(f"pool returned no result for {len(missing)} requests, e.g. {missing[:5]}")
     return [results[r.rid] for r in requests]
+
+
+def _resume_done_rids(out_path: str | Path) -> set[str]:
+    """rids already emitted into a PARTIAL worker output (no .done marker).
+
+    A kill mid-append can leave a torn final line, so parse leniently and
+    rewrite the file from the intact rows — appending after a torn line would
+    corrupt the shard permanently. A completed (.done) output is left alone;
+    run_pool skips those shards before ever starting a worker.
+    """
+    out_path = Path(out_path)
+    if not out_path.exists():
+        return set()
+    rows, torn = [], False
+    with out_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                torn = True          # only ever the last line of a killed write
+    if torn:
+        write_jsonl(out_path, rows)
+    return {r["rid"] for r in rows if "rid" in r}
 
 
 def _model_fingerprint(model_path: str) -> str:
@@ -295,7 +327,24 @@ def _worker(argv: list[str]) -> None:
     llm = LLM(**llm_kwargs)
 
     reqs = [GenRequest(**row) for row in read_jsonl(args.input)]
-    rows: list[dict] = []
+
+    # Incremental checkpointing. A shard is one worker's whole slice of the
+    # pool — hours to days on a full-dataset sweep — so results are appended
+    # per chunk and already-emitted rids are skipped on rerun. Without this,
+    # resume granularity is the entire shard: a kill at 99% redoes everything
+    # (and _wait_all's progress readout sits at 0 until a worker finishes).
+    done_rids = _resume_done_rids(args.output)
+    if done_rids:
+        print(f"[worker] resuming: {len(done_rids)} of {len(reqs)} results already on disk",
+              flush=True)
+        reqs = [r for r in reqs if r.rid not in done_rids]
+    n_written = len(done_rids)
+
+    def emit(new_rows: list[dict]) -> None:
+        nonlocal n_written
+        for row in new_rows:
+            append_jsonl(args.output, row)
+        n_written += len(new_rows)
 
     # Group by adapter: one llm.generate call per adapter (or None = base
     # model). Per-request seeds keep results independent of request order, so
@@ -320,28 +369,33 @@ def _worker(argv: list[str]) -> None:
         groups.setdefault(r.lora_path, []).append(r)
 
     if args.mode == "generate":
+        # Chunked so a kill costs at most one chunk, not the shard. vLLM cannot
+        # run more than max_num_seqs concurrently anyway, so a chunk of
+        # generate_chunk_size requests keeps the batch just as full.
+        gcs = max(1, int(ecfg.get("generate_chunk_size", 256)))
         for path in [None, *lora_paths]:
             group = groups.get(path)
             if not group:
                 continue
-            prompts = [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in group]
-            params = [
-                SamplingParams(
-                    n=r.n,
-                    temperature=sampling.get("temperature", 1.0),
-                    top_p=sampling.get("top_p", 1.0),
-                    top_k=sampling.get("top_k", -1),
-                    min_p=sampling.get("min_p", 0.0),
-                    max_tokens=(r.max_tokens if r.max_tokens is not None
-                                else sampling.get("max_tokens", 1024)),
-                    stop=sampling.get("stop"),
-                    seed=r.seed,
-                )
-                for r in group
-            ]
-            outs = llm.generate(prompts, params, **lora_kw(path))
-            for r, out in zip(group, outs):
-                rows.append(GenResult(
+            for start in range(0, len(group), gcs):
+                chunk = group[start:start + gcs]
+                prompts = [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in chunk]
+                params = [
+                    SamplingParams(
+                        n=r.n,
+                        temperature=sampling.get("temperature", 1.0),
+                        top_p=sampling.get("top_p", 1.0),
+                        top_k=sampling.get("top_k", -1),
+                        min_p=sampling.get("min_p", 0.0),
+                        max_tokens=(r.max_tokens if r.max_tokens is not None
+                                    else sampling.get("max_tokens", 1024)),
+                        stop=sampling.get("stop"),
+                        seed=r.seed,
+                    )
+                    for r in chunk
+                ]
+                outs = llm.generate(prompts, params, **lora_kw(path))
+                emit([GenResult(
                     rid=r.rid,
                     samples=[
                         {
@@ -352,7 +406,7 @@ def _worker(argv: list[str]) -> None:
                         for o in out.outputs
                     ],
                     meta=r.meta,
-                ).__dict__)
+                ).__dict__ for r, out in zip(chunk, outs)])
     else:  # score
         bs = max(1, ecfg.get("score_batch_size", 256))
         want_tokens = bool(sampling.get("return_token_logprobs"))
@@ -364,6 +418,7 @@ def _worker(argv: list[str]) -> None:
                 continue
             for start in range(0, len(group), bs):
                 chunk = group[start:start + bs]
+                chunk_rows: list[dict] = []
                 outs = llm.generate(
                     [TokensPrompt(prompt_token_ids=r.prompt_token_ids) for r in chunk],
                     params,
@@ -386,7 +441,7 @@ def _worker(argv: list[str]) -> None:
                             if top_k > 0:
                                 topk.append(None)
                     scored = [v for v in lps if v is not None]
-                    rows.append(GenResult(
+                    chunk_rows.append(GenResult(
                         rid=r.rid,
                         sum_logprob=float(sum(scored)) if scored else None,
                         mean_logprob=float(sum(scored) / len(scored)) if scored else None,
@@ -395,10 +450,10 @@ def _worker(argv: list[str]) -> None:
                         topk_logprobs=topk if top_k > 0 else None,
                         meta=r.meta,
                     ).__dict__)
+                emit(chunk_rows)
 
-    n = write_jsonl(args.output, rows)
-    mark_done(args.output, count=n, config_hash=args.cache_key)
-    print(f"[worker] wrote {n} results to {args.output}", flush=True)
+    mark_done(args.output, count=n_written, config_hash=args.cache_key)
+    print(f"[worker] wrote {n_written} results to {args.output}", flush=True)
 
 
 if __name__ == "__main__":

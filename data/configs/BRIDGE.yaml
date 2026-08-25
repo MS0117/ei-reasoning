@@ -88,53 +88,12 @@ partition:
   cliff_max_correct: 0
 
 anchor:
-  # ---- WHERE IMPROVEMENT STARTS: x alone, or x + a prefix of a failure ------
-  # Two independent choices: WHICH failed rollout to cut (base_selection) and
-  # WHERE to cut it (policy). The anchor is always an ID-SLICE of the original
-  # rollout — never re-tokenized text — and it becomes a conditioning prefix:
-  # the operator continues from x + a, and training puts loss only after it.
-  #
-  # policy:
-  #   none                   empty anchor. The operator resamples the WHOLE
-  #                          response from x. Rejection-sampling / STaR
-  #                          ablation, and what every arm has run so far.
-  #   fixed_fraction         keep the first `fraction` of the failure, clamped
-  #                          to [min_tokens, max_tokens]. Simplest baseline.
-  #   privileged_divergence  cut where the reference solution stops endorsing
-  #                          the failure. Two teacher-forcing passes over the
-  #                          failed response y- with the SAME policy —
-  #                          privileged context prompt(x, y*) vs base context
-  #                          prompt(x) — give a per-token signal
-  #                              g_t = lp_base(y-_t) - lp_priv(y-_t)
-  #                          which rises where KNOWING the reference LOWERS the
-  #                          probability of the failure's own next token, i.e.
-  #                          at the first reference-detectable wrong turn.
-  #                          Averaged per step, thresholded at mu + c_sigma*sigma.
-  #                          NEEDS gold y* (backfilled into questions/train.jsonl).
-  #
-  # base_selection: which of the K failed rollouts to cut
-  #   first_failed   the first one (cheapest, no extra pass)
-  #   longest        the longest response
-  #   random         seeded by run.seed
-  #   min_mean_nll   the failure the policy finds MOST typical (lowest mean
-  #                  NLL) — the methodology's G4 choice, one extra batched
-  #                  scoring pass
-  #
-  # WHAT THE ANCHOR ACTUALLY CHANGES depends on the operator:
-  #   self_resample  q_phi samples from x + a instead of x
-  #   lora_sft       NOTHING in the fit — its pair is gold (x -> y*), and y* is
-  #                  not a continuation of a failed prefix, so there is nowhere
-  #                  to put the anchor. Only the sampling start moves. This is
-  #                  why anchored lora_sft is a weak variant.
-  #   bridge_sft     the anchor enters the FIT PAIR: (x + a -> z+), loss on z+
-  #                  only, and the bridge is GENERATED as a continuation of a.
-  #                  This is the coherent anchored method.
-  policy: none                # budget control arm vs STAGED: no anchor, like
-                              # every STAGED run and the 0.421 BRIDGE baseline.
-                              # (For the anchored variant swap back to
-                              # privileged_divergence WITH its params block —
-                              # params is validated against the active policy.)
-  base_selection: min_mean_nll   # first_failed | longest | random | min_mean_nll
+  # DEPRECATED stage. The prefix-cut methodology (fixed_fraction /
+  # privileged_divergence + base_selection) was abandoned; every live preset
+  # runs `none`, so the operator resamples the WHOLE response from x and the
+  # stage only emits an empty anchor. Left in place so old run dirs load.
+  policy: none
+  base_selection: first_failed   # unused with policy: none
 
 improve:
   operator: bridge_sft        # <- the ONLY methodological difference vs LSPO
@@ -185,7 +144,9 @@ improve:
     # NOTE this is unrelated to improve.rl.grad_accum / micro_batch_size, which
     # shape the RL batch, and to improve.n, which is the sampling budget.
     adapter_scope: pooled     # pooled | per_problem
-    chunk_size: 0             # pooled only: 0 = ONE adapter for all questions
+    chunk_size: 25            # pooled only: 0 = ONE adapter for all questions;
+                              # 25 -> 5 adapters over the 107-cliff set (the
+                              # never-run sharding arm the notes above ask for)
     refit_budget: 0           # per-problem refits for cliffs the pooled adapter
                               # failed to resolve (0 = off; they simply pass)
     fit:

@@ -28,7 +28,7 @@ model:
   #   bash scripts/eval_bench.sh            -> model.base (this line)
   #   bash scripts/eval_bench.sh MODEL      -> MODEL
   # Accepts an HF hub id, an EI checkpoint dir, or a LoRA adapter dir (auto-merged).
-  base: Qwen/Qwen3-8B   #Qwen/Qwen3-8B, Qwen/Qwen3-4B
+  base: Qwen/Qwen3-14B #Qwen/Qwen3-8B, Qwen/Qwen3-4B
   # THINKING MODE: OFF. Qwen3-*-2507 Instruct is non-thinking by construction
   # (no switch in its template, so the flag is ignored there); the flag is what
   # actually toggles thinking on hybrid Qwen3 (0.6B/4B/8B).

@@ -64,3 +64,28 @@ def test_external_context_default_none():
         continuation_token_ids=[3], continuation_text="t",
     )
     assert c.external_context is None
+
+
+def test_sft_example_cliff_fields_and_negative_source():
+    # pre-cliff rows (no n_q / ref_mean_nll keys) load with defaults
+    old = SFTExample(
+        uid="u", qid="q", source="improved",
+        input_ids=list(range(6)), prompt_len=3, anchor_len=0, completion_len=3,
+    ).to_dict()
+    del old["n_q"], old["ref_mean_nll"]
+    back = SFTExample.from_dict(old)
+    assert back.n_q == 0 and back.ref_mean_nll is None
+
+    neg = SFTExample(
+        uid="n", qid="q", source="negative",
+        input_ids=list(range(6)), prompt_len=3, anchor_len=0, completion_len=3,
+        n_q=2,
+    )
+    neg.validate()  # ok
+    bad = SFTExample(
+        uid="n2", qid="q", source="negative",
+        input_ids=list(range(6)), prompt_len=2, anchor_len=1, completion_len=3,
+    )
+    import pytest
+    with pytest.raises(ValueError, match="anchor_len"):
+        bad.validate()

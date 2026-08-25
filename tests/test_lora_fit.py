@@ -147,6 +147,150 @@ def test_lora_fit_roundtrip_and_resume(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# objective=dpo (staged stage2_objective): preference pairs, precomputed reference
+# ---------------------------------------------------------------------------
+
+DPO_PAIRS = [
+    {"qid": "a", "prompt_len": 2, "chosen_ids": [1, 2, 3, 4, 5, 6], "rejected_ids": [1, 2, 9, 8, 7]},
+    {"qid": "b", "prompt_len": 1, "chosen_ids": [5, 4, 3, 2], "rejected_ids": [5, 6, 7, 8, 9]},
+    {"qid": "c", "prompt_len": 3, "chosen_ids": [9, 8, 7, 6, 5], "rejected_ids": [9, 8, 7, 1, 2, 3]},
+]
+
+
+def _run_dpo(tmp_path, out_name, pairs, **overrides):
+    import json as _json
+    from expert_iter import lora_fit
+    from expert_iter.utils import write_jsonl
+
+    base = tmp_path / "base"
+    if not base.exists():
+        _tiny_base(tmp_path)
+    pairs_path = tmp_path / f"{out_name}_pairs.jsonl"
+    write_jsonl(pairs_path, pairs)
+    out = tmp_path / out_name
+    params = {**FIT_PARAMS, "objective": "dpo", "beta": 0.5, "steps": 4, "lr": 5e-3,
+              **overrides}
+    lora_fit.main(["--model", str(base), "--pairs", str(pairs_path), "--out", str(out),
+                   "--params-json", _json.dumps(params), "--cache-key", out_name])
+    return out, _json.loads((out / "fit_meta.json").read_text())
+
+
+@pytest.mark.slow
+def test_dpo_roundtrip_margin_rises_and_resume(tmp_path, monkeypatch):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    out, meta = _run_dpo(tmp_path, "dpo", DPO_PAIRS)
+    assert list(out.glob("adapter_model*")), "no adapter weights saved"
+    assert meta["objective"] == "dpo" and meta["n_pairs"] == 3
+    assert len(meta["loss_per_step"]) == 4 == len(meta["reward_margin_per_step"])
+    # chosen response tokens only (4 + 3 + 2), the SFT-style normalizer
+    assert meta["total_resp_tokens"] == 4 + 3 + 2
+    # the objective does what it says: chosen gains on rejected relative to the
+    # reference, monotonically over 4 steps, and the loss falls
+    m = meta["reward_margin_per_step"]
+    assert m[0] == pytest.approx(0.0, abs=1e-4)       # step 1 == reference policy
+    assert m[-1] > m[0] and meta["loss_per_step"][-1] < meta["loss_per_step"][0]
+    assert 0.0 <= meta["pref_acc_per_step"][-1] <= 1.0
+    # resume: matching .done marker skips the refit
+    from expert_iter import lora_fit
+    import json as _json
+    weights = next(out.glob("adapter_model*"))
+    mtime = weights.stat().st_mtime_ns
+    lora_fit.main(["--model", str(tmp_path / "base"), "--pairs", str(tmp_path / "dpo_pairs.jsonl"),
+                   "--out", str(out), "--params-json",
+                   _json.dumps({**FIT_PARAMS, "objective": "dpo", "beta": 0.5, "steps": 4, "lr": 5e-3}),
+                   "--cache-key", "dpo"])
+    assert weights.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.slow
+def test_dpo_loss_invariant_to_micro_batch_size(tmp_path, monkeypatch):
+    """Pair normalization: the per-step loss must not depend on how the pairs
+    are split into micro-batches (same property tests/test_loss_invariance.py
+    guards for SFT)."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    _, m1 = _run_dpo(tmp_path, "mb1", DPO_PAIRS, micro_batch_size=1, steps=2)
+    _, m2 = _run_dpo(tmp_path, "mb2", DPO_PAIRS, micro_batch_size=2, steps=2)
+    for a, b in zip(m1["loss_per_step"], m2["loss_per_step"]):
+        assert a == pytest.approx(b, rel=1e-4, abs=1e-6)
+    for a, b in zip(m1["reward_margin_per_step"], m2["reward_margin_per_step"]):
+        assert a == pytest.approx(b, rel=1e-4, abs=1e-6)
+
+
+@pytest.mark.slow
+def test_dpo_sft_weight_and_base_reference(tmp_path, monkeypatch):
+    """sft_weight adds the chosen NLL term (loss strictly larger at step 1 for
+    the same weights); reference=base runs with the adapter disabled."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    _, plain = _run_dpo(tmp_path, "plain", DPO_PAIRS, steps=1)
+    _, rpo = _run_dpo(tmp_path, "rpo", DPO_PAIRS, steps=1, sft_weight=1.0)
+    assert rpo["loss_per_step"][0] > plain["loss_per_step"][0]
+    _, base_ref = _run_dpo(tmp_path, "baseref", DPO_PAIRS, steps=2, reference="base")
+    assert base_ref["params"]["reference"] == "base"
+    assert len(base_ref["reward_margin_per_step"]) == 2
+
+
+@pytest.mark.slow
+def test_ddp_dpo_uneven_pairs_matches_single_process(tmp_path):
+    """3 DPO pairs over 2 ranks: rank 1 runs a zero-weighted filler micro-batch
+    that has no cached reference logprob (the KeyError that killed the first
+    4B DPO arm), and the DDP weights must still equal the single-process fit."""
+    import torch
+    from safetensors.torch import load_file
+
+    from expert_iter.utils import write_jsonl
+
+    base = _tiny_base(tmp_path)
+    pairs_path = tmp_path / "dpo_pairs.jsonl"
+    write_jsonl(pairs_path, DPO_PAIRS)
+    params = {**FIT_PARAMS, "objective": "dpo", "beta": 0.5, "steps": 2, "lr": 5e-3,
+              "sft_weight": 0.5}
+
+    def run(out, argv_prefix, extra_env=None):
+        cmd = [*argv_prefix, "expert_iter.lora_fit",
+               "--model", str(base), "--pairs", str(pairs_path), "--out", str(out),
+               "--params-json", json.dumps(params), "--cache-key", out.name]
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", **(extra_env or {})}
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+        return load_file(out / "adapter_model.safetensors")
+
+    single = run(tmp_path / "single", [sys.executable, "-m"])
+    ddp = run(tmp_path / "ddp",
+              [sys.executable, "-m", "torch.distributed.run",
+               "--nproc_per_node", "2", "--master_port", "29578", "-m"],
+              {"OMP_NUM_THREADS": "1"})
+    for k in single:
+        assert torch.allclose(single[k], ddp[k], atol=1e-5, rtol=1e-4), k
+    m1 = json.loads((tmp_path / "single" / "fit_meta.json").read_text())
+    m2 = json.loads((tmp_path / "ddp" / "fit_meta.json").read_text())
+    assert m2["world_size"] == 2
+    for a, b in zip(m1["reward_margin_per_step"], m2["reward_margin_per_step"]):
+        assert a == pytest.approx(b, rel=1e-3, abs=1e-5)
+
+
+def test_dpo_rejects_sft_schema(tmp_path, monkeypatch):
+    import json as _json
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    from expert_iter import lora_fit
+    from expert_iter.utils import write_jsonl
+
+    pairs_path = tmp_path / "sft_pairs.jsonl"
+    write_jsonl(pairs_path, [{"qid": "a", "input_ids": [1, 2, 3], "prompt_len": 1}])
+    with pytest.raises(SystemExit, match="needs pair keys"):
+        lora_fit.main(["--model", "unused", "--pairs", str(pairs_path),
+                       "--out", str(tmp_path / "x"),
+                       "--params-json", _json.dumps({"objective": "dpo"}),
+                       "--cache-key", "x"])
+
+
+# ---------------------------------------------------------------------------
 # wandb reporting for the transient fit
 # ---------------------------------------------------------------------------
 

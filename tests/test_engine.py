@@ -162,3 +162,42 @@ def test_old_schema_result_rows_deserialize():
            "n_scored": 2, "meta": {}}
     r = GenResult(**row)
     assert r.token_logprobs is None and r.topk_logprobs is None
+
+
+# ---------------------------------------------------------------------------
+# Worker-level incremental checkpointing (_resume_done_rids)
+#
+# A shard is one worker's whole slice of the pool — hours to days on a
+# full-dataset sweep. These pin the contract that makes a kill cost one chunk
+# instead of the entire shard.
+# ---------------------------------------------------------------------------
+
+def test_resume_rids_absent_output(tmp_path):
+    assert engine._resume_done_rids(tmp_path / "never_started.jsonl") == set()
+
+
+def test_resume_rids_reads_complete_rows(tmp_path):
+    out = tmp_path / "out_0.jsonl"
+    write_jsonl(out, [{"rid": "a", "samples": []}, {"rid": "b", "samples": []}])
+    assert engine._resume_done_rids(out) == {"a", "b"}
+
+
+def test_resume_rids_drops_and_repairs_torn_final_line(tmp_path):
+    # A kill mid-append leaves a half-written last line. Appending after it
+    # would corrupt the shard permanently, so the file is rewritten intact.
+    out = tmp_path / "out_0.jsonl"
+    out.write_text('{"rid": "a", "samples": []}\n{"rid": "b", "samples": []}\n{"rid": "c", "sam')
+    assert engine._resume_done_rids(out) == {"a", "b"}
+    assert [r["rid"] for r in read_jsonl(out)] == ["a", "b"]
+
+
+def test_generate_chunk_size_reaches_the_worker(tmp_path, monkeypatch):
+    fake = _FakeProcFactory()
+    monkeypatch.setattr(engine.subprocess, "Popen", fake)
+    engine.run_pool(
+        [GenRequest(rid="q", prompt_token_ids=[1, 2])],
+        mode="generate", model_path="org/model", sampling={"max_tokens": 4},
+        engine_cfg=EngineCfg(gpus=[0], generate_chunk_size=32), work_dir=tmp_path,
+    )
+    engine_json = json.loads(fake.calls[0][fake.calls[0].index("--engine-json") + 1])
+    assert engine_json["generate_chunk_size"] == 32

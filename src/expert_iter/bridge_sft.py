@@ -102,6 +102,9 @@ class BridgeSftOperator(_ls.LoraSftOperator):
             # per-stage sample count. All default to None, keeping this
             # operator's requests (and seeds) byte-identical.
             bridge_lora = getattr(self, "_bridge_lora_path", None)
+            # per-question override: with stage-2 sharding each question's
+            # "current adapter" is its own shard, not one pooled adapter
+            bridge_lora_of = getattr(self, "_bridge_lora_of", None) or {}
             seed_salt = getattr(self, "_bridge_seed_salt", None)
             bridge_n = getattr(self, "_bridge_n", None) or br.n
             results = _ls.run_pool(
@@ -113,7 +116,7 @@ class BridgeSftOperator(_ls.LoraSftOperator):
                           if seed_salt is None
                           else stable_seed(cfg.run.seed, pass_name, iteration, qid, seed_salt)),
                     max_tokens=gen_max[qid],
-                    lora_path=bridge_lora,
+                    lora_path=bridge_lora_of.get(qid, bridge_lora),
                 ) for qid in pending],
                 mode="generate", model_path=policy,
                 sampling={

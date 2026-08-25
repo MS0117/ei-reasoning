@@ -429,7 +429,328 @@ def test_keep_selection_longest(monkeypatch, tmp_path):
     assert [p["input_ids"] for p in q1] == [[1, 2, 105, 105, 105, 0]]   # LONGEST kept
 
 
+def _both_unsolved_responder(qid, kind, r, stage):
+    """Bridges succeed for both questions; neither converts at stage 1, so both
+    reach the stage-2 fit."""
+    if kind in ("bridge", "bridge_retry"):
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+    if stage == "stage1":
+        return [_sample(102)]
+    return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+
+def test_stage2_chunking_one_adapter_per_question(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_chunk_size=1")
+    fits, launches = _setup(monkeypatch, _both_unsolved_responder)
+    _propose(cfg, tmp_path, _fixtures())
+
+    # one stage-2 fit per question, each on its own pairs, both chained from stage1
+    assert fits["order"] == ["stage1", "stage2_c0", "stage2_c1"]
+    assert {p["qid"] for p in fits["pairs"]["stage2_c0"]} == {"q1"}
+    assert {p["qid"] for p in fits["pairs"]["stage2_c1"]} == {"q2"}
+    for name in ("stage2_c0", "stage2_c1"):
+        assert str(fits["init"][name]).endswith("stage1/FAKEKEY")
+    # the final rollout serves each question from ITS OWN shard adapter
+    final = next(l for l in launches if l["stage"] == "stage2")
+    lora_of = {r.rid.split(":")[0]: str(r.lora_path) for r in final["requests"]}
+    assert lora_of["q1"].endswith("stage2_c0/FAKEKEY")
+    assert lora_of["q2"].endswith("stage2_c1/FAKEKEY")
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_chunks"] == [
+        {"name": "stage2_c0", "n_questions": 1, "n_pairs": 1},
+        {"name": "stage2_c1", "n_questions": 1, "n_pairs": 1},
+    ]
+    assert stats["n_fits"] == 3
+
+
+def test_stage2_chunk_size_larger_than_set_stays_single_adapter(monkeypatch, tmp_path):
+    """One chunk keeps the un-sharded fit name, so cache keys/logs are unchanged."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_chunk_size=25")
+    fits, _ = _setup(monkeypatch, _both_unsolved_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["order"] == ["stage1", "stage2"]
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_chunks"] == [{"name": "stage2", "n_questions": 2, "n_pairs": 2}]
+
+
+def test_chunking_leaves_unfitted_question_on_its_previous_adapter(monkeypatch, tmp_path):
+    """train_scope=unsolved_only + final_rollout_scope=all: a question solved at
+    stage 1 is absent from the stage-2 fit, so it rolls out from stage-1."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_chunk_size=1",
+               "improve.lora_sft.staged.final_rollout_scope=all")
+    _, launches = _setup(monkeypatch, _default_responder)   # q1 solves at stage 1
+    _propose(cfg, tmp_path, _fixtures())
+    final = next(l for l in launches if l["stage"] == "stage2")
+    lora_of = {r.rid.split(":")[0]: str(r.lora_path) for r in final["requests"]}
+    assert lora_of["q1"].endswith("stage1/FAKEKEY")       # never re-fitted
+    assert lora_of["q2"].endswith("stage2/FAKEKEY")       # sole stage-2 chunk
+
+
+def test_chunking_chains_each_shard_from_its_own_previous_adapter(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_chunk_size=1",
+               "improve.lora_sft.staged.num_stages=2")
+
+    def responder(qid, kind, r, stage):
+        if kind in ("bridge", "bridge_retry"):
+            return [_sample(101)] if qid == "q1" else [_sample(104)]
+        if stage in ("stage1", "stage2"):   # unsolved through the intermediate roll
+            return [_sample(102)]
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["order"] == ["stage1", "stage2_c0", "stage2_c1", "stage3_c0", "stage3_c1"]
+    # shard membership is stable, so stage3_cN chains from stage2_cN (not a neighbour)
+    assert str(fits["init"]["stage3_c0"]).endswith("stage2_c0/FAKEKEY")
+    assert str(fits["init"]["stage3_c1"]).endswith("stage2_c1/FAKEKEY")
+    assert {p["qid"] for p in fits["pairs"]["stage3_c0"]} == {"q1"}
+
+
+def test_chunking_without_chaining(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_chunk_size=1",
+               "improve.lora_sft.staged.chain_adapter=false")
+    fits, _ = _setup(monkeypatch, _both_unsolved_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["init"]["stage2_c0"] is None and fits["init"]["stage2_c1"] is None
+
+
+def _dpo_responder(qid, kind, r, stage):
+    """Bridges succeed for both; at stage 1 both questions FAIL with two
+    distinct wrong rollouts (the on-policy negatives); both convert at the end."""
+    if kind in ("bridge", "bridge_retry"):
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+    if stage == "stage1":
+        return [_sample(102), _sample(102, ids=[102, 102, 102])]
+    return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+
+def test_stage2_dpo_pairs_use_own_stage1_failures(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo",
+               "improve.lora_sft.staged.dpo.beta=0.2",
+               "improve.lora_sft.staged.dpo.lr=5e-5",
+               "improve.lora_sft.staged.dpo.negative_selection=shortest")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+
+    assert fits["order"] == ["stage1", "stage2"]
+    # stage 1 is untouched SFT
+    assert "input_ids" in fits["pairs"]["stage1"][0]
+    assert fits["params"]["stage1"].get("objective", "sft") == "sft"
+    # stage 2 carries DPO pairs: chosen = the bridge, rejected = the SHORTEST
+    # stage-1 failure, same prompt_len; params carry the DPO knobs
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    assert set(pairs) == {"q1", "q2"}
+    assert pairs["q1"]["chosen_ids"] == [1, 2, 101, 0]
+    assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 0]      # shortest failure
+    assert pairs["q2"]["chosen_ids"] == [1, 2, 104, 0]
+    assert pairs["q1"]["prompt_len"] == 2
+    assert all("input_ids" not in p for p in fits["pairs"]["stage2"])
+    p2 = fits["params"]["stage2"]
+    assert p2["objective"] == "dpo" and p2["beta"] == 0.2 and p2["lr"] == 5e-5
+    assert p2["reference"] == "init" and p2["sft_weight"] == 0.0
+    assert str(fits["init"]["stage2"]).endswith("stage1/FAKEKEY")   # chained
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_dpo_pairs"] == 2
+    assert stats["stage2_dpo_no_negative"] == 0
+
+
+def test_stage2_dpo_longest_and_random_negatives(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo",
+               "improve.lora_sft.staged.dpo.negative_selection=longest")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 102, 102, 0]
+
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo",
+               "improve.lora_sft.staged.dpo.negative_selection=random")
+    picks = []
+    for _ in range(2):   # seeded -> identical across repeats
+        fits, _ = _setup(monkeypatch, _dpo_responder)
+        _propose(cfg, tmp_path / str(len(picks)), _fixtures())
+        picks.append({p["qid"]: p["rejected_ids"] for p in fits["pairs"]["stage2"]})
+    assert picks[0] == picks[1]
+
+
+def test_stage2_dpo_drops_questions_without_negatives(monkeypatch, tmp_path):
+    """A question whose stage-1 samples were all truncated has no graded
+    failure in the pool -> no DPO pair, counted in stats."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo")
+
+    def responder(qid, kind, r, stage):
+        if kind in ("bridge", "bridge_retry"):
+            return [_sample(101)] if qid == "q1" else [_sample(104)]
+        if stage == "stage1":
+            if qid == "q2":   # truncated -> _collect emits nothing for q2
+                return [{"text": "", "token_ids": [102], "finish_reason": "length"}]
+            return [_sample(102)]
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert {p["qid"] for p in fits["pairs"]["stage2"]} == {"q1"}
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_dpo_no_negative"] == 1
+
+
+def test_stage2_dpo_max_pairs_per_question(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo",
+               "improve.lora_sft.staged.dpo.max_pairs_per_question=1",
+               "improve.lora_sft.bridge.max_keep=2")
+
+    def responder(qid, kind, r, stage):
+        if kind in ("bridge", "bridge_retry"):   # two bridges each -> two SFT pairs
+            return ([_sample(101), _sample(105, ids=[105, 105, 105])] if qid == "q1"
+                    else [_sample(104), _sample(104, ids=[104, 104])])
+        if stage == "stage1":
+            return [_sample(102)]
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+    fits, _ = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert len(fits["pairs"]["stage1"]) == 4                 # SFT: all bridges
+    assert sorted(p["qid"] for p in fits["pairs"]["stage2"]) == ["q1", "q2"]   # DPO: capped
+
+
+def test_stage2_dpo_composes_with_chunking(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo",
+               "improve.lora_sft.staged.stage2_chunk_size=1")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["order"] == ["stage1", "stage2_c0", "stage2_c1"]
+    for name in ("stage2_c0", "stage2_c1"):
+        assert fits["params"][name]["objective"] == "dpo"
+        assert "chosen_ids" in fits["pairs"][name][0]
+
+
 @pytest.mark.parametrize("bad,match", [
+    ("improve.lora_sft.staged.stage2_objective=nope", "stage2_objective"),
+    ("improve.lora_sft.staged.dpo.beta=0", "beta"),
+    ("improve.lora_sft.staged.dpo.sft_weight=-1", "sft_weight"),
+    ("improve.lora_sft.staged.dpo.negative_selection=nope", "negative_selection"),
+    ("improve.lora_sft.staged.dpo.reference=nope", "reference"),
+    ("improve.lora_sft.staged.dpo.max_pairs_per_question=0", "max_pairs_per_question"),
+])
+def test_dpo_config_validation(bad, match):
+    with pytest.raises(ValueError, match=match):
+        _cfg(bad)
+
+
+def test_stage1_chunking_shards_fit_and_rollout(monkeypatch, tmp_path):
+    """stage1_chunk_size=1: one stage-1 adapter per question; the stage-1
+    rollout serves each question from its own shard; stage-2 shards inherit
+    the membership and chain from their OWN stage-1 shard."""
+    cfg = _cfg("improve.lora_sft.staged.stage1_chunk_size=1",
+               "improve.lora_sft.staged.stage2_chunk_size=1")
+    fits, launches = _setup(monkeypatch, _both_unsolved_responder)
+    _propose(cfg, tmp_path, _fixtures())
+
+    assert fits["order"] == ["stage1_c0", "stage1_c1", "stage2_c0", "stage2_c1"]
+    assert {p["qid"] for p in fits["pairs"]["stage1_c0"]} == {"q1"}
+    assert {p["qid"] for p in fits["pairs"]["stage1_c1"]} == {"q2"}
+    assert fits["init"]["stage1_c0"] is None
+    assert str(fits["init"]["stage2_c0"]).endswith("stage1_c0/FAKEKEY")
+    assert str(fits["init"]["stage2_c1"]).endswith("stage1_c1/FAKEKEY")
+    roll1 = next(l for l in launches if l["stage"] == "stage1")
+    lora_of = {r.rid.split(":")[0]: str(r.lora_path) for r in roll1["requests"]}
+    assert lora_of["q1"].endswith("stage1_c0/FAKEKEY")
+    assert lora_of["q2"].endswith("stage1_c1/FAKEKEY")
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert [c["name"] for c in stats["stage1_chunks"]] == ["stage1_c0", "stage1_c1"]
+    assert stats["n_fits"] == 4
+
+
+def test_stage1_chunking_bridge_skipped_question_gets_a_shard(monkeypatch, tmp_path):
+    """A question with no accepted bridge has no fit pairs but is still sampled
+    (bridge.sample_skipped): it is attached to a shard adapter round-robin."""
+    cfg = _cfg("improve.lora_sft.staged.stage1_chunk_size=1",
+               "improve.lora_sft.staged.stage2_chunk_size=1")
+
+    def responder(qid, kind, r, stage):
+        if kind in ("bridge", "bridge_retry"):
+            return [_sample(101)] if qid == "q1" else [_sample(102)]   # q2 never bridges
+        if stage == "stage1":
+            return [_sample(102)]
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+    fits, launches = _setup(monkeypatch, responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["order"][:1] == ["stage1"]          # one shard -> un-sharded name
+    roll1 = next(l for l in launches if l["stage"] == "stage1")
+    assert {r.rid.split(":")[0] for r in roll1["requests"]} == {"q1", "q2"}
+    assert all(str(r.lora_path).endswith("stage1/FAKEKEY") for r in roll1["requests"])
+
+
+def test_stage1_chunking_without_chaining_allows_pooled_stage2(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage1_chunk_size=1",
+               "improve.lora_sft.staged.chain_adapter=false")
+    fits, _ = _setup(monkeypatch, _both_unsolved_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["order"] == ["stage1_c0", "stage1_c1", "stage2"]
+    assert fits["init"]["stage2"] is None
+
+
+@pytest.mark.parametrize("bad,match", [
+    ("improve.lora_sft.staged.stage1_chunk_size=-1", "stage1_chunk_size"),
+    # stage-1 sharded + chained pooled stage-2: no well-defined warm start
+    ("improve.lora_sft.staged.stage1_chunk_size=1", "chain_adapter"),
+])
+def test_stage1_chunking_validation(bad, match):
+    with pytest.raises(ValueError, match=match):
+        _cfg(bad)
+
+
+def test_stage2_chunk_cannot_exceed_stage1_chunk():
+    with pytest.raises(ValueError, match="cannot exceed"):
+        _cfg("improve.lora_sft.staged.stage1_chunk_size=1",
+             "improve.lora_sft.staged.stage2_chunk_size=2")
+
+
+def test_hierarchical_chunking_splits_each_stage1_shard(monkeypatch, tmp_path):
+    """stage1_chunk_size=2 (both questions in ONE stage-1 shard), stage2_chunk_size=1:
+    stage 2 sub-splits that shard into two adapters, each warm-started from the
+    parent stage-1 adapter."""
+    cfg = _cfg("improve.lora_sft.staged.stage1_chunk_size=2",
+               "improve.lora_sft.staged.stage2_chunk_size=1")
+    fits, launches = _setup(monkeypatch, _both_unsolved_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert fits["order"] == ["stage1", "stage2_c0_0", "stage2_c0_1"]   # 1 parent -> 2 children
+    assert {p["qid"] for p in fits["pairs"]["stage2_c0_0"]} == {"q1"}
+    assert {p["qid"] for p in fits["pairs"]["stage2_c0_1"]} == {"q2"}
+    for name in ("stage2_c0_0", "stage2_c0_1"):
+        assert str(fits["init"][name]).endswith("stage1/FAKEKEY")
+    final = next(l for l in launches if l["stage"] == "stage2")
+    lora_of = {r.rid.split(":")[0]: str(r.lora_path) for r in final["requests"]}
+    assert lora_of["q1"].endswith("stage2_c0_0/FAKEKEY")
+    assert lora_of["q2"].endswith("stage2_c0_1/FAKEKEY")
+
+
+def test_assign_chunks_helper():
+    from expert_iter.staged_bridge_sft import _assign_chunks
+
+    key: dict = {}
+    # first split == a slice of the sorted fit set; keys record the shard path
+    assert _assign_chunks(["c", "a", "d", "b", "e"], 2, key) == [
+        ("c0", ["a", "b"]), ("c1", ["c", "d"]), ("c2", ["e"])]
+    assert key == {"a": (0,), "b": (0,), "c": (1,), "d": (1,), "e": (2,)}
+    # same size later: solved questions drop out, survivors keep their shard
+    assert _assign_chunks(["b", "c", "e"], 2, key) == [("c0", ["b"]), ("c1", ["c"]), ("c2", ["e"])]
+    # a newcomer joins the smallest parent group
+    _assign_chunks(["b", "c", "e", "f"], 2, key)
+    assert key["f"] in ((0,), (1,), (2,))
+    # smaller size: each parent shard is sub-split, children get (parent, j) keys
+    key = {"a": (0,), "b": (0,), "c": (0,), "d": (1,)}
+    assert _assign_chunks(["a", "b", "c", "d"], 2, key) == [
+        ("c0_0", ["a", "b"]), ("c0_1", ["c"]), ("c1", ["d"])]
+    assert key["a"] == (0, 0) and key["c"] == (0, 1) and key["d"] == (1,)
+    # size <= 0 -> one pooled shard; keys reset to () (nothing to chain from)
+    assert _assign_chunks(["b", "a"], 0, key) == [("c0", ["a", "b"])]
+    assert key["a"] == () and key["b"] == ()
+
+
+@pytest.mark.parametrize("bad,match", [
+    ("improve.lora_sft.staged.stage2_chunk_size=-1", "stage2_chunk_size"),
+    ("improve.lora_sft.chunk_size=25", "stage2_chunk_size"),
     ("improve.lora_sft.bridge.keep_selection=nope", "keep_selection"),
     ("improve.lora_sft.staged.stage_bridge_n=0", "stage_bridge_n"),
     ("improve.lora_sft.staged.stage_max_keep=0", "stage_max_keep"),

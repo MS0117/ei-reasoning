@@ -53,7 +53,49 @@ DEFAULTS = {
     "gradient_checkpointing": True,
     "attn_implementation": None,   # None -> flash_attention_2 on CUDA, eager on CPU
     "seed": 0,
+    # objective=dpo (staged stage2_objective): pairs carry chosen_ids /
+    # rejected_ids (same prompt, prompt_len shared) instead of input_ids. Loss is
+    # -logsigmoid(beta * ((pol_c - ref_c) - (pol_r - ref_r))) averaged over the
+    # GLOBAL pair count, plus sft_weight * NLL(chosen) per chosen response token.
+    # Reference logprobs are precomputed once before training from the fit's
+    # starting weights ("init") or with the adapter disabled ("base").
+    "objective": "sft",
+    "beta": 0.1,
+    "sft_weight": 0.0,
+    "reference": "init",
 }
+
+
+def _pack(seqs: list[tuple[list[int], int]], device):
+    """Right-pad (ids, prompt_len) sequences into ids/mask/labels tensors;
+    labels are -100 on the prompt and padding so only response tokens score."""
+    import torch
+
+    width = max(len(ids) for ids, _ in seqs)
+    ids_t = torch.zeros(len(seqs), width, dtype=torch.long)
+    mask = torch.zeros(len(seqs), width, dtype=torch.long)
+    labels = torch.full((len(seqs), width), -100, dtype=torch.long)
+    for i, (ids, plen) in enumerate(seqs):
+        seq = torch.tensor(ids, dtype=torch.long)
+        ids_t[i, :len(seq)] = seq
+        mask[i, :len(seq)] = 1
+        labels[i, plen:len(seq)] = seq[plen:]
+    return ids_t.to(device), mask.to(device), labels.to(device)
+
+
+def _seq_nll(logits, labels):
+    """Per-sequence summed NLL over label positions (shifted), and the per-
+    sequence label counts. Shared by the SFT loss, the DPO policy pass and the
+    DPO reference pass so all three score tokens identically."""
+    import torch
+    import torch.nn.functional as F
+
+    tgt = labels[:, 1:]
+    # one sequence at a time: the fp32 copy of a 16k x 152k logit slab is ~10 GB,
+    # and a DPO micro-batch holds two sequences — never materialize both at once
+    sums = [F.cross_entropy(logits[i, :-1].float(), tgt[i], ignore_index=-100,
+                            reduction="sum") for i in range(logits.shape[0])]
+    return torch.stack(sums), (tgt != -100).sum(-1)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -79,6 +121,16 @@ def main(argv: list[str] | None = None) -> None:
     pairs = sorted(read_jsonl(args.pairs), key=lambda p: p["qid"])
     if not pairs:
         raise SystemExit(f"[lora_fit] {args.pairs} is empty — nothing to fit")
+    objective = str(params["objective"])
+    if objective not in ("sft", "dpo"):
+        raise SystemExit(f"[lora_fit] unknown objective {objective!r} (sft | dpo)")
+    need = ("chosen_ids", "rejected_ids") if objective == "dpo" else ("input_ids",)
+    bad = [i for i, p in enumerate(pairs) if any(k not in p for k in need)]
+    if bad:
+        raise SystemExit(
+            f"[lora_fit] objective={objective} needs pair keys {need}; "
+            f"{len(bad)} pair(s) lack them (first at index {bad[0]})"
+        )
 
     seed_everything(int(params["seed"]))
 
@@ -164,12 +216,17 @@ def main(argv: list[str] | None = None) -> None:
 
     optimizer = torch.optim.AdamW(trainable, lr=float(params["lr"]))
     mb = max(1, int(params["micro_batch_size"]))
-    # Shifted-label count: each pair contributes len(input_ids) - prompt_len
-    # response predictions. Counted over ALL pairs (global) so every rank
-    # normalizes by the same denominator. Constant across steps (full batch).
-    total_resp_tokens = sum(len(p["input_ids"]) - p["prompt_len"] for p in pairs)
+    # Shifted-label count: each pair contributes len(response) - prompt_len
+    # response predictions (the CHOSEN response for DPO). Counted over ALL pairs
+    # (global) so every rank normalizes by the same denominator. Constant across
+    # steps (full batch). DPO's own loss is normalized by the global PAIR count.
+    resp_key = "chosen_ids" if objective == "dpo" else "input_ids"
+    total_resp_tokens = sum(len(p[resp_key]) - p["prompt_len"] for p in pairs)
     if total_resp_tokens <= 0:
         raise SystemExit("[lora_fit] pairs contain no response tokens")
+    n_pairs_global = len(pairs)
+    beta = float(params["beta"])
+    sft_weight = float(params["sft_weight"])
 
     # Every rank must run the SAME number of micro-batches and synchronize at
     # the SAME indices — otherwise the ranks enqueue different collectives and
@@ -209,59 +266,126 @@ def main(argv: list[str] | None = None) -> None:
             except Exception as e:                        # noqa: BLE001
                 print(f"[lora_fit] wandb disabled ({type(e).__name__}: {e})", flush=True)
 
-    loss_per_step: list[float] = []
-    for step in range(int(params["steps"])):
-        optimizer.zero_grad(set_to_none=True)
-        step_ce = 0.0
+    def micro_chunks():
+        """(chunk, pad) per micro-batch; pad chunks are fillers that every rank
+        runs zero-weighted so DDP collective counts stay equal."""
         for mi in range(n_micro):
             chunk = local_pairs[mi * mb:(mi + 1) * mb]
             pad = not chunk
             if pad:
-                chunk = local_pairs[:mb]   # filler, zero-weighted below
-            width = max(len(p["input_ids"]) for p in chunk)
-            ids = torch.zeros(len(chunk), width, dtype=torch.long)
-            mask = torch.zeros(len(chunk), width, dtype=torch.long)
-            labels = torch.full((len(chunk), width), -100, dtype=torch.long)
-            for i, p in enumerate(chunk):
-                seq = torch.tensor(p["input_ids"], dtype=torch.long)
-                ids[i, :len(seq)] = seq
-                mask[i, :len(seq)] = 1
-                labels[i, p["prompt_len"]:len(seq)] = seq[p["prompt_len"]:]
-            ids, mask, labels = ids.to(device), mask.to(device), labels.to(device)
-            logits = model(input_ids=ids, attention_mask=mask).logits
-            ce = F.cross_entropy(
-                logits[:, :-1].flatten(0, 1).float(),
-                labels[:, 1:].flatten(),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            # Normalize by the FULL batch's response-token count so micro-batch
-            # gradients sum to the full-batch mean regardless of mb topology.
-            # Under DDP the all-reduce AVERAGES gradients across ranks, so the
-            # local loss carries a world_size factor to undo that averaging —
-            # the update then matches the single-process full-batch one.
-            loss = ce * (0.0 if pad else world / total_resp_tokens)
+                chunk = local_pairs[:mb]
+            yield mi, chunk, pad
+
+    def dpo_seqs(chunk):
+        return ([(p["chosen_ids"], p["prompt_len"]) for p in chunk]
+                + [(p["rejected_ids"], p["prompt_len"]) for p in chunk])
+
+    # DPO reference logprobs: ONE no-grad pass over the local pairs from the
+    # fit's starting weights ("init" = the adapter that produced the rejected
+    # samples) or with the adapter disabled ("base"). Precomputing them means
+    # the reference policy never has to be held as a second model.
+    ref_logp: dict[int, tuple] = {}
+    if objective == "dpo":
+        import contextlib
+
+        ref_ctx = (peft_model.disable_adapter() if params["reference"] == "base"
+                   else contextlib.nullcontext())
+        with torch.no_grad(), ref_ctx:
+            for mi, chunk, pad in micro_chunks():
+                if pad:
+                    continue
+                ids, mask, labels = _pack(dpo_seqs(chunk), device)
+                nll, _ = _seq_nll(peft_model(input_ids=ids, attention_mask=mask).logits, labels)
+                half = len(chunk)
+                for i in range(half):
+                    ref_logp[mi * mb + i] = (-float(nll[i]), -float(nll[half + i]))
+        if rank == 0:
+            print(f"[lora_fit] dpo reference ({params['reference']}) logprobs cached "
+                  f"for {len(ref_logp)} local pairs")
+
+    loss_per_step: list[float] = []
+    margin_per_step: list[float] = []
+    acc_per_step: list[float] = []
+    for step in range(int(params["steps"])):
+        optimizer.zero_grad(set_to_none=True)
+        step_ce = 0.0          # SFT: summed response NLL (reported per token)
+        step_dpo = 0.0         # DPO: summed pair loss (reported per pair)
+        step_margin = 0.0
+        step_acc = 0.0
+        for mi, chunk, pad in micro_chunks():
+            if objective == "sft":
+                ids, mask, labels = _pack([(p["input_ids"], p["prompt_len"]) for p in chunk], device)
+                logits = model(input_ids=ids, attention_mask=mask).logits
+                nll, _ = _seq_nll(logits, labels)
+                ce = nll.sum()
+                # Normalize by the FULL batch's response-token count so micro-
+                # batch gradients sum to the full-batch mean regardless of mb
+                # topology. Under DDP the all-reduce AVERAGES gradients across
+                # ranks, so the local loss carries a world_size factor to undo
+                # that averaging — the update then matches the single-process
+                # full-batch one.
+                loss = ce * (0.0 if pad else world / total_resp_tokens)
+            else:
+                ids, mask, labels = _pack(dpo_seqs(chunk), device)
+                logits = model(input_ids=ids, attention_mask=mask).logits
+                nll, _ = _seq_nll(logits, labels)
+                half = len(chunk)
+                pol_c, pol_r = -nll[:half], -nll[half:]
+                # filler micro-batches (DDP rank with fewer pairs) have no cached
+                # reference — they are zero-weighted below, so any value works
+                ref = ([(0.0, 0.0)] * half if pad
+                       else [ref_logp[mi * mb + i] for i in range(half)])
+                ref_c = torch.tensor([r[0] for r in ref], device=device)
+                ref_r = torch.tensor([r[1] for r in ref], device=device)
+                margin = beta * ((pol_c - ref_c) - (pol_r - ref_r))
+                dpo = -F.logsigmoid(margin).sum()
+                # pair-normalized preference loss (+ optional RPO NLL on chosen,
+                # token-normalized like the SFT path); same world factor.
+                loss = dpo * (0.0 if pad else world / n_pairs_global)
+                nll_c = nll[:half].sum()
+                if sft_weight > 0:
+                    loss = loss + nll_c * (
+                        0.0 if pad else sft_weight * world / total_resp_tokens)
+                if not pad:
+                    # reported loss = the optimized objective per pair (DPO term
+                    # + the RPO NLL term rescaled to the same per-pair unit)
+                    step_dpo += float(dpo.detach()) + (
+                        sft_weight * float(nll_c.detach()) * n_pairs_global / total_resp_tokens)
+                    step_margin += float(margin.detach().sum())
+                    step_acc += float((margin.detach() > 0).sum())
             sync = mi == n_micro - 1 or (sync_every and (mi + 1) % sync_every == 0)
             if world > 1 and not sync:
                 with model.no_sync():   # accumulate without communicating
                     loss.backward()
             else:
                 loss.backward()
-            if not pad:
+            if objective == "sft" and not pad:
                 step_ce += float(ce.detach())
         if float(params["max_grad_norm"]) > 0:
             torch.nn.utils.clip_grad_norm_(trainable, float(params["max_grad_norm"]))
         optimizer.step()
-        step_loss = step_ce / total_resp_tokens
-        if world > 1:  # report the GLOBAL loss, not this rank's shard
-            t = torch.tensor([step_loss], device=device)
+        if objective == "sft":
+            stats_t = [step_ce / total_resp_tokens, 0.0, 0.0]
+        else:
+            stats_t = [step_dpo / n_pairs_global, step_margin / n_pairs_global,
+                       step_acc / n_pairs_global]
+        if world > 1:  # report the GLOBAL numbers, not this rank's shard
+            t = torch.tensor(stats_t, device=device)
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-            step_loss = float(t.item())
+            stats_t = [float(v) for v in t.tolist()]
+        step_loss, step_m, step_a = stats_t
         loss_per_step.append(step_loss)
+        margin_per_step.append(step_m)
+        acc_per_step.append(step_a)
         if rank == 0:
-            print(f"[lora_fit] step {step + 1}/{params['steps']} loss {step_loss:.4f}")
+            extra = (f" margin {step_m:.4f} pref_acc {step_a:.3f}"
+                     if objective == "dpo" else "")
+            print(f"[lora_fit] step {step + 1}/{params['steps']} loss {step_loss:.4f}{extra}")
             if wb is not None:
-                wb.log({"lora_fit_loss": step_loss}, step=step + 1)
+                log = {"lora_fit_loss": step_loss}
+                if objective == "dpo":
+                    log.update(reward_margin=step_m, pref_acc=step_a)
+                wb.log(log, step=step + 1)
 
     if world > 1:
         torch.distributed.barrier()
@@ -276,6 +400,10 @@ def main(argv: list[str] | None = None) -> None:
         "world_size": world,
         "total_resp_tokens": total_resp_tokens,
         "loss_per_step": [round(v, 6) for v in loss_per_step],
+        "objective": objective,
+        **({"reward_margin_per_step": [round(v, 6) for v in margin_per_step],
+            "pref_acc_per_step": [round(v, 6) for v in acc_per_step]}
+           if objective == "dpo" else {}),
         "seed": int(params["seed"]),
         "seconds": round(time.time() - t0, 1),
         "params": params,

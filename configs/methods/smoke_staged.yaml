@@ -64,6 +64,13 @@ improve:
       unsolved_targets: regen_bridge   # exercises bridge regen THROUGH the adapter
       solved_targets: self_wash_min_c  # exercises the wash C(y) scoring pass
       train_scope: full_pool
+      stage2_objective: dpo   # exercises the preference path: chosen = the bridge,
+                              # rejected = this adapter's own stage-1 failure
+      dpo:
+        beta: 0.1
+        sft_weight: 0.5       # also exercises the RPO NLL term
+        negative_selection: random
+        reference: init
       stage2_steps: 2
       final_rollout_n: 4
       final_rollout_scope: unsolved
@@ -86,6 +93,19 @@ train:
     epochs: 1
     global_batch_size: 8
     logging_steps: 1
+    # Smoke the FULL cliff objective path: stratified sampler + per-question
+    # normalized L_C + v1 unlikelihood negatives + displacement guard
+    # (selection.method=c_score above provides the guard refs).
+    cliff:
+      enabled: true
+      rho: 0.3
+      m_per_batch: 1
+      negative:
+        mode: v1
+        mu: 0.1
+        m_per_batch: 1
+      guard:
+        enabled: true
 
 loop:
   iterations: 1

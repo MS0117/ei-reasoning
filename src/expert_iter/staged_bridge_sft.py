@@ -114,24 +114,33 @@ class StagedBridgeSftOperator(BridgeSftOperator):
         solved: set[str] = set()
         fit_seconds: list[float] = []
         stats["n_budget_skipped"] = 0
+        # qid -> the adapter it currently samples from, and its shard bookkeeping.
+        # A question the stage-2 fit does not cover keeps its previous adapter,
+        # so no fallback branch is needed anywhere below.
+        adapter_of_qid: dict[str, Path] = {}
+        chunk_key_of: dict[str, tuple[int, ...]] = {}
+        chunk_label_of: dict[str, str] = {}
 
-        def _roll(name: str, qids: list[str], adapter: Path, n: int, fit_meta: dict):
-            """Sample n per qid from `adapter`, grade, re-index attempt_idx to
-            stay unique across rounds, stamp op_meta.stage, extend the pool.
-            Returns the per-qid correct counts."""
+        def _roll(name: str, qids: list[str], n: int, fit_meta: dict):
+            """Sample n per qid from that question's CURRENT adapter (pooled at
+            stage 1, its own shard once stage-2 chunking is on), grade, re-index
+            attempt_idx to stay unique across rounds, stamp op_meta.stage, extend
+            the pool. Returns the per-qid correct counts."""
             qids = sorted(qids)
             if not qids:
                 return {}
+            adapter_of = {q: adapter_of_qid[q] for q in qids}
             results, skipped = self._sample(
                 qids, [1.0], n, prompts, anchors_by_qid,
-                {q: adapter for q in qids}, cfg, policy,
+                adapter_of, cfg, policy,
                 pool_base / f"{name}_roll", iteration, tag=name,
             )
             stats["n_budget_skipped"] += skipped
             cands, correct_total, curves = self._collect(
                 results, questions_by_qid, anchors_by_qid, prompts, tokenizer,
-                grader, cfg, n, pb, {q: name for q in qids},
-                {q: adapter for q in qids},
+                grader, cfg, n, pb,
+                {q: chunk_label_of.get(q, name) for q in qids},
+                adapter_of,
                 {q: {**fit_meta, "stage": name} for q in qids},
                 iteration, refit=False,
             )
@@ -159,20 +168,46 @@ class StagedBridgeSftOperator(BridgeSftOperator):
             write_json(improve_dir / "stats.json", stats)
             print(f"[improve:{self.name}] {stats}")
             return []
-        seed = stable_seed(cfg.run.seed, "lora_fit", iteration, "stage1")
-        adapter, secs = _ls._fit_adapter(
-            policy, pairs1, adapters_dir, "stage1",
-            {**fit_params, "seed": seed}, cfg,
-            wandb=_ls.wandb_params(
-                cfg, run_name=f"{cfg.run.name}/iter{iteration}/fit_stage1"),
-        )
-        fit_seconds.append(secs)
+        # ---- stage-1 fit: pooled, or one adapter per stage1_chunk_size questions
+        pairs1_by_qid: dict[str, list[dict]] = defaultdict(list)
+        for pair in pairs1:
+            pairs1_by_qid[pair["qid"]].append(pair)
+        chunks1 = _assign_chunks(sorted(pairs1_by_qid), st.stage1_chunk_size, chunk_key_of)
+        self._warn_max_loras(len(chunks1), cfg, "stage-1")
+        chunk1_rows = []
+        shard_adapters: list[Path] = []
+        for label, chunk_qids in chunks1:
+            name = "stage1" if len(chunks1) == 1 else f"stage1_{label}"
+            chunk_pairs = [p for q in chunk_qids for p in pairs1_by_qid[q]]
+            seed = stable_seed(cfg.run.seed, "lora_fit", iteration, name)
+            adapter, secs = _ls._fit_adapter(
+                policy, chunk_pairs, adapters_dir, name,
+                {**fit_params, "seed": seed}, cfg,
+                wandb=_ls.wandb_params(
+                    cfg, run_name=f"{cfg.run.name}/iter{iteration}/fit_{name}"),
+            )
+            fit_seconds.append(secs)
+            shard_adapters.append(adapter)
+            for q in chunk_qids:
+                adapter_of_qid[q] = adapter
+                chunk_label_of[q] = name
+            chunk1_rows.append({"name": name, "n_questions": len(chunk_qids),
+                                "n_pairs": len(chunk_pairs)})
+        if st.stage1_chunk_size > 0:
+            stats["stage1_chunks"] = chunk1_rows
+        # questions without fit pairs (bridge-skipped; sampled when
+        # bridge.sample_skipped) still need an adapter: round-robin over shards
+        for i, q in enumerate(q for q in with_gold if q not in adapter_of_qid):
+            s = i % len(shard_adapters)
+            adapter_of_qid[q] = shard_adapters[s]
+            chunk_key_of[q] = chunk_key_of[chunks1[s][1][0]]   # same shard path
+            chunk_label_of[q] = chunk1_rows[s]["name"]
 
         # ---- rollout (b) off the stage-1 adapter ----------------------------
         sample_unpaired = self._sample_unpaired(cfg)
         roll_qids = [q for q in with_gold if q in targets1 or sample_unpaired]
         meta1 = {**fit_params, "n_pairs": len(pairs1)}
-        correct = _roll("stage1", roll_qids, adapter, st.rollout_n, meta1)
+        correct = _roll("stage1", roll_qids, st.rollout_n, meta1)
         solved |= {q for q, n_ok in correct.items() if n_ok > 0}
         stats["n_resolved_stage1"] = stats["n_resolved_pool"] = len(solved)
         stats["n_resolved_by_stage"] = {"stage1": len(solved)}
@@ -187,6 +222,9 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                 regen_stats: dict = {}
                 cap = st.stage_max_keep or ls.bridge.max_keep
                 self._bridge_lora_path = str(adapter)
+                # regenerate through each question's CURRENT adapter (pooled at
+                # stage 1; its own shard once stage-2 chunking has run)
+                self._bridge_lora_of = {q: str(adapter_of_qid[q]) for q in unsolved_k}
                 self._bridge_seed_salt = f"stage{k}"
                 self._bridge_n = st.stage_bridge_n
                 self._bridge_max_keep = st.stage_max_keep
@@ -203,6 +241,7 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                     )
                 finally:
                     self._bridge_lora_path = None
+                    self._bridge_lora_of = None
                     self._bridge_seed_salt = None
                     self._bridge_n = None
                     self._bridge_max_keep = None
@@ -247,22 +286,63 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                 stats[f"stage{k + 1}_skipped"] = "no_pairs"
                 break
             stages_run = k
-            seed = stable_seed(cfg.run.seed, "lora_fit", iteration, f"stage{k + 1}")
-            adapter, secs = _ls._fit_adapter(
-                policy, pairs_k, adapters_dir, f"stage{k + 1}",
-                {**fit_params, "steps": st.stage2_steps, "seed": seed}, cfg,
-                init_adapter=(adapter if st.chain_adapter else None),
-                wandb=_ls.wandb_params(
-                    cfg, run_name=f"{cfg.run.name}/iter{iteration}/fit_stage{k + 1}"),
-            )
-            fit_seconds.append(secs)
+            # ---- objective: NLL on the bridges, or DPO against the adapter's
+            # own failures from the preceding rollout (tag = last_tag) ----------
+            fit_extra: dict = {}
+            if st.stage2_objective == "dpo":
+                pairs_k = _dpo_pairs(
+                    pairs_k, pool, neg_stage=last_tag, prompts=prompts,
+                    anchors_by_qid=anchors_by_qid, eos=eos, max_pair_tokens=max_pair,
+                    selection=st.dpo.negative_selection,
+                    max_per_question=st.dpo.max_pairs_per_question,
+                    seed_of=lambda q: stable_seed(cfg.run.seed, "dpo_neg", iteration, q, k),
+                    stats=stats, prefix=f"stage{k + 1}",
+                )
+                fit_extra = {"objective": "dpo", "beta": st.dpo.beta,
+                             "sft_weight": st.dpo.sft_weight,
+                             "reference": st.dpo.reference,
+                             "lr": st.dpo.lr if st.dpo.lr is not None else ls.fit.lr}
+                if not pairs_k:
+                    stats[f"stage{k + 1}_skipped"] = "no_dpo_pairs"
+                    break
+            # ---- fit: one adapter for the whole set, or one per shard --------
+            pairs_by_qid: dict[str, list[dict]] = defaultdict(list)
+            for pair in pairs_k:
+                pairs_by_qid[pair["qid"]].append(pair)
+            chunks = _assign_chunks(sorted(pairs_by_qid), st.stage2_chunk_size,
+                                    chunk_key_of)
+            self._warn_max_loras(len(chunks), cfg, f"stage-{k + 1}")
+            chunk_rows = []
+            for label, chunk_qids in chunks:
+                # a single chunk keeps the un-sharded name, so its fit cache key
+                # and logs stay identical to the pooled path
+                name = f"stage{k + 1}" if len(chunks) == 1 else f"stage{k + 1}_{label}"
+                chunk_pairs = [p for q in chunk_qids for p in pairs_by_qid[q]]
+                seed = stable_seed(cfg.run.seed, "lora_fit", iteration, name)
+                init = adapter_of_qid[chunk_qids[0]] if st.chain_adapter else None
+                chunk_adapter, secs = _ls._fit_adapter(
+                    policy, chunk_pairs, adapters_dir, name,
+                    {**fit_params, "steps": st.stage2_steps, "seed": seed, **fit_extra}, cfg,
+                    init_adapter=init,
+                    wandb=_ls.wandb_params(
+                        cfg, run_name=f"{cfg.run.name}/iter{iteration}/fit_{name}"),
+                )
+                fit_seconds.append(secs)
+                for q in chunk_qids:
+                    adapter_of_qid[q] = chunk_adapter
+                    chunk_label_of[q] = name
+                chunk_rows.append({"name": name, "n_questions": len(chunk_qids),
+                                   "n_pairs": len(chunk_pairs)})
+            if st.stage2_chunk_size > 0:
+                stats[f"stage{k + 1}_chunks"] = chunk_rows
             last = k == st.num_stages
             n = st.final_rollout_n if last else st.rollout_n
             qids = (roll_qids if (last and st.final_rollout_scope == "all")
                     else [q for q in roll_qids if q not in solved])
             last_tag = f"stage{k + 1}"
-            meta_k = {**fit_params, "steps": st.stage2_steps, "n_pairs": len(pairs_k)}
-            correct = _roll(last_tag, qids, adapter, n, meta_k)
+            meta_k = {**fit_params, "steps": st.stage2_steps, **fit_extra,
+                      "n_pairs": len(pairs_k)}
+            correct = _roll(last_tag, qids, n, meta_k)
             newly = {q for q, n_ok in correct.items() if n_ok > 0} - solved
             solved |= newly
             stats["n_resolved_by_stage"][last_tag] = len(newly)
@@ -285,6 +365,12 @@ class StagedBridgeSftOperator(BridgeSftOperator):
         write_json(improve_dir / "stats.json", stats)
         print(f"[improve:{self.name}] {stats}")
         return out
+
+    def _warn_max_loras(self, n_adapters: int, cfg: Config, where: str) -> None:
+        if n_adapters > cfg.engine.max_loras:
+            print(f"[improve:{self.name}] {n_adapters} {where} adapters exceed "
+                  f"engine.max_loras={cfg.engine.max_loras}: vLLM will swap adapters "
+                  "during the rollout (slower, still correct)")
 
     def _solved_pairs(self, k: int, solved_qids: list[str],
                       pool: list[ImprovedCandidate], targets1: dict,
@@ -353,6 +439,103 @@ class StagedBridgeSftOperator(BridgeSftOperator):
         stats["n_wash_dropped_long"] = stats.get("n_wash_dropped_long", 0) + n_dropped
         stats.setdefault("n_wash_pairs", {})[f"stage{k}"] = len(pairs)
         return pairs
+
+
+def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
+               neg_stage: str, prompts, anchors_by_qid, eos: int,
+               max_pair_tokens: int, selection: str, max_per_question: int | None,
+               seed_of, stats: dict, prefix: str) -> list[dict]:
+    """Turn the stage-2 SFT pairs (chosen = bridges) into DPO pairs whose
+    rejected side is a failure the CURRENT adapter produced in the rollout
+    tagged `neg_stage` — an on-policy negative, free of extra generation.
+
+    One pair per bridge (negatives cycle when fewer than bridges), so the chosen
+    side is identical to the SFT arm and an SFT-vs-DPO comparison isolates the
+    objective. Both sequences are built by templates.bridge_pair_ids, so they
+    share the prompt (+anchor) ids and a single prompt_len. Questions with no
+    negative are dropped (counted), as are pairs over max_pair_tokens."""
+    negs: dict[str, list[ImprovedCandidate]] = defaultdict(list)
+    for c in pool:
+        if not c.correct and c.op_meta.get("stage") == neg_stage:
+            negs[c.qid].append(c)
+    by_qid: dict[str, list[dict]] = defaultdict(list)
+    for p in sft_pairs:
+        by_qid[p["qid"]].append(p)
+
+    out: list[dict] = []
+    n_no_neg = n_long = 0
+    for qid in sorted(by_qid):
+        cands = sorted(negs.get(qid, []), key=lambda c: c.attempt_idx)
+        if not cands:
+            n_no_neg += 1
+            continue
+        if selection == "shortest":
+            cands.sort(key=lambda c: (len(c.continuation_token_ids), c.attempt_idx))
+        elif selection == "longest":
+            cands.sort(key=lambda c: (-len(c.continuation_token_ids), c.attempt_idx))
+        else:
+            random.Random(seed_of(qid)).shuffle(cands)
+        anchor_ids = list(anchors_by_qid[qid].anchor_token_ids)
+        chosen_list = by_qid[qid][:max_per_question] if max_per_question else by_qid[qid]
+        for i, chosen in enumerate(chosen_list):
+            neg = cands[i % len(cands)]
+            rej_ids, plen = bridge_pair_ids(prompts[qid], anchor_ids,
+                                            neg.continuation_token_ids, eos)
+            if plen != chosen["prompt_len"]:   # same prompt+anchor -> must match
+                raise RuntimeError(f"dpo pair prompt_len mismatch for {qid}")
+            if len(rej_ids) > max_pair_tokens or len(chosen["input_ids"]) > max_pair_tokens:
+                n_long += 1
+                continue
+            out.append({"qid": qid, "prompt_len": plen,
+                        "chosen_ids": list(chosen["input_ids"]),
+                        "rejected_ids": rej_ids})
+    stats[f"{prefix}_dpo_pairs"] = len(out)
+    stats[f"{prefix}_dpo_no_negative"] = n_no_neg
+    stats[f"{prefix}_dpo_dropped_long"] = n_long
+    return out
+
+
+def _assign_chunks(fit_qids: list[str], size: int,
+                   key_of: dict[str, tuple[int, ...]]) -> list[tuple[str, list[str]]]:
+    """Hierarchical, stable sharding of a fit set. Returns [(label, qids)].
+
+    `key_of` maps a question to the shard path it has been assigned so far —
+    () for "pooled / not yet sharded", (i,) after a first split, (i, j) after a
+    sub-split. Rules:
+      * size <= 0 -> ONE pooled shard (label "c0"); every question's key is
+        reset to () (a pooled fit has no shard identity to chain from).
+      * size > 0  -> questions are grouped by their CURRENT key (the parent
+        shard) and each parent group is cut into sub-shards of `size`. A parent
+        that yields a single sub-shard keeps its key (so with equal sizes a
+        shard simply shrinks as questions get solved and chains from its own
+        previous adapter); a parent that splits gets child keys (parent..., j).
+      * newcomers (no key yet, e.g. solved questions joining via full_pool) join
+        the smallest parent group before splitting.
+    Labels are "c" + "_".join(path): c0, c1, ... / c0_0, c0_1, ... With
+    num_stages: 1 and a pooled stage 1 this is exactly a slice of the sorted fit
+    set — the same semantics as lora_sft's pooled chunking."""
+    qids = sorted(fit_qids)
+    if size <= 0:
+        for q in qids:
+            key_of[q] = ()
+        return [("c0", qids)]
+    parents: dict[tuple[int, ...], list[str]] = defaultdict(list)
+    for q in qids:
+        parents[key_of.get(q, ())].append(q)
+    if () in parents and len(parents) > 1:        # newcomers among assigned ones
+        for q in parents.pop(()):
+            k = min(parents, key=lambda k: (len(parents[k]), k))
+            parents[k].append(q)
+    out: list[tuple[str, list[str]]] = []
+    for pkey in sorted(parents):
+        members = sorted(parents[pkey])
+        subs = [members[i:i + size] for i in range(0, len(members), size)]
+        for j, sub in enumerate(subs):
+            key = pkey if (len(subs) == 1 and pkey) else pkey + (j,)
+            for q in sub:
+                key_of[q] = key
+            out.append(("c" + "_".join(map(str, key)), sub))
+    return out
 
 
 def _merge_pairs(old: list[dict], new: list[dict], cap: int, selection: str,

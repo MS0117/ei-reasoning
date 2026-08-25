@@ -13,7 +13,8 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import get_args, get_origin, get_type_hints
+import types
+from typing import Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -96,6 +97,12 @@ class EngineCfg:
     # A100 80GB, 2026-08-16). Halving the chunk halves the spike and leaves the
     # KV cache untouched, which is cheaper than lowering the utilization.
     score_max_num_batched_tokens: int = 4096
+    # Requests per llm.generate call in a pool worker. Bounds what a kill
+    # costs: results are appended after each chunk, so a crashed sweep resumes
+    # at the last chunk instead of redoing the worker's whole shard (hours to
+    # days on a full-dataset run). vLLM caps concurrency at max_num_seqs
+    # regardless, so chunking at this size does not shrink the running batch.
+    generate_chunk_size: int = 256
     enable_prefix_caching: bool = True
     enforce_eager: bool = False
     # ---- LoRA serving (needed by the lora_sft improvement operator) ----
@@ -117,6 +124,13 @@ class DataCfg:
     question_suffix: str = "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
     eval_holdout: int = 200            # split off by stable qid hash, fixed across iterations
     accumulate: bool = True            # STaR-style union of all iterations' filtered data
+    # Held-out-cliff transfer (A/B split, docs/objective_decision_20260823.md §4):
+    # path to a JSON file listing qids whose examples must NEVER reach the
+    # trainer (train_sft/train_dpo). Rollout/improve still run on them, so they
+    # stay measurable ("improved-but-never-trained" = the B set). Accepts a
+    # plain list, or a dict with an "exclude" (preferred) or "B" key —
+    # scripts/cliff_split.py writes a compatible file. "" = no exclusion.
+    exclude_train_qids: str = ""
 
 
 @dataclass
@@ -239,6 +253,28 @@ class BridgeCfg:
 
 
 @dataclass
+class StagedDpoCfg:
+    """staged.stage2_objective=dpo: the stage-2 fit optimizes a preference pair
+    per bridge instead of NLL. chosen = the verifier-accepted bridge; rejected =
+    a failure the CURRENT adapter itself produced in the preceding rollout, so
+    the contrast lands exactly on what this policy still gets wrong."""
+
+    beta: float = 0.1                  # DPO temperature
+    lr: float | None = None            # null -> fit.lr (DPO usually wants lower)
+    sft_weight: float = 0.0            # + w * NLL(chosen) in the SAME loss (RPO-style).
+                                       # Pure DPO only widens the chosen-rejected GAP and
+                                       # can push both down; this keeps "make chosen
+                                       # likely" in the objective. Raise if reward_margin
+                                       # climbs while conversion falls.
+    negative_selection: str = "random"  # random | longest | shortest
+    max_pairs_per_question: int | None = None   # null -> one pair per kept bridge, which
+                                       # keeps the chosen side identical to the SFT arm
+    reference: str = "init"            # init (the fit's starting weights = the adapter
+                                       # that produced the negatives) | base (adapter
+                                       # disabled). Identical when chain_adapter: false.
+
+
+@dataclass
 class StagedCfg:
     """staged_bridge_sft operator: stage-1 bridge LoRA fit (steps = fit.steps)
     -> rollout (b) off the adapter (correct samples = converted cliffs, pooled)
@@ -266,7 +302,27 @@ class StagedCfg:
                                              # longest | shortest (read only when
                                              # train_scope: full_pool)
     train_scope: str = "unsolved_only"       # unsolved_only | full_pool
+    stage2_objective: str = "sft"      # sft | dpo — what the stage-2 fit optimizes.
+                                       # dpo turns the preceding rollout's FAILURES into
+                                       # on-policy negatives (see StagedDpoCfg).
+    dpo: StagedDpoCfg = field(default_factory=StagedDpoCfg)
     stage2_steps: int = 2              # full-batch gradient steps per stage-2 fit
+    stage1_chunk_size: int = 0         # 0 = ONE stage-1 adapter (pooled); N = one
+                                       # adapter per N questions of the stage-1 fit
+                                       # set. Sharding exists to keep PAIRS PER
+                                       # ADAPTER in the validated regime (~250-320
+                                       # pairs) as the cliff set grows — at 107
+                                       # cliffs shards of 25 (~85 pairs) HURT, so
+                                       # size chunks by pairs, not by question count.
+    stage2_chunk_size: int = 0         # 0 = ONE stage-2 adapter; N = one adapter per
+                                       # N questions of the stage-2 fit set. When
+                                       # stage 1 is sharded too, stage-2 shards are
+                                       # SUB-shards of their stage-1 shard (equal
+                                       # sizes = one-to-one, a shard just shrinks as
+                                       # questions get solved; smaller = each stage-1
+                                       # shard is split further, e.g. 100 -> 5x20),
+                                       # each warm-starting from the parent adapter.
+                                       # Must be <= stage1_chunk_size.
     final_rollout_n: int = 16
     final_rollout_scope: str = "unsolved"    # unsolved | all
     emit: str = "all"                  # all | final_only (which pool rounds reach filters)
@@ -519,6 +575,57 @@ class FilterCfg:
 
 
 @dataclass
+class NegativeTermCfg:
+    """L_N — the attractor negative on the base policy's own modal-wrong failures.
+
+    mode "v0" is the zero-code arm: train.objective sft+dpo with the DPO pairs'
+    rejected switched to the modal-wrong sample (train.dpo.rejected_selection);
+    no training-code branch reads v0 — it is a validated documentation marker.
+    mode "v1" adds bounded-unlikelihood rows (source="negative") to the SFT set:
+    per-token loss -log(1 - p) with p clamped <= 1-delta, weighted mu inside the
+    rho bracket. Negatives never get CE and never get an appended EOS.
+    """
+
+    mode: str = "off"                  # off | v0 | v1
+    mu: float = 0.1                    # weight on L_N (v1 only)
+    m_per_batch: int = 1               # negative rows per global batch window (v1)
+    max_per_question: int = 8          # cap on modal-wrong failures kept per cliff
+    delta: float = 0.02                # unlikelihood clamp: p <= 1 - delta
+
+
+@dataclass
+class GuardCfg:
+    """L_G — displacement guard: hinge on each rescued success's mean completion
+    CE rising above its stored reference (the C(y) pass's s_mean). Requires the
+    scores file, i.e. filter.selection.method=c_score or always_score, and
+    selection.scope=continuation (the live region must match the scored one)."""
+
+    enabled: bool = True
+
+
+@dataclass
+class CliffTermCfg:
+    """Separately-normalized cliff term (docs/objective_decision_20260823.md §3):
+
+        L = (1-rho)·L_S + rho·(L_C + mu·L_N + L_G)
+
+    enabled=false keeps the train stage byte-identical to the legacy single-
+    normalizer loss. When enabled, a stratified sampler places exactly
+    m_per_batch improved rows (and negative.m_per_batch negative rows under v1)
+    in EVERY global batch window, and L_C normalizes per QUESTION (1/(n_q·T_j))
+    so one converted cliff = one unit of loss regardless of rescue count or
+    length; per_question_norm=false is the S3-tok ablation (token-normalized
+    within the cliff slice, still under its own normalizer)."""
+
+    enabled: bool = False
+    rho: float = 0.1                   # per-step share of the cliff bracket, (0,1)
+    per_question_norm: bool = True     # false -> S3-tok
+    m_per_batch: int = 1               # cliff rows per global batch window (m_C)
+    negative: NegativeTermCfg = field(default_factory=NegativeTermCfg)
+    guard: GuardCfg = field(default_factory=GuardCfg)
+
+
+@dataclass
 class SftCfg:
     lr: float = 1.0e-5
     epochs: float = 2.0
@@ -537,6 +644,8 @@ class SftCfg:
     region_weights: dict = field(default_factory=lambda: {
         "prompt": 0.0, "anchor": 0.0, "continuation": 1.0, "solution": 1.0,
     })
+    # ⚗ extension point IV (cliff objective): L = (1-rho)·L_S + rho·(L_C + mu·L_N + L_G)
+    cliff: CliffTermCfg = field(default_factory=CliffTermCfg)
 
 
 @dataclass
@@ -549,6 +658,11 @@ class DpoCfg:
     loss_type: str = "sigmoid"
     max_grad_norm: float = 1.0
     logging_steps: int = 5
+    # Which base failure becomes `rejected` in build_dataset's DPO pairs:
+    # base_pick = the anchor stage's base_sample_idx pick (legacy);
+    # modal_wrong = the rollout carrying the question's modal wrong answer
+    # (the attractor) — the S4-v0 negative arm.
+    rejected_selection: str = "base_pick"   # base_pick | modal_wrong
 
 
 @dataclass
@@ -823,6 +937,47 @@ class Config:
             )
         if not 1 <= st.stage2_steps <= 32:
             raise ValueError("improve.lora_sft.staged.stage2_steps must be in [1, 32]")
+        if st.stage2_chunk_size < 0 or st.stage1_chunk_size < 0:
+            raise ValueError(
+                "improve.lora_sft.staged.stage1_chunk_size/stage2_chunk_size must be >= 0 "
+                "(0 = pooled)"
+            )
+        if st.stage1_chunk_size and st.stage2_chunk_size and \
+                st.stage2_chunk_size > st.stage1_chunk_size:
+            raise ValueError(
+                "improve.lora_sft.staged: stage-2 shards are SUB-shards of their stage-1 "
+                f"shard, so stage2_chunk_size ({st.stage2_chunk_size}) cannot exceed "
+                f"stage1_chunk_size ({st.stage1_chunk_size}); equal = one-to-one shards, "
+                "smaller = each stage-1 shard is split further"
+            )
+        if st.stage1_chunk_size and not st.stage2_chunk_size and st.chain_adapter:
+            raise ValueError(
+                "improve.lora_sft.staged: a pooled stage-2 fit cannot warm-start from "
+                "several stage-1 shard adapters — set stage2_chunk_size to match "
+                "stage1_chunk_size, or chain_adapter: false"
+            )
+        if st.stage2_objective not in ("sft", "dpo"):
+            raise ValueError(
+                f"improve.lora_sft.staged.stage2_objective: {st.stage2_objective!r} "
+                "(sft | dpo)"
+            )
+        dpo = st.dpo
+        if dpo.beta <= 0:
+            raise ValueError("improve.lora_sft.staged.dpo.beta must be > 0")
+        if dpo.lr is not None and dpo.lr <= 0:
+            raise ValueError("improve.lora_sft.staged.dpo.lr must be > 0 or null")
+        if dpo.sft_weight < 0:
+            raise ValueError("improve.lora_sft.staged.dpo.sft_weight must be >= 0")
+        if dpo.negative_selection not in ("random", "longest", "shortest"):
+            raise ValueError(
+                f"improve.lora_sft.staged.dpo.negative_selection: {dpo.negative_selection!r}"
+            )
+        if dpo.max_pairs_per_question is not None and dpo.max_pairs_per_question < 1:
+            raise ValueError(
+                "improve.lora_sft.staged.dpo.max_pairs_per_question must be >= 1 or null"
+            )
+        if dpo.reference not in ("init", "base"):
+            raise ValueError(f"improve.lora_sft.staged.dpo.reference: {dpo.reference!r}")
         if st.unsolved_targets not in ("reuse_bridge", "regen_bridge", "add_bridge"):
             raise ValueError(f"improve.lora_sft.staged.unsolved_targets: {st.unsolved_targets!r}")
         if st.stage_bridge_n is not None and st.stage_bridge_n < 1:
@@ -855,7 +1010,10 @@ class Config:
                 ("improve.lora_sft.project_back.enabled", pb.enabled),
                 ("improve.lora_sft.refit_budget > 0", ls.refit_budget > 0),
                 ("improve.lora_sft.adapter_scope != 'pooled'", ls.adapter_scope != "pooled"),
-                ("improve.lora_sft.chunk_size != 0", ls.chunk_size != 0),
+                # stage-2 sharding has its own knob (staged.stage2_chunk_size);
+                # the global one has no defined stage to apply to here.
+                ("improve.lora_sft.chunk_size != 0 (use "
+                 "improve.lora_sft.staged.stage2_chunk_size instead)", ls.chunk_size != 0),
                 ("improve.rl.enabled", self.improve.rl.enabled),
             ]
             bad = [name for name, hit in unsupported if hit]
@@ -1024,6 +1182,57 @@ class Config:
             raise ValueError(
                 "train.sft.packing=true is not implemented by WeightedCausalCollator"
             )
+        cl = t.sft.cliff
+        if cl.negative.mode not in ("off", "v0", "v1"):
+            raise ValueError(f"train.sft.cliff.negative.mode: {cl.negative.mode!r} (off | v0 | v1)")
+        if t.dpo.rejected_selection not in ("base_pick", "modal_wrong"):
+            raise ValueError(
+                f"train.dpo.rejected_selection: {t.dpo.rejected_selection!r} (base_pick | modal_wrong)"
+            )
+        if cl.negative.mode != "off" and not cl.enabled:
+            raise ValueError(
+                "train.sft.cliff.negative.mode != off requires train.sft.cliff.enabled "
+                "(L_N lives inside the rho bracket)"
+            )
+        if cl.enabled:
+            if not 0 < cl.rho < 1:
+                raise ValueError("train.sft.cliff.rho must be in (0, 1)")
+            if cl.m_per_batch < 1:
+                raise ValueError("train.sft.cliff.m_per_batch must be >= 1")
+            neg = cl.negative
+            if neg.mu < 0:
+                raise ValueError("train.sft.cliff.negative.mu must be >= 0")
+            if neg.m_per_batch < 1 or neg.max_per_question < 1:
+                raise ValueError("train.sft.cliff.negative m_per_batch/max_per_question must be >= 1")
+            if not 0 < neg.delta < 1:
+                raise ValueError("train.sft.cliff.negative.delta must be in (0, 1)")
+            reserved = cl.m_per_batch + (neg.m_per_batch if neg.mode == "v1" else 0)
+            if reserved > t.sft.global_batch_size // 2:
+                raise ValueError(
+                    f"cliff m_per_batch (+negative) reserves {reserved} of the "
+                    f"{t.sft.global_batch_size}-example global batch — must be <= half"
+                )
+            if neg.mode == "v0" and (t.objective != "sft+dpo" or t.dpo.rejected_selection != "modal_wrong"):
+                raise ValueError(
+                    "negative.mode=v0 is the zero-code arm: it requires train.objective=sft+dpo "
+                    "AND train.dpo.rejected_selection=modal_wrong"
+                )
+            if neg.mode == "v1" and t.objective != "sft":
+                raise ValueError(
+                    "negative.mode=v1 requires train.objective=sft (sft+dpo would apply the "
+                    "modal-wrong negatives twice: in-SFT unlikelihood + the DPO phase)"
+                )
+            sel = self.filter.selection
+            if cl.guard.enabled and not (sel.method == "c_score" or sel.always_score):
+                raise ValueError(
+                    "train.sft.cliff.guard needs the C(y) scores file: set "
+                    "filter.selection.method=c_score or filter.selection.always_score=true"
+                )
+            if cl.guard.enabled and sel.scope != "continuation":
+                raise ValueError(
+                    "train.sft.cliff.guard requires filter.selection.scope=continuation "
+                    "(the guard's live region must match the scored region)"
+                )
         for name, global_bs, micro_bs in (
             ("sft", t.sft.global_batch_size, t.sft.micro_batch_size),
             ("dpo", t.dpo.global_batch_size, t.dpo.micro_batch_size),
@@ -1101,7 +1310,14 @@ def _from_dict(cls, raw: dict, path: str):
 
 def _coerce_scalar(target, value, path: str):
     """YAML 1.1 parses '2e-5' (no decimal point) as a STRING; coerce scalars to
-    the field's declared type so numeric overrides always behave."""
+    the field's declared type so numeric overrides always behave. `X | None`
+    fields coerce to X (a `--override a.b=5e-5` on an optional float must not
+    arrive as the string '5e-5')."""
+    if get_origin(target) in (Union, types.UnionType):
+        members = [a for a in get_args(target) if a is not type(None)]
+        if value is None or len(members) != 1:
+            return value
+        target = members[0]
     try:
         if target is float and isinstance(value, (int, str)):
             return float(value)

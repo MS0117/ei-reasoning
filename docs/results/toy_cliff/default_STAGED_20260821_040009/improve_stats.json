@@ -1,0 +1,77 @@
+{
+  "operator": "staged_bridge_sft",
+  "n_eligible": 107,
+  "n_with_gold": 107,
+  "n_no_gold": 0,
+  "n_budget_skipped": 0,
+  "n_bridge_generated": 1048,
+  "n_bridge_correct": 536,
+  "n_bridge_leak_rule": 0,
+  "n_bridge_leak_judge": 0,
+  "n_bridge_retried": 24,
+  "n_bridge_budget_skipped": 0,
+  "n_questions_bridged": 87,
+  "n_bridge_skipped": 20,
+  "bridge_skipped_qids": [
+    "hfm-0d25d6a048aa97a9",
+    "hfm-0eb4bf97db2a00ab",
+    "hfm-10953a3f49c5ec60",
+    "hfm-171ff5a9e865f3fb",
+    "hfm-1a968c5466e02013",
+    "hfm-28068fd65f1bba59",
+    "hfm-2a393c5bef706b33",
+    "hfm-3da202a244ade757",
+    "hfm-640863cccf876831",
+    "hfm-64bb844b47ed2be9",
+    "hfm-6c7c3761e58438d0",
+    "hfm-85c592f8a0b8ffca",
+    "hfm-9572fc7ca43e862e",
+    "hfm-a7827729a8fb1960",
+    "hfm-b0f959ba04ef23f9",
+    "hfm-b46261c1a8646674",
+    "hfm-c3e786d0bc91ee68",
+    "hfm-c52be0b8a0b66234",
+    "hfm-d208e842d8942340",
+    "hfm-ecb73934fbab3156"
+  ],
+  "bridge_pairs_kept": 314,
+  "bridge_yield": 0.8131,
+  "n_pairs": 314,
+  "n_dropped_long": 0,
+  "n_resolved_stage1": 17,
+  "n_resolved_pool": 17,
+  "n_resolved_by_stage": {
+    "stage1": 17,
+    "stage2": 32
+  },
+  "stage2_chunks": [
+    {
+      "name": "stage2_c0",
+      "n_questions": 25,
+      "n_pairs": 89
+    },
+    {
+      "name": "stage2_c1",
+      "n_questions": 25,
+      "n_pairs": 90
+    },
+    {
+      "name": "stage2_c2",
+      "n_questions": 21,
+      "n_pairs": 81
+    }
+  ],
+  "n_fits": 4,
+  "fit_seconds": [
+    703.1,
+    314.7,
+    260.6,
+    276.8
+  ],
+  "n_stages_run": 1,
+  "n_resolved_final": 49,
+  "pool_size": 2154,
+  "n_emitted": 2154,
+  "lora_yield": 0.4579,
+  "alpha_star_mean": 1.0
+}

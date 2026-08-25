@@ -36,19 +36,21 @@ The loop, per iteration `k`:
 1. **rollout** — the policy samples `n` responses per question (vLLM, data-parallel workers).
 2. **partition** — a verifier grades every sample; questions split into *solved*
    (correct trajectories kept for training) and *unsolved* (sent to improvement).
-3. **anchor** *(extension point I)* — for each unsolved question, pick a failed rollout and
-   fix an *anchor prefix* (leading token span we commit to keeping).
-4. **improve** *(extension point II)* — an improvement operator continues from
-   `question + anchor` and tries to reach the correct answer.
+3. **anchor** — pass-through stage. Every live preset runs `anchor.policy: none`
+   (empty prefix): the prefix-cutting variants (`fixed_fraction`, `privileged_divergence`)
+   are **deprecated** and kept only so old run dirs still load.
+4. **improve** *(extension point II)* — an improvement operator resamples the whole
+   response from the question (transient-LoRA operators `lora_sft` / `bridge_sft` /
+   `staged_bridge_sft`) and tries to reach the correct answer.
 5. **filters** *(extension point III)* — learnability gates: correctness, no residual
    dependence on external feedback, dedup, length, optional policy-logprob gate.
 6. **train** *(extension point IV)* — mixed objective over natively-solved trajectories and
-   anchor-prefixed improved trajectories (region-weighted SFT and/or anchor-conditioned DPO).
+   improved trajectories (region-weighted SFT and/or DPO).
 7. Retrain (from base or last checkpoint), then iterate.
 
 **Deep dive:** [`src/expert_iter/README.md`](src/expert_iter/README.md) explains the
 architecture, the run-directory data flow, every module's role, and how to add new
-anchor policies / operators / gates. API quirks of the pinned bleeding-edge deps are
+operators / gates. API quirks of the pinned bleeding-edge deps are
 in [`docs/api_notes.md`](docs/api_notes.md).
 
 ## Running
@@ -66,7 +68,15 @@ bash scripts/run.sh -g 2 -b -- --iterations 1        # background, log under log
 
 # smoke test (small model, 1 GPU, 1 iteration)
 bash scripts/smoke.sh
+
+# one-cycle toy-cliff comparison of improvement operators (no train/eval)
+bash data/run_toy_cliff.sh -c data/configs/STAGED.yaml -b \
+    -- --reuse-rollout runs/toy_cliff/default_LSPO_20260813_155520
 ```
+
+Toy-cliff experiments (which dataset, which YAML, which code to touch, results so far and the
+analysis tooling) are documented in [`docs/toy_cliff_playbook.md`](docs/toy_cliff_playbook.md);
+committed per-run summaries live under `docs/results/toy_cliff/`.
 
 Config is a single YAML (see `configs/ei_default.yaml`); any field can be overridden on the
 CLI with `--override a.b.c=value`. Distributed training backend is selected with

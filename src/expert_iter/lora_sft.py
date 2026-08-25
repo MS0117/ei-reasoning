@@ -779,7 +779,13 @@ def _fit_adapter(policy: str, pairs: list[dict], adapters_dir: Path, name: str,
         "lora_fit_v1",
         json.dumps(params, sort_keys=True),
         _model_fingerprint(policy),
-        tuple((p["qid"], tuple(p["input_ids"]), p["prompt_len"]) for p in pairs),
+        # SFT pairs carry input_ids; DPO pairs (staged stage2_objective=dpo)
+        # carry chosen_ids/rejected_ids. The SFT tuple is unchanged so existing
+        # cached adapters keep their keys.
+        tuple((p["qid"], tuple(p["input_ids"]), p["prompt_len"]) if "input_ids" in p
+              else (p["qid"], tuple(p["chosen_ids"]), tuple(p["rejected_ids"]),
+                    p["prompt_len"])
+              for p in pairs),
         str(init_adapter) if init_adapter else "",
         n_proc,   # DDP is mathematically but not bitwise identical to 1 process
     )

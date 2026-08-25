@@ -161,18 +161,31 @@ class SFTExample(Record):
     Region lengths — not baked weights — are stored so region->weight mapping
     stays a config knob (`train.sft.region_weights`): weight sweeps re-train
     without rebuilding data. Invariant: prompt_len+anchor_len+completion_len
-    == len(input_ids); anchor_len == 0 for source == "solved".
+    == len(input_ids); anchor_len == 0 for source in ("solved", "negative").
+
+    Cliff-objective fields (train.sft.cliff — see docs/objective_decision_20260823.md §3):
+      source "negative" = a base-policy modal-wrong failure rollout, trained with
+      bounded unlikelihood (L_N v1), never with CE.
+      n_q = per-question mass for the per-question normalizer: on "improved" rows
+      the number of kept rescued successes for that qid, on "negative" rows the
+      number of negative rows for that qid (n⁻_q). 0 = not a cliff-term row /
+      written by pre-cliff code; build_dataset restamps it every iteration.
+      ref_mean_nll = the C(y) scoring pass's s_mean (mean NLL over the
+      continuation region under the pre-train policy) — the displacement
+      guard's reference. None = unavailable (guard skips the row).
     """
 
     uid: str
     qid: str
-    source: str                 # "solved" | "improved"
+    source: str                 # "solved" | "improved" | "negative"
     input_ids: list[int]
     prompt_len: int
     anchor_len: int
     completion_len: int
     text: str = ""
     iter_created: int = 0
+    n_q: int = 0
+    ref_mean_nll: float | None = None
 
     def validate(self) -> None:
         total = self.prompt_len + self.anchor_len + self.completion_len
@@ -180,8 +193,8 @@ class SFTExample(Record):
             raise ValueError(
                 f"{self.uid}: region lengths {total} != len(input_ids) {len(self.input_ids)}"
             )
-        if self.source == "solved" and self.anchor_len != 0:
-            raise ValueError(f"{self.uid}: solved example with anchor_len != 0")
+        if self.source in ("solved", "negative") and self.anchor_len != 0:
+            raise ValueError(f"{self.uid}: {self.source} example with anchor_len != 0")
 
 
 @dataclass
