@@ -1,0 +1,105 @@
+{
+  "name": "openr1_mix8k_qwen3-4b-2507",
+  "seed": 17,
+  "mix": "0-0=3640,1-2=2200,3-4=1100,5-8=460,9-15=400,16-16=200",
+  "inputs": [
+    "runs/passrate/friend_openr1_default/openr1-math-220k_default_passrate.jsonl",
+    "runs/passrate/friend_openr1_extended/openr1-math-220k_extended_passrate.jsonl"
+  ],
+  "max_truncated": 8,
+  "n_mix": 8000,
+  "n_cliff_holdout": 300,
+  "by_source": {
+    "openr1-math-220k_extended_passrate": 1544,
+    "openr1-math-220k_default_passrate": 6456
+  },
+  "buckets": [
+    {
+      "c_range": [
+        0,
+        0
+      ],
+      "quota": 3640,
+      "pool": 3940,
+      "taken": 3640,
+      "holdout": 300,
+      "by_source": {
+        "openr1-math-220k_extended_passrate": 1359,
+        "openr1-math-220k_default_passrate": 2281
+      },
+      "order": "hash (pool exhausted)"
+    },
+    {
+      "c_range": [
+        1,
+        2
+      ],
+      "quota": 2200,
+      "pool": 2886,
+      "taken": 2200,
+      "holdout": 0,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 2015,
+        "openr1-math-220k_extended_passrate": 185
+      },
+      "order": "preference then hash"
+    },
+    {
+      "c_range": [
+        3,
+        4
+      ],
+      "quota": 1100,
+      "pool": 2369,
+      "taken": 1100,
+      "holdout": 0,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 1100
+      },
+      "order": "preference then hash"
+    },
+    {
+      "c_range": [
+        5,
+        8
+      ],
+      "quota": 460,
+      "pool": 5119,
+      "taken": 460,
+      "holdout": 0,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 460
+      },
+      "order": "preference then hash"
+    },
+    {
+      "c_range": [
+        9,
+        15
+      ],
+      "quota": 400,
+      "pool": 27073,
+      "taken": 400,
+      "holdout": 0,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 400
+      },
+      "order": "preference then hash"
+    },
+    {
+      "c_range": [
+        16,
+        16
+      ],
+      "quota": 200,
+      "pool": 73676,
+      "taken": 200,
+      "holdout": 0,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 200
+      },
+      "order": "preference then hash"
+    }
+  ],
+  "n_with_gold_solution": 8000
+}

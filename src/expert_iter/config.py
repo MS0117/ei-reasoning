@@ -123,6 +123,14 @@ class DataCfg:
     # reliable by pinning the final-answer format.
     question_suffix: str = "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
     eval_holdout: int = 200            # split off by stable qid hash, fixed across iterations
+    # Use an EXTERNAL QuestionRecord JSONL as the eval holdout instead of
+    # splitting one off the train set. For a holdout that must be a specific
+    # curated slice rather than a random sample — e.g. reserved cliff questions,
+    # where "rescue rate on cliffs never trained on" is the endpoint and a
+    # proportional random holdout would carry too few of them. Mutually
+    # exclusive with eval_holdout > 0; qids overlapping the train set are a
+    # hard error, since the whole point is that these were never trained on.
+    holdout_path: str | None = None
     accumulate: bool = True            # STaR-style union of all iterations' filtered data
     # Held-out-cliff transfer (A/B split, docs/objective_decision_20260823.md §4):
     # path to a JSON file listing qids whose examples must NEVER reach the
@@ -1162,6 +1170,11 @@ class Config:
             raise ValueError(f"loop.stages must follow pipeline order: {LOOP_STAGES}")
         if self.data.eval_holdout < 0:
             raise ValueError("data.eval_holdout must be >= 0")
+        if self.data.holdout_path and self.data.eval_holdout > 0:
+            raise ValueError(
+                "data.holdout_path and data.eval_holdout are mutually exclusive: "
+                f"set eval_holdout=0 to use {self.data.holdout_path!r} as the holdout"
+            )
         t = self.train
         if t.objective not in ("sft", "dpo", "sft+dpo"):
             raise ValueError(f"train.objective: {t.objective!r}")

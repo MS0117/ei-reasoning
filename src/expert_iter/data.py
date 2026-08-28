@@ -552,7 +552,26 @@ def ensure_questions(cfg, run_dir) -> tuple[list[QuestionRecord], list[QuestionR
         records = load_questions(cfg.data.adapter, cfg.data.adapter_args)
         if not records:
             raise RuntimeError(f"adapter {cfg.data.adapter!r} produced no questions")
-        train, holdout = split_holdout(records, cfg.data.eval_holdout, cfg.run.seed)
+        if cfg.data.holdout_path:
+            # Curated external holdout (config validation already forbids
+            # pairing this with eval_holdout > 0). The overlap check is the
+            # load-bearing part: the endpoint these holdouts exist to measure
+            # is performance on questions the run never trained on, and a
+            # silent overlap would invalidate it without any visible symptom.
+            train = records
+            holdout = list(QuestionRecord.load_jsonl(cfg.data.holdout_path))
+            if not holdout:
+                raise RuntimeError(
+                    f"data.holdout_path {cfg.data.holdout_path!r} produced no questions"
+                )
+            leaked = {r.qid for r in holdout} & {r.qid for r in train}
+            if leaked:
+                raise RuntimeError(
+                    f"data.holdout_path shares {len(leaked)} qid(s) with the train set "
+                    f"(e.g. {sorted(leaked)[:3]}) — the holdout must be disjoint"
+                )
+        else:
+            train, holdout = split_holdout(records, cfg.data.eval_holdout, cfg.run.seed)
         n = QuestionRecord.dump_jsonl(train_path, train)
         mark_done(train_path, count=n, config_hash=cfg.hash())
         n = QuestionRecord.dump_jsonl(holdout_path, holdout)

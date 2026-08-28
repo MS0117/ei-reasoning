@@ -493,3 +493,56 @@ def test_write_cliff_set(tmp_path):
     assert row.meta["passrate_c"] == 0 and row.meta["passrate_k"] == 32
     assert row.meta["passrate_run"] == "run_x"
     assert row.meta["passrate_model"] == "org/model"
+
+
+# ---------------------------------------------------------------------------
+# data.holdout_path: a curated external holdout instead of a random split
+# ---------------------------------------------------------------------------
+
+def _q(qid, meta=None):
+    from expert_iter.records import QuestionRecord
+    return QuestionRecord(qid=qid, question=f"q {qid}", final_answer="1",
+                          domain="math", meta=meta or {})
+
+
+def test_holdout_path_conflicts_with_eval_holdout():
+    cfg = Config.load(REPO_ROOT / "data" / "configs" / "toy_cliff.yaml")
+    cfg.data.holdout_path = "some/file.jsonl"
+    cfg.data.eval_holdout = 200
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cfg.validate()
+
+
+def test_holdout_path_loads_external_file_and_keeps_train_whole(tmp_path, monkeypatch):
+    from expert_iter.records import QuestionRecord
+    from expert_iter import data as data_mod
+
+    hold = tmp_path / "hold.jsonl"
+    QuestionRecord.dump_jsonl(hold, [_q("h1"), _q("h2")])
+    monkeypatch.setattr(data_mod, "load_questions",
+                        lambda *a, **k: [_q("t1"), _q("t2"), _q("t3")])
+
+    cfg = Config.load(REPO_ROOT / "data" / "configs" / "toy_cliff.yaml")
+    cfg.data.eval_holdout = 0
+    cfg.data.holdout_path = str(hold)
+    train, holdout = data_mod.ensure_questions(cfg, tmp_path / "run")
+    # Nothing is split off the train set — the holdout is the external file.
+    assert [r.qid for r in train] == ["t1", "t2", "t3"]
+    assert [r.qid for r in holdout] == ["h1", "h2"]
+
+
+def test_holdout_path_rejects_overlap_with_train(tmp_path, monkeypatch):
+    # A silent overlap would invalidate the "never trained on" endpoint with no
+    # visible symptom, so it must be a hard error.
+    from expert_iter.records import QuestionRecord
+    from expert_iter import data as data_mod
+
+    hold = tmp_path / "hold.jsonl"
+    QuestionRecord.dump_jsonl(hold, [_q("t2")])
+    monkeypatch.setattr(data_mod, "load_questions", lambda *a, **k: [_q("t1"), _q("t2")])
+
+    cfg = Config.load(REPO_ROOT / "data" / "configs" / "toy_cliff.yaml")
+    cfg.data.eval_holdout = 0
+    cfg.data.holdout_path = str(hold)
+    with pytest.raises(RuntimeError, match="shares 1 qid"):
+        data_mod.ensure_questions(cfg, tmp_path / "run")
