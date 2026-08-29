@@ -154,7 +154,7 @@ improve:
                               # ~9 min for a staged shard, so extra steps are
                               # nearly free -- probe 3/4/8 on the 1k mix before the
                               # full run rather than assuming 4 is enough:
-                              #   --override data.adapter_args.path=data/mixes/openr1_mix1k_qwen3-4b-2507.jsonl
+                              #   --override data.adapter_args.path=data/mixes/openr1_mix500_qwen3-4b-2507.jsonl
                               #   --override improve.lora_sft.fit.steps=8
       max_pair_tokens: 16384
       dropout: 0.0
