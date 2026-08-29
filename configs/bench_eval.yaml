@@ -28,7 +28,11 @@ model:
   #   bash scripts/eval_bench.sh            -> model.base (this line)
   #   bash scripts/eval_bench.sh MODEL      -> MODEL
   # Accepts an HF hub id, an EI checkpoint dir, or a LoRA adapter dir (auto-merged).
-  base: Qwen/Qwen3-14B #Qwen/Qwen3-8B, Qwen/Qwen3-4B
+  # The L5 base policy, so a MODEL-less invocation grades the right family.
+  # eval_bench.sh's MODEL argument still wins (and says so) — pass the arm's
+  # final ckpt for the paper numbers, per docs/L5_protocol_20260829.md §3.
+  # Other models this has graded: Qwen/Qwen3-14B, -8B, -4B, -1.7B.
+  base: Qwen/Qwen3-4B-Instruct-2507
   # THINKING MODE: OFF. Qwen3-*-2507 Instruct is non-thinking by construction
   # (no switch in its template, so the flag is ignored there); the flag is what
   # actually toggles thinking on hybrid Qwen3 (0.6B/4B/8B).

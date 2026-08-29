@@ -249,3 +249,59 @@ def test_cliff_unknown_key_and_hash():
         Config.load(None, overrides=["train.sft.cliff.negative.bogus=1"])
     assert Config.load(None).hash() != Config.load(
         None, overrides=["train.sft.cliff.rho=0.2"]).hash()
+
+
+_STAGED_ON = "improve.operator=staged_bridge_sft|engine.enable_lora=true"
+
+
+@pytest.mark.parametrize("overrides", [
+    f"{_STAGED_ON}|improve.lora_sft.staged.stage2_objective=bogus",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.mu=-0.1",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.delta=0",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.delta=1.5",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.lr=0",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.negative_selection=bogus",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.max_pairs_per_question=0",
+    f"{_STAGED_ON}|improve.lora_sft.staged.ul.reference=bogus",
+    f"{_STAGED_ON}|improve.lora_sft.staged.dpo.negative_selection=bogus",
+])
+def test_staged_ul_validations_reject(overrides):
+    with pytest.raises(ValueError):
+        Config.load(None, overrides=overrides.split("|"))
+
+
+def test_staged_ul_arm_loads():
+    cfg = Config.load(None, overrides=[*_STAGED_ON.split("|"),
+                                       "improve.lora_sft.staged.stage2_objective=ul"])
+    ul = cfg.improve.lora_sft.staged.ul
+    assert (ul.mu, ul.delta, ul.guard, ul.negative_selection) == (0.1, 0.02, True, "modal")
+    # modal is legal for the dpo arm too (a DPO+modal control needs no code)
+    Config.load(None, overrides=[*_STAGED_ON.split("|"),
+                                 "improve.lora_sft.staged.stage2_objective=dpo",
+                                 "improve.lora_sft.staged.dpo.negative_selection=modal"])
+
+
+# --- train.dpo memory knobs (added 2026-08-28 after the S4-v0 OOM) -----------
+
+def test_dpo_memory_knobs_default_to_the_settings_that_fit():
+    """Defaults must reproduce the configuration the S4-v0 arm actually ran:
+    checkpointing on, reference log-probs precomputed, max_length inherited."""
+    cfg = Config.load(None)
+    assert cfg.train.dpo.gradient_checkpointing is True
+    assert cfg.train.dpo.precompute_ref_log_probs is True
+    assert cfg.train.dpo.max_length is None
+
+
+@pytest.mark.parametrize("value", [0, -1, 999_999])
+def test_dpo_max_length_must_fit_inside_max_seq_len(tmp_path, value):
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text("train:\n  max_seq_len: 4096\nfilter:\n  max_total_tokens: 4096\n")
+    with pytest.raises(ValueError, match="train.dpo.max_length"):
+        Config.load(cfg_path, overrides=[f"train.dpo.max_length={value}"])
+
+
+def test_dpo_max_length_accepts_a_value_at_or_below_max_seq_len(tmp_path):
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text("train:\n  max_seq_len: 4096\nfilter:\n  max_total_tokens: 4096\n")
+    for v in (1, 2048, 4096):
+        assert Config.load(cfg_path, overrides=[f"train.dpo.max_length={v}"]).train.dpo.max_length == v

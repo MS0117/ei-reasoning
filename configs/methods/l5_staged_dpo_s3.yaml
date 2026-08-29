@@ -1,88 +1,42 @@
-# Method preset: STAGED BRIDGE-SFT (full EI loop) on OpenR1.
+# L5 headline preset: the SURVIVING configuration from the L2/L3 ladder —
+# staged_bridge_sft (stage-2 DPO) as the operator + the cliff objective S3 as
+# the training loss, run as a full 4-iteration EI loop.
 #
-# Multi-stage extension of bridge_sft (configs/methods/bridge_sft.yaml):
-#   stage 1  bridges z+ from the plain privileged prompt (x + y*, NO anchor)
-#            -> transient LoRA fit (fit.steps, default 2)
-#   (b)      staged.rollout_n samples per cliff off the adapter; correct
-#            samples enter the candidate pool (the cliff is CONVERTED)
-#   stage 2  staged.num_stages more fits (staged.stage2_steps each), warm-
-#            started from the previous adapter (staged.chain_adapter):
-#              unsolved  bridge pairs reused (reuse_bridge) or regenerated
-#                        THROUGH the adapter (regen_bridge)
-#              solved    only with train_scope: full_pool — one correct
-#                        rollout per question picked by staged.solved_targets
-#                        (self_wash_min_c / bridge / random / longest / shortest)
-#            each fit is followed by a rollout (intermediate: rollout_n over
-#            unsolved; final: final_rollout_n over final_rollout_scope)
-#   emit     the rollout pool (staged.emit: all | final_only). Bridges never
-#            become training data; filters' gates + filter.selection.method
-#            (shortest | c_score | random) do the per-question trimming.
+# This file exists so the L5 arms are not a pile of --override flags: every knob
+# scripts/l3_arm.sh set by hand for the S3 arm is pinned here, and a missing
+# override silently becomes a DIFFERENT experiment.
 #
-# v1 constraints (rejected at config load): fit.adaptive, project_back,
-# refit_budget, per_problem adapters, the GLOBAL lora_sft.chunk_size, and rl are
-# not supported with this operator yet. Stage-2 sharding IS supported — it has
-# its own knobs, staged.stage1_chunk_size / stage2_chunk_size (stage-2 shards are
-# sub-shards of their stage-1 shard, so stage2 <= stage1).
+#   bash scripts/run.sh -c configs/methods/l5_staged_dpo_s3.yaml -b
 #
-# ============================== HOW-TO / TOGGLES ==============================
-# The method is THREE INDEPENDENT AXES (same layout as data/configs/toy_cliff.yaml,
-# the one-cycle toy driver version of this experiment):
+# What it pins beyond configs/methods/staged_bridge_sft.yaml
+#   train.sft.cliff.enabled  true   the objective itself. L3: S3 minus S1 is the
+#                                   net objective effect (held-out cliff B:
+#                                   attractor -7.0pp, avg@32 +5.4pp), while S1
+#                                   alone was indistinguishable from the
+#                                   no-cliff-data arm S0.
+#   train.sft.cliff.rho      0.3    the dose L3 selected
+#   guard.enabled            true   displacement hinge; REQUIRES always_score
+#   filter.selection.always_score   true, so every kept candidate carries the
+#                                   s_mean the guard joins as its reference
+#   negative.mode            off    both negatives were measured and rejected:
+#                                   v1 (in-SFT uniform unlikelihood) halves the
+#                                   attractor but scatters the mass into the
+#                                   wrong-answer tail (other-wrong 25->39%,
+#                                   distinct kinds 6.7->8.9) and inflates length
+#                                   +57%; v0 (post-SFT DPO) is indistinguishable
+#                                   from S3 on every endpoint (p>0.19; only 8
+#                                   optimizer steps). See docs/L3_results_20260826.md
 #
-#   improve.operator        WHAT the transient LoRA is fitted on
-#       lora_sft    gold pairs (x -> y*)
-#       bridge_sft  self-generated bridges (x [+ a] -> z+); see           [THIS FILE]
-#                   configs/methods/bridge_sft.yaml
-#       self_resample  no LoRA at all (best-of-n from the policy)
-#   anchor.policy           WHERE improvement starts
-#       none                    x only
-#       privileged_divergence   x + anchor (step-granular cut where the   [THIS FILE]
-#                               y*-conditioned pass diverges); also switches
-#                               bridge_sft to its "continue the attempt" variant
-#       NOTE: with the gold-target lora_sft operator the anchor never enters the
-#       FIT (y* is not a continuation of a failed prefix) — it only changes where
-#       q_phi is sampled from. Anchoring is coherent with bridge_sft.
-#   improve.rl.enabled      WHETHER the fitted LoRA is then refined by RL
-#       RL is a PHASE, never an improve.operator value. Prompts carry NO y*:
-#       the true target state (x, or x + a when an anchor policy is on).
+# The held-out cliff set B is per-run, so it stays an override — build the split
+# once and reuse it for every arm and every iteration so B is never trained on:
+#   .venv/bin/python scripts/cliff_split.py ...      # -> iter_0/cliff_split.json
+#   --override data.exclude_train_qids=<run>/iter_0/cliff_split.json
 #
-# Other switches: improve.lora_sft.project_back.enabled (alpha sweep),
-# improve.lora_sft.fit.adaptive.enabled (tau_E early stop),
-# filter.selection.method (shortest | c_score | random),
-# improve.lora_sft.adapter_scope / chunk_size (LoRA fit batching).
-# Token budgets: rollout.max_tokens = improve.max_tokens =
-# fit.max_pair_tokens = 16384, and validation requires
-# filter.max_total_tokens <= train.max_seq_len <= engine.max_model_len.
-# =============================================================================
-#
-# PREREQUISITE (one-time, CPU+network):
-#   .venv/bin/python scripts/backfill_gold_solutions.py \
-#       --input data/cliff_sets/openr1_qwen3-4b-2507_n2000.jsonl
-#
-# Run:
-#   bash scripts/run.sh -c configs/methods/bridge_sft.yaml -g 0,1 -b
-#
-# Ablations (fresh run dir each launch):
-#   --override train.sft.region_weights.anchor=0.0        # continuation-only loss
-#   --override anchor.params.signal=topk_kl --override engine.max_logprobs=100
-#   --override anchor.base_selection=random               # G4 ablation
+# Paired control arm (= S1, today's loss, same data and operator):
+#   --override train.sft.cliff.enabled=false
 
-#
-# OBJECTIVE ARMS (L3 decision experiment — docs/objective_decision_20260823.md §3/§4/§8;
-# every arm = fresh run dir; cliff-on arms need always_score for the guard refs):
-#   S1  (status quo)   no overrides — cliff.enabled=false
-#   S1' (legacy share) --override train.sft.cliff.enabled=true \
-#                      --override train.sft.cliff.rho=0.06 \
-#                      --override filter.selection.always_score=true
-#   S3(rho)            S1' with train.sft.cliff.rho=0.1 | 0.3
-#   S3-tok             S3(0.3) + --override train.sft.cliff.per_question_norm=false
-#   S4-v0 (zero-code)  S3(rho*) + --override train.sft.cliff.negative.mode=v0 \
-#                      --override train.objective=sft+dpo \
-#                      --override train.dpo.rejected_selection=modal_wrong
-#   S4-v1 (in-SFT)     S3(rho*) + --override train.sft.cliff.negative.mode=v1 \
-#                      --override train.sft.cliff.negative.mu=0.1
-#
 run:
-  name: ei_openr1_staged_bridge_sft
+  name: l5_staged_dpo_s3
   output_root: runs
   seed: 17
   wandb:
@@ -92,17 +46,31 @@ run:
 model:
   base: Qwen/Qwen3-4B-Instruct-2507
   dtype: bfloat16
+  # A NO-OP for this base and pinned deliberately: Qwen3-4B-Instruct-2507 is a
+  # non-thinking model whose chat template has no `enable_thinking` variable and
+  # no <think> tag, so token ids are byte-identical with or without it (checked).
+  # It is load-bearing the moment model.base becomes a HYBRID model (Qwen3-4B,
+  # -8B, -14B), where the same flag flips the template into thinking mode — and
+  # configs/bench_eval.yaml already sets it, so pinning it here keeps the
+  # in-loop benchmark canaries and the standalone headline eval on the same
+  # prompt for every base we might swap in.
+  chat_template_kwargs: {enable_thinking: false}
 
 engine:
   gpus: null
   tensor_parallel: 1
-  gpu_memory_utilization: 0.90
+  gpu_memory_utilization: 0.95   # srun owns these GPUs outright; the
+                              # score path still drops to 0.80 below
   max_model_len: 20480        # >= train.max_seq_len
   enable_lora: true           # LoRA operators serve q_phi via per-request adapters
-  max_loras: 24               # adapters vLLM keeps co-resident per rollout batch.
-                              # Must cover the shard count when chunking (2000
-                              # cliffs / chunk 100 = 20 adapters); beyond it vLLM
-                              # swaps adapters in and out (correct, slower).
+  max_loras: 10               # NOT the shard count. The pool worker groups
+                              # requests by adapter and issues one generate call
+                              # per group (engine.py), so exactly ONE adapter is
+                              # live at a time and vLLM never revisits an evicted
+                              # one; shards are single-adapter by construction.
+                              # 80 slots reserved ~4.9 GB of KV cache (63 MB per
+                              # rank-16 adapter) for nothing, and KV is what caps
+                              # concurrency in the 16k tail. 10 is headroom.
   max_lora_rank: 16
   max_logprobs: 20            # raise to >= anchor.params.top_k for signal=topk_kl
   score_gpu_memory_utilization: 0.80   # C(y)/anchor scoring pools run at this
@@ -118,14 +86,25 @@ engine:
                               # spike and leaves the KV cache alone.
 
 data:
-  adapter: hf_math
+  # Stratified pass-rate mix (data/sample_mix.py) rather than a random draw from
+  # openr1. Cliffs are 3.6% of the corpus, so the old n_questions: 2000 random
+  # sample carried ~70 of them and spent the rest of the rollout budget where
+  # the operator has nothing to act on. This set over-samples the cliff ~12.6x:
+  # 8,000 questions, 45.5% at c=0/16 under the base policy. y* already rides in
+  # meta.gold_solution, so include_solution has no analogue here.
+  adapter: local_jsonl
   adapter_args:
-    preset: openr1
-    n_questions: 2000
-    seed: 17
-    include_solution: true    # y* -> meta.gold_solution (privileged machinery only)
+    path: data/mixes/openr1_mix6k_qwen3-4b-2507.jsonl
   question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
-  eval_holdout: 200
+  # No random split: the eval holdout is the 300 cliffs sample_mix.py reserved
+  # OUT of the mix. A proportional 200-question split would carry ~91 cliffs,
+  # and cliff rescue is the endpoint — a paired power simulation puts 300 at 92%
+  # for a +3pp effect (eval.passk.k: 16 below), against 42-54% at 200. The two
+  # sets are exchangeable by construction (62.7% vs 63.7% openr1-`default`), so
+  # the contrast is method effect, not source quality. Overlap with the train
+  # set is a hard error at run start.
+  eval_holdout: 0
+  holdout_path: data/mixes/openr1_mix8k_qwen3-4b-2507_cliff_holdout.jsonl
   accumulate: true
 
 rollout:
@@ -144,8 +123,11 @@ anchor:                       # ---- axis 1: WHERE improvement starts ----
   policy: none                # staged spec: NO anchor — bridges use the plain
                               # "write your own complete solution" variant and
                               # rollouts start from the bare question prompt
-  base_selection: min_mean_nll   # same as every other main arm and the toy runs
-                              # (policy=none: only picks base_sample_idx)
+  base_selection: first_failed   # NOT min_mean_nll: with policy=none the pick
+                              # only stamps base_sample_idx onto ids, but
+                              # min_mean_nll pays a full vLLM score pass over
+                              # every failed rollout for it — MEASURED 763s per
+                              # iteration on 500 questions, ~3.4h at 8k.
 
 improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
   operator: staged_bridge_sft # lora_sft | bridge_sft | staged_bridge_sft | self_resample
@@ -309,11 +291,12 @@ improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
                               # chains from its own stage-1 adapter, just shrinking
                               # as they convert; smaller = sub-split. 0 after a
                               # sharded stage 1 is rejected unless chain_adapter is
-                              # false. ~2000 cliffs / 100 = 20 shards, ~290 pairs
-                              # each, 40 fits (+~33 min of adapter loads).
-                              # 25 (5 shards of the ~90-question unsolved set) is
-                              # under evaluation in the toy sweep — left at 0
-                              # here until that arm reports.
+                              # false. On the 8k mix: ~4,900 cliffs / 100 = ~49
+                              # shards, ~290 pairs each, ~98 fits (+~80 min of
+                              # adapter loads). That is 2.4x the 2000-question
+                              # estimate this preset was written against — see
+                              # the fit-time table under improve.lora_sft before
+                              # launching, and keep engine.max_loras >= 49.
       final_rollout_n: 16
       final_rollout_scope: unsolved    # unsolved | all
       emit: all               # all (should be pair with final_rollout_scope: all) | final_only (which pool rounds reach filters)
@@ -453,10 +436,21 @@ train:
     # and any train.* change invalidates ALL .done markers of an existing run
     # dir (global config hash) — launch arms into FRESH run dirs (run.sh does).
     cliff:
-      enabled: false
-      rho: 0.1                # per-step share of the cliff bracket, (0,1)
+      enabled: true     # L5: the objective is ON (arm S3)
+      rho: 0.3                # per-step share of the cliff bracket, (0,1)
       per_question_norm: true # false = S3-tok ablation (token-normalized L_C)
-      m_per_batch: 1          # cliff rows per 32-example global batch window
+      m_per_batch: auto       # cliff rows per 32-example global batch window.
+                              # NOT 1: an epoch is sized by the SOLVED pool
+                              # (n_win = n_solved // fill), so a fixed value
+                              # decides coverage by accident. L3's ratio (118
+                              # improved rows / 173 windows) over-sampled at 1,
+                              # but this mix over-samples cliffs ~12x and at 1 a
+                              # 6k run would train on only ~24% of its rescue
+                              # trajectories per epoch (measured 4% on a
+                              # 300-question smoke). auto solves for the
+                              # smallest m_C that shows every improved row once
+                              # — and returns 1 at L3-like ratios, so the
+                              # validated setting is untouched there.
       negative:
         mode: "off"           # off | v0 (sft+dpo + modal_wrong rejected) | v1 (unlikelihood)
         mu: 0.1
@@ -467,14 +461,39 @@ train:
         enabled: true         # displacement hinge vs the C(y) pass's s_mean
 
 loop:
-  iterations: 4
+  iterations: 3
 
 eval:
-  greedy_pass1: true
-  passk: {k: 8, temperature: 0.7, top_p: 0.95}
-  max_tokens: 8192
+  # TRACKING ONLY — the headline is NOT measured here. Per docs/L5_protocol_20260829.md
+  # the paper's cliff numbers come from a post-hoc `scripts/cliff_reroll.py
+  # --qids-file holdout --n 32` on the FINAL checkpoint (plus one base floor
+  # shared by every arm), which is the L3 measurement path and runs at
+  # rollout.max_tokens. This in-loop pass exists to draw the per-iteration
+  # curve, so it is deliberately cheap: greedy off, k=4.
+  greedy_pass1: false
+  # k=16, not the usual 8: the holdout is 300 cliffs rather than a 200-question
+  # proportional split, and k is what buys the per-question precision that keeps
+  # the smaller set at 92% power (79% at k=8). Cost is unchanged — 300x16 vs the
+  # old 200x8 plus a proportional split's dead weight.
+  passk: {k: 4, temperature: 0.7, top_p: 0.95}
+  max_tokens: 16384         # match rollout: 14.6% of correct samples
+                            # exceed 8192 (measured), and censoring them
+                            # penalises whichever arm reasons longest
   # Regression canaries on the trained checkpoint.
   benchmark_verifier: math_strict
+  # Regression canaries on the trained checkpoint — NOT the paper's benchmark
+  # numbers (those come from scripts/eval_bench.sh at n=64 on the final ckpt,
+  # docs/L5_protocol_20260829.md §3). Their job is only to show that learning
+  # cliffs hard does not break general math.
+  #
+  # n differs by design: aime24 has 30 questions to math500_hard's 134, so the
+  # smaller set buys its precision with more samples. Both run at 16384 —
+  # math500_hard used to be capped at 8192 and MEASURED 6.5% -> 8.8% truncation
+  # across iterations, which censors exactly the arms that reason longest and
+  # drifts as the policy does.
+  benchmark_every: 2          # every other iteration: a canary needs a trend,
+                              # not a reading per step (~25 min saved per arm,
+                              # measured 1424-1497s per benchmark_eval)
   benchmarks:
     - {name: aime24, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
-    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 8192}
+    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

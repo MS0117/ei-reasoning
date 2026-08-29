@@ -34,6 +34,7 @@ every code path above is byte-identical to the legacy loss.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import random
@@ -150,6 +151,8 @@ class StratifiedWindowSampler(torch.utils.data.Sampler):
             print("[train] WARNING: cliff term enabled but no improved rows — "
                   "windows degrade to solved-only, loss = (1-rho)*L_S")
             m_c = 0
+        elif m_c == "auto":
+            m_c = self._auto_m_c(len(solved_idx), len(cliff_idx), window, m_n)
         self.solved_idx = list(solved_idx)
         self.cliff_idx = list(cliff_idx)
         self.neg_idx_by_qid = {q: list(v) for q, v in neg_idx_by_qid.items()}
@@ -182,6 +185,42 @@ class StratifiedWindowSampler(torch.utils.data.Sampler):
                 f"cannot fill one {fill}-slot window (global_batch_size={window}, "
                 f"m_c={m_c}, m_n={m_n}) and there are no cliff rows to fill from"
             )
+
+    @staticmethod
+    def _auto_m_c(n_solved: int, n_cliff: int, window: int, m_n: int) -> int:
+        """Smallest cliff-rows-per-window that shows EVERY improved row at least
+        once per epoch.
+
+        An epoch is sized by the SOLVED pool (n_win = n_solved // fill), so the
+        number of cliff DRAWS is n_win * m_C — independent of how many improved
+        rows exist. Whether that over- or under-samples them is therefore an
+        accident of the solved:cliff ratio, and the L5 mixes sit on the opposite
+        side of it from L3 (which had 118 improved rows against 173 windows).
+        Solving for m_C restores the intent: every rescue trajectory the
+        operator paid to produce enters training, and per_question_norm — inert
+        at m_C=1, where its 1/n_q cancels against the window denominator —
+        starts equalising questions again.
+
+        fill shrinks as m_C grows, so n_win moves too; scan rather than divide.
+        At least one fill slot is kept: a window of pure cliff rows would leave
+        L_S with no data.
+        """
+        if n_cliff <= 0:
+            return 0
+        hi = max(1, window - m_n - 1)
+        for m in range(1, hi + 1):
+            fill = window - m - m_n
+            n_win = n_solved // fill if fill > 0 else 0
+            if n_win * m >= n_cliff:
+                return m
+        return hi
+
+    def cliff_coverage(self) -> float:
+        """Fraction of improved rows the epoch actually draws (cycled order, so
+        draws beyond the pool are a second pass, not a re-roll)."""
+        if not self.cliff_idx:
+            return 0.0
+        return min(1.0, self.n_win * self.m_c / len(self.cliff_idx))
 
     def set_epoch(self, epoch: int) -> None:   # reached via DataLoaderShard.set_epoch
         self.epoch = epoch
@@ -487,13 +526,14 @@ def run_sft(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path
         n_neg_rows = sum(len(v) for v in neg_idx_by_qid.values())
         print(
             f"[train] cliff objective on: rho={cliff.rho} mu={cliff.negative.mu} "
-            f"m_c={sampler.m_c} m_n={sampler.m_n} per_question_norm={cliff.per_question_norm} "
+            f"m_c={sampler.m_c}(cliff coverage {sampler.cliff_coverage():.0%}) "
+            f"m_n={sampler.m_n} per_question_norm={cliff.per_question_norm} "
             f"guard={cliff.guard.enabled} | rows solved={len(solved_idx)} "
             f"cliff={len(cliff_pairs)} negative={n_neg_rows} | "
             f"{sampler.n_win} windows/epoch, {sampler.n_solved_dropped} solved rows dropped per epoch"
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(init_path)
+    tokenizer = _load_tokenizer(init_path)
     model = AutoModelForCausalLM.from_pretrained(
         init_path,
         torch_dtype=torch.bfloat16 if sft.bf16 else None,
@@ -541,6 +581,17 @@ def run_sft(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path
     )
     trainer.train()
     _save_and_check(trainer, tokenizer, out_dir)
+    # objective=sft+dpo continues in THIS process: run_dpo then loads a policy
+    # AND a reference model on top of whatever is still resident. The SFT
+    # DeepSpeed engine (params + grads + optimizer shards) outlives function
+    # scope because Trainer <-> CallbackHandler is a reference cycle, so a
+    # refcount drop is not enough — break it explicitly and hand the caching
+    # allocator's blocks back before returning.
+    trainer.accelerator.free_memory()
+    del trainer, model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def run_dpo(
@@ -563,7 +614,7 @@ def run_dpo(
     from trl import DPOConfig, DPOTrainer
 
     dpo = cfg.train.dpo
-    tokenizer = AutoTokenizer.from_pretrained(init_path)
+    tokenizer = _load_tokenizer(init_path)
     ds = Dataset.from_list([
         {
             "prompt": tokenizer.decode(r["prompt_token_ids"]),
@@ -575,6 +626,23 @@ def run_dpo(
     model = AutoModelForCausalLM.from_pretrained(
         init_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"
     )
+    # With precompute on we supply the reference ourselves, loaded AND PLACED,
+    # because trl's precompute pass runs inside DPOTrainer.__init__ — before the
+    # DeepSpeed engine exists. Passing ref_model=None there makes trl fall back
+    # to self.model, which under DeepSpeed is still on the CPU at that point and
+    # under ZeRO-3 is partitioned with no gather hooks, i.e. silently wrong.
+    # After __init__ the reference is dead weight (the loss reads cached logps),
+    # so we drop it before training starts. With precompute off we hand trl None
+    # and it builds/prepares the reference itself, as before.
+    ref_model = None
+    if dpo.precompute_ref_log_probs:
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            init_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"
+        ).eval()
+        ref_model.to(torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0"))))
+    grad_ckpt = dpo.gradient_checkpointing
+    if grad_ckpt:
+        model.config.use_cache = False
     world = int(os.environ.get("WORLD_SIZE", "1"))
     dargs = DPOConfig(
         output_dir=str(out_dir / "trainer_state_dpo"),
@@ -585,19 +653,75 @@ def run_dpo(
         beta=dpo.beta,
         loss_type=dpo.loss_type,
         max_grad_norm=dpo.max_grad_norm,
-        max_length=cfg.train.max_seq_len,
+        max_length=dpo.max_length or cfg.train.max_seq_len,
         bf16=True,
+        gradient_checkpointing=grad_ckpt,
+        # Precompute the reference log-probs ONCE up front, then train with the
+        # policy forward only. This is exact — the reference is the frozen SFT
+        # checkpoint, so its logps cannot change — and it is what makes DPO fit:
+        # measured 2026-08-27 on the S4-v0 arm, a training step costs ~4.4 MB of
+        # logits/softmax buffers per token of the longer side of a pair (152k
+        # vocab, chosen+rejected, .contiguous() copies, fp32 log_softmax), and
+        # running policy AND reference together doubled that into an OOM at
+        # 76 GiB on an 80 GB A100 while only 33.7 GiB was resident.
+        precompute_ref_log_probs=dpo.precompute_ref_log_probs,
+        precompute_ref_batch_size=1,
+        # use_reentrant=False is REQUIRED, not cosmetic: with the reentrant
+        # autograd checkpoint the recompute is skipped whenever the block's
+        # inputs do not require grad, so checkpointing silently no-ops and the
+        # full activation stack is kept (2026-08-27: enabling checkpointing
+        # moved the S4-v0 DPO peak by 0.06 of 74.6 GiB).
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=dpo.logging_steps,
         save_strategy="no",
         report_to=_report_to(cfg),
         run_name=f"{cfg.run.name}/iter{args.iteration}/dpo",
         seed=cfg.run.seed,
     )
-    trainer = DPOTrainer(model=model, args=dargs, train_dataset=ds, processing_class=tokenizer)
+    trainer = DPOTrainer(model=model, ref_model=ref_model, args=dargs,
+                         train_dataset=ds, processing_class=tokenizer)
+    if dpo.precompute_ref_log_probs:
+        trainer.ref_model = None      # logps are cached; release the ~8 GB copy
+        del ref_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    trainer.add_callback(_DpoMemoryProbe())
     trainer.train()
     _save_and_check(trainer, tokenizer, out_dir)
     return True
 
+
+def _trainer_callback_base():
+    from transformers import TrainerCallback
+    return TrainerCallback
+
+
+class _DpoMemoryProbe(_trainer_callback_base()):
+    """Reports what actually occupies the GPU during DPO.
+
+    DPO is the memory-critical phase (policy + reference, both forwards over
+    chosen AND rejected, logits at a 152k vocab) and it OOMs in ways that are
+    easy to misdiagnose — checkpointing that silently no-ops looks exactly like
+    checkpointing that is on but insufficient. Print the two facts that tell
+    them apart: whether checkpointing is live on the prepared model, and the
+    allocated bytes before any activation is built."""
+
+    def _log(self, tag, model):
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+        inner = getattr(model, "module", model)
+        print(f"[train] dpo/{tag}: grad_ckpt={getattr(inner, 'is_gradient_checkpointing', '?')} "
+              f"alloc={torch.cuda.memory_allocated() / 2**30:.1f} GiB "
+              f"peak={torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+
+    def on_train_begin(self, args, state, control, model=None, **kw):
+        self._log("train_begin", model)
+
+    def on_step_end(self, args, state, control, model=None, **kw):
+        if state.global_step <= 2:
+            self._log(f"step{state.global_step}", model)
+        torch.cuda.reset_peak_memory_stats()
 
 # ---------------------------------------------------------------------------
 
@@ -625,11 +749,44 @@ def _save_and_check(trainer, tokenizer, out_dir: Path) -> None:
     """One final full-weights save, valid under all backends: the accelerate/DS
     configs set ZeRO-3 gather-on-save and FSDP FULL_STATE_DICT, so save_model
     always lands a complete HF checkpoint that vLLM can load."""
-    trainer.save_model(str(out_dir))
+    # Tokenizer FIRST: it is kilobytes, the weights are ~9 GB of NFS write. If
+    # the job dies mid-save, a dir with weights but no tokenizer is the
+    # dangerous state (see _load_tokenizer) — a dir with a tokenizer but no
+    # weights fails loudly on the next load.
     if trainer.is_world_process_zero():
         tokenizer.save_pretrained(str(out_dir))
+    trainer.save_model(str(out_dir))
+    if trainer.is_world_process_zero():
         n_shards, total = _check_checkpoint(out_dir)
         print(f"[train] saved checkpoint: {n_shards} shard(s), {total / 1e9:.2f} GB -> {out_dir}")
+    # Barrier: only rank 0 writes the weights, and on NFS an 8-9 GB safetensors
+    # takes ~90 s. Without this the objective=sft+dpo path races — the other
+    # ranks return from save_model and enter run_dpo, which loads this very
+    # directory, before the file exists ("no file named model.safetensors",
+    # observed 2026-08-27 on a 2-GPU zero2 S4-v0 arm).
+    trainer.accelerator.wait_for_everyone()
+
+
+def _load_tokenizer(path: str):
+    """Load a tokenizer that is actually the model's tokenizer.
+
+    transformers 5.x does NOT raise when a local dir holds model files but no
+    tokenizer files: it builds an EMPTY tokenizer from config.json's
+    `tokenizer_class` (vocab_size 1, `decode()` returns ""). On 2026-08-27 that
+    silent fallback made a DPO phase train on blank prompt/chosen/rejected text
+    for a full epoch and then overwrite the SFT checkpoint with the result —
+    no error until an unrelated stage tripped over the missing chat template.
+    Never trust the fallback; fail here instead."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(path)
+    if tok.vocab_size < 1000 or tok.chat_template is None:
+        raise RuntimeError(
+            f"degenerate tokenizer from {path}: vocab_size={tok.vocab_size}, "
+            f"chat_template={'set' if tok.chat_template else 'MISSING'} — the dir is "
+            "missing its tokenizer files and transformers fell back to an empty "
+            "tokenizer. Re-save the checkpoint; do not train against this."
+        )
+    return tok
 
 
 def _check_checkpoint(out_dir: Path) -> tuple[int, int]:
@@ -642,11 +799,23 @@ def _check_checkpoint(out_dir: Path) -> tuple[int, int]:
             f"checkpoint at {out_dir} looks empty ({total} bytes) — "
             "sharded save without gather? Check backend save flags."
         )
+    # A checkpoint without its tokenizer is silently loadable and silently
+    # wrong (see _load_tokenizer), so treat it as an incomplete save.
+    _load_tokenizer(str(out_dir))
     return len(shards), total
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = stage_argparser("EI train stage (run under `accelerate launch`)").parse_args(argv)
+    parser = stage_argparser("EI train stage (run under `accelerate launch`)")
+    # Resume helper for objective=sft+dpo, whose two phases are ~3 h apart: if
+    # DPO dies, --phase dpo re-runs it against the SFT checkpoint already on
+    # disk. A CLI flag, NOT a config field, on purpose — Config.hash() covers
+    # every field, so a new one would invalidate the .done marker of every
+    # stage in every existing run dir (and --override cannot help either:
+    # freeze_run_config rejects any hash that differs from the run snapshot).
+    parser.add_argument("--phase", choices=["all", "sft", "dpo"], default="all",
+                        help="run only one phase of objective=sft+dpo (default: all)")
+    args = parser.parse_args(argv)
     cfg = load_stage_config(args)
     it_dir = iter_dir(args.run_dir, args.iteration)
     out_dir = it_dir / "ckpt"
@@ -658,16 +827,22 @@ def main(argv: list[str] | None = None) -> None:
     # --model-path here is the INITIALIZATION checkpoint (loop.py resolves
     # base-vs-last); inference stages resolve the current policy separately.
     objective = cfg.train.objective
-    if objective in ("sft", "sft+dpo"):
+    if args.phase != "all" and objective != "sft+dpo":
+        raise SystemExit(f"--phase {args.phase} needs train.objective=sft+dpo, got {objective!r}")
+    if objective in ("sft", "sft+dpo") and args.phase in ("all", "sft"):
         run_sft(cfg, args, it_dir / "dataset" / "train_sft.jsonl", args.model_path, out_dir)
-    if objective in ("dpo", "sft+dpo"):
+    if objective in ("dpo", "sft+dpo") and args.phase in ("all", "dpo"):
         dpo_init = str(out_dir) if objective == "sft+dpo" else args.model_path
+        if args.phase == "dpo":
+            # resuming: the SFT phase must have left a complete checkpoint
+            _check_checkpoint(out_dir)
         run_dpo(
             cfg, args, it_dir / "dataset" / "train_dpo.jsonl", dpo_init, out_dir,
             allow_empty=objective == "sft+dpo",
         )
 
-    if int(os.environ.get("RANK", "0")) == 0:
+    # --phase sft leaves the objective half-done, so it must NOT be marked.
+    if args.phase != "sft" and int(os.environ.get("RANK", "0")) == 0:
         _check_checkpoint(out_dir)
         mark_done(done_key, count=1, config_hash=cfg.hash())
 

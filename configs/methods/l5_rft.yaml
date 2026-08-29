@@ -1,0 +1,148 @@
+# L5 BASELINE: RFT / ReST-EM — rejection-sampling fine-tuning, solved-only.
+#
+# The named baseline of the main table. Per iteration: sample n=8 from the
+# current policy, keep the verifier-correct trajectories, SFT on them, repeat.
+# NO improvement operator: cliffs (all 8 rollouts wrong) contribute nothing,
+# which is exactly the failure mode this paper is about. Looped, this is
+# ReST-EM (Singh et al. 2023); at iteration 0 it is identical to the L3 arm S0
+# (docs/L3_results_20260826.md) — cliff questions produce no solved rows by
+# construction, so "solved only" already means "no cliff data".
+#
+#   bash scripts/run.sh -c configs/methods/l5_rft.yaml -b
+#
+# MATCHED to configs/methods/l5_staged_dpo_s3.yaml, knob for knob:
+#   data / holdout        the same 8k mix and the same 300-cliff holdout file
+#   rollout.n             8
+#   solved_keep_max 4 + solved_selection shortest   the shared substrate; this
+#                         is the cap that must be identical across every arm
+#   train.*               same lr/epochs/batch/backend/max_seq_len/init_from
+#   loop.iterations       3
+#   eval / benchmarks     identical
+# The ONLY differences are (a) no operator and (b) train.sft.cliff.enabled=false.
+#
+# WHAT TO MEASURE HERE (beyond the headline): the brute-force channel. This arm
+# still rescues cliffs by luck — as the policy improves, questions that were
+# cliffs at iteration k are solved at k+1 and enter as ordinary solved rows.
+# partition/stats.json per iteration gives that curve, and it is the answer to
+# "why not just sample more instead of running an operator".
+#
+# Robustness variant (RFT as published keeps DIVERSE correct paths, not the
+# shortest ones — do not let our selection rule quietly weaken the baseline):
+#   --override partition.solved_selection=random
+
+run:
+  name: l5_rft
+  output_root: runs
+  seed: 17
+  wandb:
+    project: ei_reasoning
+    mode: online
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  # A NO-OP for this base and pinned deliberately: Qwen3-4B-Instruct-2507 is a
+  # non-thinking model whose chat template has no `enable_thinking` variable and
+  # no <think> tag, so token ids are byte-identical with or without it (checked).
+  # It is load-bearing the moment model.base becomes a HYBRID model (Qwen3-4B,
+  # -8B, -14B), where the same flag flips the template into thinking mode — and
+  # configs/bench_eval.yaml already sets it, so pinning it here keeps the
+  # in-loop benchmark canaries and the standalone headline eval on the same
+  # prompt for every base we might swap in.
+  chat_template_kwargs: {enable_thinking: false}
+
+engine:
+  gpus: null
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.95   # srun owns these GPUs outright; the
+                              # score path still drops to 0.80 below
+  max_model_len: 20480        # >= train.max_seq_len
+  enable_lora: false          # no operator, so no per-request adapters: leaving
+                              # LoRA on would reserve co-resident adapter slots
+                              # (~63 MB each) off the KV cache for nothing
+  max_logprobs: 20
+  score_gpu_memory_utilization: 0.80
+  score_max_num_batched_tokens: 4096
+
+data:
+  # IDENTICAL to the main arm — same questions, same holdout file. Nothing about
+  # the data may differ or the comparison stops being a comparison.
+  adapter: local_jsonl
+  adapter_args:
+    path: data/mixes/openr1_mix6k_qwen3-4b-2507.jsonl
+  question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  eval_holdout: 0
+  holdout_path: data/mixes/openr1_mix8k_qwen3-4b-2507_cliff_holdout.jsonl
+  accumulate: true
+
+rollout:
+  n: 8
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+
+partition:
+  verifier: math
+  solved_keep_max: 4          # MATCHED to the main arm. Do not tune per arm.
+  solved_selection: shortest
+  cliff_max_correct: 0        # still routed + counted (unsolved.jsonl) so the
+                              # cliff census is comparable across arms; nothing
+                              # downstream consumes it in this arm
+
+anchor:
+  policy: none                # unused (the stage is not in loop.stages)
+
+train:
+  objective: sft
+  init_from: base
+  backend: zero2
+  max_seq_len: 18432
+  sft:
+    lr: 1.0e-5
+    epochs: 2
+    global_batch_size: 32
+    micro_batch_size: 1
+    region_weights:
+      prompt: 0.0
+      anchor: 1.0
+      continuation: 1.0
+      solution: 1.0
+    cliff:
+      enabled: false          # legacy loss: this arm has no cliff rows to weight
+
+loop:
+  iterations: 3
+  # anchor / improve / filters removed: with no operator they would burn the
+  # whole improve budget to produce an empty kept.jsonl. build_dataset treats a
+  # missing kept.jsonl as 0 improved rows.
+  stages: [rollout, partition, build_dataset, train, eval, benchmark_eval]
+
+eval:
+  # TRACKING ONLY — the headline is NOT measured here. Per docs/L5_protocol_20260829.md
+  # the paper's cliff numbers come from a post-hoc `scripts/cliff_reroll.py
+  # --qids-file holdout --n 32` on the FINAL checkpoint (plus one base floor
+  # shared by every arm), which is the L3 measurement path and runs at
+  # rollout.max_tokens. This in-loop pass exists to draw the per-iteration
+  # curve, so it is deliberately cheap: greedy off, k=4.
+  greedy_pass1: false
+  passk: {k: 4, temperature: 0.7, top_p: 0.95}
+  max_tokens: 16384         # match rollout: 14.6% of correct samples
+                            # exceed 8192 (measured), and censoring them
+                            # penalises whichever arm reasons longest
+  benchmark_verifier: math_strict
+  # Regression canaries on the trained checkpoint — NOT the paper's benchmark
+  # numbers (those come from scripts/eval_bench.sh at n=64 on the final ckpt,
+  # docs/L5_protocol_20260829.md §3). Their job is only to show that learning
+  # cliffs hard does not break general math.
+  #
+  # n differs by design: aime24 has 30 questions to math500_hard's 134, so the
+  # smaller set buys its precision with more samples. Both run at 16384 —
+  # math500_hard used to be capped at 8192 and MEASURED 6.5% -> 8.8% truncation
+  # across iterations, which censors exactly the arms that reason longest and
+  # drifts as the policy does.
+  benchmark_every: 2          # every other iteration: a canary needs a trend,
+                              # not a reading per step (~25 min saved per arm,
+                              # measured 1424-1497s per benchmark_eval)
+  benchmarks:
+    - {name: aime24, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

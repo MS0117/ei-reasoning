@@ -411,3 +411,92 @@ def test_sampler_scarce_solved_cliff_fill():
         StratifiedWindowSampler(
             solved_idx=[], cliff_idx=[], neg_idx_by_qid={}, cliff_qids=[],
             window=8, m_c=1, m_n=0, seed=0)
+
+
+def test_negative_rows_eos_ablation_flag(tmp_path):
+    """negative.drop_terminal_eos is the paired ablation leg (spec §1): vLLM
+    already includes the stop token in response_token_ids, so 'not calling
+    ensure_eos' does NOT keep EOS out of the unlikelihood. Default false keeps
+    it (every arm so far); true drops it (measured motivation: keeping it gave
+    +57% mean generation length and 4x truncation on held-out cliffs)."""
+    import expert_iter.build_dataset as bd
+
+    EOS = 99
+    it = tmp_path / "iter_0"
+    (it / "rollout").mkdir(parents=True)
+    (it / "partition").mkdir()
+    RolloutSample.dump_jsonl(it / "rollout" / "rollouts.jsonl", [
+        RolloutSample(qid="q1", sample_idx=0, prompt_text="p", prompt_token_ids=[1, 2],
+                      response_text="r", response_token_ids=[7, 8, EOS], finish_reason="stop"),
+        RolloutSample(qid="q1", sample_idx=1, prompt_text="p", prompt_token_ids=[1, 2],
+                      response_text="r", response_token_ids=[7, 9, EOS, EOS], finish_reason="stop"),
+    ])
+    VerdictRecord.dump_jsonl(it / "partition" / "verdicts.jsonl", [
+        VerdictRecord(qid="q1", sample_idx=0, correct=False, extracted_answer="7"),
+        VerdictRecord(qid="q1", sample_idx=1, correct=False, extracted_answer="7"),
+    ])
+    modal = bd._modal_wrong_failures(it, {"q1"})
+    assert len(modal["q1"]) == 2
+    assert Config.load(None).train.sft.cliff.negative.drop_terminal_eos is False
+    for b in modal["q1"]:
+        raw = list(b.response_token_ids)
+        assert raw[-1] == EOS, "vLLM stop samples carry the stop token"
+        dropped = list(raw)
+        while dropped and dropped[-1] == EOS:
+            dropped.pop()
+        assert EOS not in dropped and dropped, "drop leg removes all trailing EOS, keeps content"
+
+
+# ---------------------------------------------------------------------------
+# m_per_batch: auto
+#
+# An epoch is sized by the SOLVED pool, so a fixed m_C decides how many rescue
+# trajectories are ever seen only by accident. MEASURED: L3 (118 improved rows,
+# 173 windows) over-sampled at m_C=1, while a 6k L5 mix would show ~24% of its
+# rescue rows per epoch and a 300-question smoke 4%.
+# ---------------------------------------------------------------------------
+
+def test_auto_m_c_covers_every_improved_row():
+    from expert_iter.train import StratifiedWindowSampler as S
+
+    for n_solved, n_cliff in ((5366, 118), (526, 61), (1237, 110), (194, 153), (5724, 780)):
+        m = S._auto_m_c(n_solved, n_cliff, window=32, m_n=0)
+        n_win = n_solved // (32 - m)
+        assert n_win * m >= n_cliff, (n_solved, n_cliff, m)
+        if m > 1:                                    # and it is the SMALLEST such m
+            prev_win = n_solved // (32 - (m - 1))
+            assert prev_win * (m - 1) < n_cliff
+
+
+def test_auto_m_c_matches_the_validated_l3_setting():
+    """L3's ratio already over-sampled at m_C=1, so auto must not disturb it."""
+    from expert_iter.train import StratifiedWindowSampler as S
+
+    assert S._auto_m_c(5366, 118, window=32, m_n=0) == 1
+
+
+def test_auto_m_c_keeps_a_fill_slot_and_reports_short_coverage():
+    """A window of pure cliff rows would starve L_S, so m_C is clamped — and
+    then coverage is honestly below 1."""
+    from expert_iter.train import StratifiedWindowSampler as S
+
+    m = S._auto_m_c(n_solved=40, n_cliff=100_000, window=32, m_n=0)
+    assert m == 31                                   # window - m_n - 1
+    sampler = S(solved_idx=list(range(40)), cliff_idx=list(range(100_000)),
+                neg_idx_by_qid={}, cliff_qids=[f"q{i}" for i in range(100_000)],
+                window=32, m_c="auto", m_n=0, seed=1)
+    assert sampler.m_c == 31
+    assert sampler.cliff_coverage() < 1.0
+
+
+def test_auto_m_c_resolves_inside_the_sampler_and_draws_every_row():
+    from expert_iter.train import StratifiedWindowSampler as S
+
+    n_solved, n_cliff = 526, 61
+    sampler = S(solved_idx=list(range(n_solved)),
+                cliff_idx=list(range(10_000, 10_000 + n_cliff)),
+                neg_idx_by_qid={}, cliff_qids=[f"q{i}" for i in range(n_cliff)],
+                window=32, m_c="auto", m_n=0, seed=7)
+    assert sampler.m_c == 4 and sampler.cliff_coverage() == 1.0
+    drawn = [i for i in sampler if i >= 10_000]
+    assert set(drawn) == set(range(10_000, 10_000 + n_cliff))   # every row, no gaps

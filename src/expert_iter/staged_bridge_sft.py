@@ -41,6 +41,7 @@ from .records import ImprovedCandidate
 from .registry import OPERATORS, VERIFIERS, build, register
 from .templates import bridge_pair_ids
 from .utils import stable_seed, write_json, write_jsonl
+from .verifier import last_boxed
 from . import lora_sft as _ls
 
 # stats keys copied from a regen _build_targets call into stats[f"stage{k}_bridge"]
@@ -286,22 +287,30 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                 stats[f"stage{k + 1}_skipped"] = "no_pairs"
                 break
             stages_run = k
-            # ---- objective: NLL on the bridges, or DPO against the adapter's
-            # own failures from the preceding rollout (tag = last_tag) ----------
+            # ---- objective: NLL on the bridges, or DPO / bounded-unlikelihood
+            # against the adapter's own failures from the preceding rollout
+            # (tag = last_tag) --------------------------------------------------
             fit_extra: dict = {}
-            if st.stage2_objective == "dpo":
+            if st.stage2_objective in ("dpo", "ul"):
+                neg_cfg = st.dpo if st.stage2_objective == "dpo" else st.ul
                 pairs_k = _dpo_pairs(
                     pairs_k, pool, neg_stage=last_tag, prompts=prompts,
                     anchors_by_qid=anchors_by_qid, eos=eos, max_pair_tokens=max_pair,
-                    selection=st.dpo.negative_selection,
-                    max_per_question=st.dpo.max_pairs_per_question,
+                    selection=neg_cfg.negative_selection,
+                    max_per_question=neg_cfg.max_pairs_per_question,
                     seed_of=lambda q: stable_seed(cfg.run.seed, "dpo_neg", iteration, q, k),
                     stats=stats, prefix=f"stage{k + 1}",
                 )
-                fit_extra = {"objective": "dpo", "beta": st.dpo.beta,
-                             "sft_weight": st.dpo.sft_weight,
-                             "reference": st.dpo.reference,
-                             "lr": st.dpo.lr if st.dpo.lr is not None else ls.fit.lr}
+                if st.stage2_objective == "dpo":
+                    fit_extra = {"objective": "dpo", "beta": st.dpo.beta,
+                                 "sft_weight": st.dpo.sft_weight,
+                                 "reference": st.dpo.reference,
+                                 "lr": st.dpo.lr if st.dpo.lr is not None else ls.fit.lr}
+                else:
+                    fit_extra = {"objective": "ul", "mu": st.ul.mu,
+                                 "delta": st.ul.delta, "guard": st.ul.guard,
+                                 "reference": st.ul.reference,
+                                 "lr": st.ul.lr if st.ul.lr is not None else ls.fit.lr}
                 if not pairs_k:
                     stats[f"stage{k + 1}_skipped"] = "no_dpo_pairs"
                     break
@@ -445,15 +454,23 @@ def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
                neg_stage: str, prompts, anchors_by_qid, eos: int,
                max_pair_tokens: int, selection: str, max_per_question: int | None,
                seed_of, stats: dict, prefix: str) -> list[dict]:
-    """Turn the stage-2 SFT pairs (chosen = bridges) into DPO pairs whose
-    rejected side is a failure the CURRENT adapter produced in the rollout
-    tagged `neg_stage` — an on-policy negative, free of extra generation.
+    """Turn the stage-2 SFT pairs (chosen = bridges) into preference/negative
+    pairs (chosen_ids/rejected_ids — consumed by lora_fit objective=dpo AND
+    objective=ul) whose rejected side is a failure the CURRENT adapter produced
+    in the rollout tagged `neg_stage` — an on-policy negative, free of extra
+    generation.
 
     One pair per bridge (negatives cycle when fewer than bridges), so the chosen
-    side is identical to the SFT arm and an SFT-vs-DPO comparison isolates the
-    objective. Both sequences are built by templates.bridge_pair_ids, so they
-    share the prompt (+anchor) ids and a single prompt_len. Questions with no
-    negative are dropped (counted), as are pairs over max_pair_tokens."""
+    side is identical to the SFT arm and an SFT-vs-DPO/UL comparison isolates
+    the objective. Both sequences are built by templates.bridge_pair_ids, so
+    they share the prompt (+anchor) ids and a single prompt_len. Questions with
+    no negative are dropped (counted), as are pairs over max_pair_tokens.
+
+    selection="modal" keeps only the failures boxing the question's MODAL wrong
+    answer (exact-string grouping of last_boxed, ties broken by (-count, answer)
+    — the build_dataset._modal_wrong_failures rule applied to the adapter's own
+    failures); questions with no boxed failure fall back to random (counted in
+    stats as {prefix}_neg_modal_fallback)."""
     negs: dict[str, list[ImprovedCandidate]] = defaultdict(list)
     for c in pool:
         if not c.correct and c.op_meta.get("stage") == neg_stage:
@@ -463,13 +480,25 @@ def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
         by_qid[p["qid"]].append(p)
 
     out: list[dict] = []
-    n_no_neg = n_long = 0
+    n_no_neg = n_long = n_modal_fallback = 0
     for qid in sorted(by_qid):
         cands = sorted(negs.get(qid, []), key=lambda c: c.attempt_idx)
         if not cands:
             n_no_neg += 1
             continue
-        if selection == "shortest":
+        if selection == "modal":
+            groups: dict[str, list[ImprovedCandidate]] = defaultdict(list)
+            for c in cands:   # attempt_idx order preserved within each group
+                ans = last_boxed(c.continuation_text or "")
+                if ans is not None:
+                    groups[ans].append(c)
+            if groups:
+                modal_ans = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))[0][0]
+                cands = groups[modal_ans]
+            else:
+                n_modal_fallback += 1
+                random.Random(seed_of(qid)).shuffle(cands)
+        elif selection == "shortest":
             cands.sort(key=lambda c: (len(c.continuation_token_ids), c.attempt_idx))
         elif selection == "longest":
             cands.sort(key=lambda c: (-len(c.continuation_token_ids), c.attempt_idx))
@@ -492,6 +521,8 @@ def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
     stats[f"{prefix}_dpo_pairs"] = len(out)
     stats[f"{prefix}_dpo_no_negative"] = n_no_neg
     stats[f"{prefix}_dpo_dropped_long"] = n_long
+    if selection == "modal":
+        stats[f"{prefix}_neg_modal_fallback"] = n_modal_fallback
     return out
 
 

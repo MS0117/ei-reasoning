@@ -1,0 +1,94 @@
+{
+  "name": "openr1_mix1k_qwen3-4b-2507",
+  "seed": 17,
+  "mix": "0-0=455,1-2=275,3-4=138,5-8=57,9-15=50,16-16=25",
+  "subset_of": "data/mixes/openr1_mix8k_qwen3-4b-2507.jsonl",
+  "n_mix": 1000,
+  "by_source": {
+    "openr1-math-220k_extended_passrate": 258,
+    "openr1-math-220k_default_passrate": 742
+  },
+  "buckets": [
+    {
+      "c_range": [
+        0,
+        0
+      ],
+      "quota": 455,
+      "pool": 3640,
+      "taken": 455,
+      "by_source": {
+        "openr1-math-220k_extended_passrate": 160,
+        "openr1-math-220k_default_passrate": 295
+      },
+      "order": "hash (subset)"
+    },
+    {
+      "c_range": [
+        1,
+        2
+      ],
+      "quota": 275,
+      "pool": 2200,
+      "taken": 275,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 177,
+        "openr1-math-220k_extended_passrate": 98
+      },
+      "order": "hash (subset)"
+    },
+    {
+      "c_range": [
+        3,
+        4
+      ],
+      "quota": 138,
+      "pool": 1100,
+      "taken": 138,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 138
+      },
+      "order": "hash (subset)"
+    },
+    {
+      "c_range": [
+        5,
+        8
+      ],
+      "quota": 57,
+      "pool": 460,
+      "taken": 57,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 57
+      },
+      "order": "hash (subset)"
+    },
+    {
+      "c_range": [
+        9,
+        15
+      ],
+      "quota": 50,
+      "pool": 400,
+      "taken": 50,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 50
+      },
+      "order": "hash (subset)"
+    },
+    {
+      "c_range": [
+        16,
+        16
+      ],
+      "quota": 25,
+      "pool": 200,
+      "taken": 25,
+      "by_source": {
+        "openr1-math-220k_default_passrate": 25
+      },
+      "order": "hash (subset)"
+    }
+  ],
+  "n_with_gold_solution": 1000
+}

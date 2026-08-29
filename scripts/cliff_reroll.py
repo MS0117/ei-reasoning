@@ -8,7 +8,7 @@ which is why it is drawn (twice, independently) before any training arm.
 Usage (GPU; run inside the a100 tmux session):
   .venv/bin/python scripts/cliff_reroll.py --run-dir runs/<frozen L2 run> \
       [--n 32] [--passes 2] [--model-path <default: cfg.model.base>] \
-      [--qids-file cliff_split.json] [--out <run>/iter_0/reroll]
+      [--qids-file holdout|cliff_split.json] [--out <run>/iter_0/reroll]
 
 Writes, per pass i: <out>/pass_{i}/rollouts.jsonl + verdicts.jsonl (+ .done),
 and <out>/summary.json with per-qid correct counts per pass.
@@ -31,7 +31,14 @@ from expert_iter.templates import render_question_prompt
 from expert_iter.utils import is_done, mark_done, stable_seed, write_json, write_jsonl
 
 
-def _load_qids(args, run_dir: Path) -> list[str]:
+def _load_qids(args, run_dir: Path, holdout_qids: list[str]) -> list[str]:
+    if args.qids_file == "holdout":
+        # The L5 headline set: the run's external cliff holdout, never trained
+        # on by any arm. Named rather than pathed so every arm quotes the same
+        # target and the floor is drawn once for all of them.
+        if not holdout_qids:
+            raise SystemExit("[reroll] --qids-file holdout: this run has no holdout questions")
+        return holdout_qids
     if args.qids_file:
         path, _, key = args.qids_file.partition(":")
         d = json.loads(Path(path).read_text())
@@ -58,14 +65,17 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--passes", type=int, default=2)
     ap.add_argument("--model-path", default=None, help="default: cfg.model.base (the floor is the BASE policy)")
-    ap.add_argument("--qids-file", default=None, help="cliff_split.json[:A|B|exclude] or a qid list; default: all unsolved qids")
+    ap.add_argument("--qids-file", default=None,
+                    help="`holdout` (the run's external cliff holdout — the L5 headline set), "
+                         "cliff_split.json[:A|B|exclude], or a qid list; default: all unsolved qids")
     ap.add_argument("--out", default=None)
     ap.add_argument("--list", action="store_true", help="print the qid set and exit (CPU)")
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir)
     cfg = Config.load(run_dir / "config.yaml")
-    qids = _load_qids(args, run_dir)
+    train_questions, holdout_questions = ensure_questions(cfg, run_dir)
+    qids = _load_qids(args, run_dir, [q.qid for q in holdout_questions])
     print(f"[reroll] {len(qids)} cliff questions, n={args.n} x {args.passes} passes")
     if args.list:
         print("\n".join(qids))
@@ -77,11 +87,16 @@ def main(argv: list[str] | None = None) -> None:
     from transformers import AutoTokenizer
     from expert_iter.engine import GenRequest, run_pool
 
-    train_questions, _ = ensure_questions(cfg, run_dir)
-    questions = {q.qid: q for q in train_questions if q.qid in set(qids)}
+    # Both splits: the training cliffs (A/B work) live in train.jsonl, while the
+    # L5 headline holdout lives in holdout.jsonl.
+    pool = {q.qid: q for q in (*train_questions, *holdout_questions)}
+    questions = {qid: pool[qid] for qid in qids if qid in pool}
     missing = [q for q in qids if q not in questions]
     if missing:
-        raise SystemExit(f"[reroll] {len(missing)} qids not in questions/train.jsonl, e.g. {missing[:3]}")
+        raise SystemExit(
+            f"[reroll] {len(missing)} qids in neither questions/train.jsonl nor "
+            f"questions/holdout.jsonl, e.g. {missing[:3]}"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     prompts = {

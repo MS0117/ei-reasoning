@@ -197,3 +197,41 @@ def test_rho_legacy_token_share(tmp_path, capsys):
     rl.main(["--run-dir", str(run)])
     out = capsys.readouterr().out
     assert "rho=0.2000" in out           # 20 / (30+50+20)
+
+
+# ---------------------------------------------------------------------------
+# cliff_reroll target selection
+#
+# The L5 headline is measured on the external cliff holdout, which lives in
+# questions/holdout.jsonl — a set the tool could not previously address.
+# ---------------------------------------------------------------------------
+
+def test_reroll_qids_file_holdout_sentinel(tmp_path):
+    reroll = _load("cliff_reroll")
+
+    class _Args:
+        qids_file = "holdout"
+
+    assert reroll._load_qids(_Args(), tmp_path, ["h1", "h2"]) == ["h1", "h2"]
+
+
+def test_reroll_holdout_sentinel_requires_a_holdout(tmp_path):
+    reroll = _load("cliff_reroll")
+
+    class _Args:
+        qids_file = "holdout"
+
+    with pytest.raises(SystemExit, match="no holdout"):
+        reroll._load_qids(_Args(), tmp_path, [])
+
+
+def test_reroll_qids_file_paths_still_work(tmp_path):
+    """The holdout sentinel must not disturb the existing A/B split usage."""
+    reroll = _load("cliff_reroll")
+    split = tmp_path / "cliff_split.json"
+    write_json(split, {"A": ["a1"], "B": ["b1", "b2"]})
+
+    class _Args:
+        qids_file = f"{split}:B"
+
+    assert reroll._load_qids(_Args(), tmp_path, ["h1"]) == ["b1", "b2"]

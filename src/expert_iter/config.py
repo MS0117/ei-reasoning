@@ -31,7 +31,7 @@ LOOP_STAGES = (
 # run). The operator decides what the transient LoRA is fitted on; the
 # optional post-SFT RL phase is NOT an operator (improve.rl.enabled).
 IMPROVE_OPERATORS = ("self_resample", "lora_sft", "bridge_sft", "staged_bridge_sft",
-                     "teacher")
+                     "gold_text", "teacher")
 
 # anchor.params is a free-form dict, so a key belonging to a DIFFERENT policy
 # would otherwise be read by nobody and leave the active policy silently on its
@@ -274,12 +274,38 @@ class StagedDpoCfg:
                                        # can push both down; this keeps "make chosen
                                        # likely" in the objective. Raise if reward_margin
                                        # climbs while conversion falls.
-    negative_selection: str = "random"  # random | longest | shortest
+    negative_selection: str = "random"  # random | longest | shortest | modal (the
+                                       # failure boxing the stage's modal wrong answer)
     max_pairs_per_question: int | None = None   # null -> one pair per kept bridge, which
                                        # keeps the chosen side identical to the SFT arm
     reference: str = "init"            # init (the fit's starting weights = the adapter
                                        # that produced the negatives) | base (adapter
                                        # disabled). Identical when chain_adapter: false.
+
+
+@dataclass
+class StagedUlCfg:
+    """staged.stage2_objective=ul: NLL(bridge) + mu * bounded unlikelihood on a
+    failure the CURRENT adapter produced in the preceding rollout + displacement
+    guard on the bridge — the outer cliff objective's three terms (train.py
+    L_C + mu*L_N + L_G) without rho/stratification, which are meaningless in a
+    full-batch fit with no solved slice. Aimed at conversion: the transient
+    adapter absorbs uniform unlikelihood's diffusion/length pathologies that
+    disqualified it as a policy objective (L3 S4-v1), and the verifier filters
+    them out of everything the operator emits."""
+
+    mu: float = 0.1                    # weight on the unlikelihood term
+    delta: float = 0.02                # p clamp (u bounded by -log delta), same
+                                       # default as train.sft.cliff.negative.delta
+    guard: bool = True                 # + relu(mean chosen NLL - reference mean
+                                       # chosen NLL) per pair: the negative must
+                                       # not displace the bridge it protects
+    lr: float | None = None            # null -> fit.lr
+    negative_selection: str = "modal"  # modal | random | longest | shortest —
+                                       # modal aims at the adapter's own attractor
+                                       # (measured: random hits it only ~62-69%)
+    max_pairs_per_question: int | None = None   # null -> one pair per kept bridge
+    reference: str = "init"            # guard baseline: init | base (as in dpo)
 
 
 @dataclass
@@ -310,10 +336,11 @@ class StagedCfg:
                                              # longest | shortest (read only when
                                              # train_scope: full_pool)
     train_scope: str = "unsolved_only"       # unsolved_only | full_pool
-    stage2_objective: str = "sft"      # sft | dpo — what the stage-2 fit optimizes.
-                                       # dpo turns the preceding rollout's FAILURES into
-                                       # on-policy negatives (see StagedDpoCfg).
+    stage2_objective: str = "sft"      # sft | dpo | ul — what the stage-2 fit optimizes.
+                                       # dpo/ul turn the preceding rollout's FAILURES into
+                                       # on-policy negatives (see StagedDpoCfg/StagedUlCfg).
     dpo: StagedDpoCfg = field(default_factory=StagedDpoCfg)
+    ul: StagedUlCfg = field(default_factory=StagedUlCfg)
     stage2_steps: int = 2              # full-batch gradient steps per stage-2 fit
     stage1_chunk_size: int = 0         # 0 = ONE stage-1 adapter (pooled); N = one
                                        # adapter per N questions of the stage-1 fit
@@ -599,6 +626,15 @@ class NegativeTermCfg:
     m_per_batch: int = 1               # negative rows per global batch window (v1)
     max_per_question: int = 8          # cap on modal-wrong failures kept per cliff
     delta: float = 0.02                # unlikelihood clamp: p <= 1 - delta
+    # Drop the trailing EOS from negative completions before the unlikelihood.
+    # DEFAULT false = keep it, which is the documented decision of
+    # docs/objective_loss_spec_20260825.md §1 (the attractor is the whole
+    # "confidently write and stop" behaviour, so termination is part of the
+    # commitment) AND the behaviour of every arm run so far.
+    # true is the paired ablation leg: with EOS kept, S4-v1 measured +57% mean
+    # generation length, p90 at the max_tokens cap and 4x truncation on held-out
+    # cliffs (2026-08-27) — the risk that section flagged, now materialised.
+    drop_terminal_eos: bool = False
 
 
 @dataclass
@@ -628,7 +664,17 @@ class CliffTermCfg:
     enabled: bool = False
     rho: float = 0.1                   # per-step share of the cliff bracket, (0,1)
     per_question_norm: bool = True     # false -> S3-tok
-    m_per_batch: int = 1               # cliff rows per global batch window (m_C)
+    # Cliff rows per global batch window (m_C), or "auto".
+    #
+    # The sampler sizes an epoch by the SOLVED pool (n_win = n_solved // fill),
+    # so a fixed m_C decides coverage only by accident. MEASURED: L3 had 118
+    # improved rows against 173 windows -> every row seen 1.47x, but the L5
+    # mixes over-sample cliffs ~12x, and at m_C=1 a 6k run would show only ~24%
+    # of its rescue trajectories per epoch (a 300-question smoke: 4%).
+    # "auto" picks the smallest m_C whose n_win * m_C covers every improved row
+    # once — self-adjusting per iteration and per arm, and it resolves to 1 at
+    # L3-like ratios, so the validated setting is unchanged there.
+    m_per_batch: int | str = 1
     negative: NegativeTermCfg = field(default_factory=NegativeTermCfg)
     guard: GuardCfg = field(default_factory=GuardCfg)
 
@@ -671,6 +717,18 @@ class DpoCfg:
     # modal_wrong = the rollout carrying the question's modal wrong answer
     # (the attractor) — the S4-v0 negative arm.
     rejected_selection: str = "base_pick"   # base_pick | modal_wrong
+    # --- memory. DPO is the memory-critical objective: it runs a policy AND a
+    # reference forward over BOTH sides of every pair, and at a 152k vocab the
+    # logits/softmax buffers cost ~4.4 MB per token of the longer side. Measured
+    # 2026-08-27 on the S4-v0 arm (Qwen3-4B, 2x80 GB, zero2): the defaults below
+    # peak at ~70 GiB, turning either of them off OOMs on ordinary 5-6k pairs.
+    gradient_checkpointing: bool = True
+    # Compute the reference log-probs once up front, then train with the policy
+    # forward only. EXACT (the reference is the frozen SFT checkpoint, so its
+    # logps cannot change), and roughly halves the per-step transient.
+    precompute_ref_log_probs: bool = True
+    max_length: int | None = None      # null -> train.max_seq_len. Lower it only
+                                       # to fit; trl truncates whole pairs.
 
 
 @dataclass
@@ -964,10 +1022,10 @@ class Config:
                 "several stage-1 shard adapters — set stage2_chunk_size to match "
                 "stage1_chunk_size, or chain_adapter: false"
             )
-        if st.stage2_objective not in ("sft", "dpo"):
+        if st.stage2_objective not in ("sft", "dpo", "ul"):
             raise ValueError(
                 f"improve.lora_sft.staged.stage2_objective: {st.stage2_objective!r} "
-                "(sft | dpo)"
+                "(sft | dpo | ul)"
             )
         dpo = st.dpo
         if dpo.beta <= 0:
@@ -976,7 +1034,7 @@ class Config:
             raise ValueError("improve.lora_sft.staged.dpo.lr must be > 0 or null")
         if dpo.sft_weight < 0:
             raise ValueError("improve.lora_sft.staged.dpo.sft_weight must be >= 0")
-        if dpo.negative_selection not in ("random", "longest", "shortest"):
+        if dpo.negative_selection not in ("random", "longest", "shortest", "modal"):
             raise ValueError(
                 f"improve.lora_sft.staged.dpo.negative_selection: {dpo.negative_selection!r}"
             )
@@ -986,6 +1044,23 @@ class Config:
             )
         if dpo.reference not in ("init", "base"):
             raise ValueError(f"improve.lora_sft.staged.dpo.reference: {dpo.reference!r}")
+        ul = st.ul
+        if ul.mu < 0:
+            raise ValueError("improve.lora_sft.staged.ul.mu must be >= 0")
+        if not (0.0 < ul.delta < 1.0):
+            raise ValueError("improve.lora_sft.staged.ul.delta must be in (0, 1)")
+        if ul.lr is not None and ul.lr <= 0:
+            raise ValueError("improve.lora_sft.staged.ul.lr must be > 0 or null")
+        if ul.negative_selection not in ("random", "longest", "shortest", "modal"):
+            raise ValueError(
+                f"improve.lora_sft.staged.ul.negative_selection: {ul.negative_selection!r}"
+            )
+        if ul.max_pairs_per_question is not None and ul.max_pairs_per_question < 1:
+            raise ValueError(
+                "improve.lora_sft.staged.ul.max_pairs_per_question must be >= 1 or null"
+            )
+        if ul.reference not in ("init", "base"):
+            raise ValueError(f"improve.lora_sft.staged.ul.reference: {ul.reference!r}")
         if st.unsolved_targets not in ("reuse_bridge", "regen_bridge", "add_bridge"):
             raise ValueError(f"improve.lora_sft.staged.unsolved_targets: {st.unsolved_targets!r}")
         if st.stage_bridge_n is not None and st.stage_bridge_n < 1:
@@ -1202,6 +1277,11 @@ class Config:
             raise ValueError(
                 f"train.dpo.rejected_selection: {t.dpo.rejected_selection!r} (base_pick | modal_wrong)"
             )
+        if t.dpo.max_length is not None and not 0 < t.dpo.max_length <= t.max_seq_len:
+            raise ValueError(
+                f"train.dpo.max_length={t.dpo.max_length} must be in (0, train.max_seq_len="
+                f"{t.max_seq_len}] or null (= train.max_seq_len)"
+            )
         if cl.negative.mode != "off" and not cl.enabled:
             raise ValueError(
                 "train.sft.cliff.negative.mode != off requires train.sft.cliff.enabled "
@@ -1210,8 +1290,9 @@ class Config:
         if cl.enabled:
             if not 0 < cl.rho < 1:
                 raise ValueError("train.sft.cliff.rho must be in (0, 1)")
-            if cl.m_per_batch < 1:
-                raise ValueError("train.sft.cliff.m_per_batch must be >= 1")
+            if cl.m_per_batch != "auto" and (
+                    not isinstance(cl.m_per_batch, int) or cl.m_per_batch < 1):
+                raise ValueError('train.sft.cliff.m_per_batch must be >= 1 or "auto"')
             neg = cl.negative
             if neg.mu < 0:
                 raise ValueError("train.sft.cliff.negative.mu must be >= 0")
@@ -1219,7 +1300,10 @@ class Config:
                 raise ValueError("train.sft.cliff.negative m_per_batch/max_per_question must be >= 1")
             if not 0 < neg.delta < 1:
                 raise ValueError("train.sft.cliff.negative.delta must be in (0, 1)")
-            reserved = cl.m_per_batch + (neg.m_per_batch if neg.mode == "v1" else 0)
+            # "auto" is resolved (and clamped to the same budget) inside the
+            # sampler, where the row counts are known.
+            reserved = ((cl.m_per_batch if cl.m_per_batch != "auto" else 1)
+                        + (neg.m_per_batch if neg.mode == "v1" else 0))
             if reserved > t.sft.global_batch_size // 2:
                 raise ValueError(
                     f"cliff m_per_batch (+negative) reserves {reserved} of the "

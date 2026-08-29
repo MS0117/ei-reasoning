@@ -95,8 +95,17 @@ def to_record(row: dict) -> QuestionRecord:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", action="append", required=True, metavar="PATH",
+    ap.add_argument("--input", action="append", metavar="PATH",
                     help="joined pass-rate table (repeatable, in preference order)")
+    ap.add_argument("--subset-of", metavar="MIX.jsonl",
+                    help="downsample an ALREADY BUILT mix (QuestionRecord JSONL) "
+                         "instead of drawing from pass-rate tables. Buckets come "
+                         "from meta.passrate_c and are taken in the same hash "
+                         "order, so the result is a strict subset of that mix — "
+                         "a toy run then exercises the exact questions the full "
+                         "run will use, and its reserved holdout stays disjoint "
+                         "from both. Ignores --cliff-holdout: reuse the parent "
+                         "mix's holdout file, which is already disjoint.")
     ap.add_argument("--out-dir", default="data/mixes")
     ap.add_argument("--name", default="openr1_mix8k")
     ap.add_argument("--seed", type=int, default=17)
@@ -109,6 +118,11 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     buckets = parse_mix(args.mix)
+    if bool(args.input) == bool(args.subset_of):
+        raise SystemExit("pass exactly one of --input (build) or --subset-of (downsample)")
+
+    if args.subset_of:
+        return _subset(args, buckets)
 
     # Merge in preference order; first file wins a shared qid.
     merged: dict[str, dict] = {}
@@ -195,6 +209,51 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[mix] sources: {dict(src)}")
     print(f"[mix] gold_solution present: {manifest['n_with_gold_solution']}/{len(picked)}")
     print(f"\n  {'c range':<10}{'quota':>7}{'pool':>8}{'taken':>7}   by source")
+    for b in manifest_buckets:
+        lo, hi = b["c_range"]
+        print(f"  {f'{lo}-{hi}':<10}{b['quota']:>7}{b['pool']:>8}{b['taken']:>7}   {b['by_source']}")
+
+
+def _subset(args, buckets) -> None:
+    """Strict subset of an existing mix, same bucket structure, hash order."""
+    parent = list(QuestionRecord.load_jsonl(args.subset_of))
+    if not parent:
+        raise SystemExit(f"{args.subset_of} is empty")
+    missing = [r.qid for r in parent if r.meta.get("passrate_c") is None]
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} records lack meta.passrate_c (e.g. {missing[0]}) — "
+            "--subset-of needs a mix built by this script"
+        )
+
+    picked, manifest_buckets = [], []
+    for lo, hi, quota in buckets:
+        pool = [r for r in parent if lo <= r.meta["passrate_c"] <= hi]
+        ordered = sorted(pool, key=lambda r: stable_hash(args.seed, r.qid))
+        take = ordered[:quota]
+        if len(take) < quota:
+            print(f"[mix] WARNING bucket c={lo}-{hi}: wanted {quota}, "
+                  f"parent has {len(pool)} — taking all")
+        picked.extend(take)
+        manifest_buckets.append({
+            "c_range": [lo, hi], "quota": quota, "pool": len(pool), "taken": len(take),
+            "by_source": dict(Counter(r.meta.get("passrate_source", "?") for r in take)),
+            "order": "hash (subset)",
+        })
+
+    out_dir = Path(args.out_dir)
+    mix_path = out_dir / f"{args.name}.jsonl"
+    QuestionRecord.dump_jsonl(mix_path, picked)
+    src = Counter(r.meta.get("passrate_source", "?") for r in picked)
+    write_json(out_dir / f"{args.name}_manifest.json", {
+        "name": args.name, "seed": args.seed, "mix": args.mix,
+        "subset_of": args.subset_of, "n_mix": len(picked),
+        "by_source": dict(src), "buckets": manifest_buckets,
+        "n_with_gold_solution": sum(1 for r in picked if r.meta.get("gold_solution")),
+    })
+    print(f"\n[mix] wrote {len(picked)} -> {mix_path}  (subset of {args.subset_of})")
+    print(f"[mix] sources: {dict(src)}")
+    print(f"\n  {'c range':<10}{'quota':>7}{'parent':>8}{'taken':>7}   by source")
     for b in manifest_buckets:
         lo, hi = b["c_range"]
         print(f"  {f'{lo}-{hi}':<10}{b['quota']:>7}{b['pool']:>8}{b['taken']:>7}   {b['by_source']}")

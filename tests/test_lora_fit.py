@@ -291,6 +291,139 @@ def test_dpo_rejects_sft_schema(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# objective=ul (staged stage2_objective): NLL(chosen) + mu * bounded
+# unlikelihood(rejected) + displacement guard vs the cached reference
+# ---------------------------------------------------------------------------
+
+
+def _run_ul(tmp_path, out_name, pairs, **overrides):
+    import json as _json
+    from expert_iter import lora_fit
+    from expert_iter.utils import write_jsonl
+
+    base = tmp_path / "base"
+    if not base.exists():
+        _tiny_base(tmp_path)
+    pairs_path = tmp_path / f"{out_name}_pairs.jsonl"
+    write_jsonl(pairs_path, pairs)
+    out = tmp_path / out_name
+    params = {**FIT_PARAMS, "objective": "ul", "mu": 0.5, "steps": 4, "lr": 5e-3,
+              **overrides}
+    lora_fit.main(["--model", str(base), "--pairs", str(pairs_path), "--out", str(out),
+                   "--params-json", _json.dumps(params), "--cache-key", out_name])
+    return out, _json.loads((out / "fit_meta.json").read_text())
+
+
+def _seq_logp(model_dir, adapter_dir, ids, prompt_len):
+    """Response log-prob of one sequence under base(+adapter) — CPU, no grad."""
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(model_dir)
+    if adapter_dir is not None:
+        model = PeftModel.from_pretrained(model, adapter_dir)
+    model.eval()
+    import torch.nn.functional as F
+    t = torch.tensor([ids])
+    with torch.no_grad():
+        logits = model(input_ids=t).logits
+    tgt = t[:, 1:].clone()
+    tgt[:, :prompt_len - 1] = -100
+    return -float(F.cross_entropy(logits[0, :-1], tgt[0], ignore_index=-100,
+                                  reduction="sum"))
+
+
+@pytest.mark.slow
+def test_ul_roundtrip_pushes_rejected_down_and_resume(tmp_path, monkeypatch):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    out, meta = _run_ul(tmp_path, "ul", DPO_PAIRS)
+    assert list(out.glob("adapter_model*")), "no adapter weights saved"
+    assert meta["objective"] == "ul" and meta["n_pairs"] == 3
+    assert len(meta["loss_per_step"]) == 4 == len(meta["ul_per_step"])
+    assert len(meta["guard_per_step"]) == 4 == len(meta["guard_active_frac_per_step"])
+    # normalizers: chosen response tokens (4+3+2) and rejected (3+4+3)
+    assert meta["total_resp_tokens"] == 4 + 3 + 2
+    assert meta["total_rej_tokens"] == 3 + 4 + 3
+    # step 1 runs at the reference weights, so the guard hinge is exactly 0
+    assert meta["guard_per_step"][0] == pytest.approx(0.0, abs=1e-6)
+    assert meta["guard_active_frac_per_step"][0] == pytest.approx(0.0, abs=1e-6)
+    # the objective does what it says: rejected loses probability, chosen gains
+    p = DPO_PAIRS[0]
+    rej_base = _seq_logp(tmp_path / "base", None, p["rejected_ids"], p["prompt_len"])
+    rej_fit = _seq_logp(tmp_path / "base", out, p["rejected_ids"], p["prompt_len"])
+    cho_base = _seq_logp(tmp_path / "base", None, p["chosen_ids"], p["prompt_len"])
+    cho_fit = _seq_logp(tmp_path / "base", out, p["chosen_ids"], p["prompt_len"])
+    assert rej_fit < rej_base, "unlikelihood did not push the rejected sequence down"
+    assert cho_fit > cho_base, "the chosen NLL term did not lift the bridge"
+    # resume: matching .done marker skips the refit
+    import json as _json
+    from expert_iter import lora_fit
+    weights = next(out.glob("adapter_model*"))
+    mtime = weights.stat().st_mtime_ns
+    lora_fit.main(["--model", str(tmp_path / "base"), "--pairs", str(tmp_path / "ul_pairs.jsonl"),
+                   "--out", str(out), "--params-json",
+                   _json.dumps({**FIT_PARAMS, "objective": "ul", "mu": 0.5, "steps": 4, "lr": 5e-3}),
+                   "--cache-key", "ul"])
+    assert weights.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.slow
+def test_ul_bounded_by_delta(tmp_path, monkeypatch):
+    """u = -log(1 - p.clamp(max=1-delta)) <= -log(delta): with a huge delta the
+    per-token unlikelihood is tightly capped, whatever the model believes."""
+    import math
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    _, meta = _run_ul(tmp_path, "cap", DPO_PAIRS, delta=0.5, steps=1)
+    assert meta["ul_per_step"][0] <= -math.log(0.5) + 1e-6
+
+
+@pytest.mark.slow
+def test_ul_loss_invariant_to_micro_batch_size(tmp_path, monkeypatch):
+    """Global normalizers: the per-step loss must not depend on how the pairs
+    split into micro-batches (same property as the SFT/DPO paths)."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    _, m1 = _run_ul(tmp_path, "ul_mb1", DPO_PAIRS, micro_batch_size=1, steps=2)
+    _, m2 = _run_ul(tmp_path, "ul_mb2", DPO_PAIRS, micro_batch_size=2, steps=2)
+    for key in ("loss_per_step", "ul_per_step", "guard_per_step"):
+        for a, b in zip(m1[key], m2[key]):
+            assert a == pytest.approx(b, rel=1e-4, abs=1e-6), key
+
+
+@pytest.mark.slow
+def test_ul_guard_off_skips_reference(tmp_path, monkeypatch, capsys):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    _, meta = _run_ul(tmp_path, "noguard", DPO_PAIRS, guard=False, steps=2)
+    assert meta["params"]["guard"] is False
+    assert all(v == 0.0 for v in meta["guard_per_step"])
+    assert "reference" not in capsys.readouterr().out  # no cached-logprob pass
+
+
+def test_ul_rejects_sft_schema(tmp_path, monkeypatch):
+    import json as _json
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    from expert_iter import lora_fit
+    from expert_iter.utils import write_jsonl
+
+    pairs_path = tmp_path / "sft_pairs.jsonl"
+    write_jsonl(pairs_path, [{"qid": "a", "input_ids": [1, 2, 3], "prompt_len": 1}])
+    with pytest.raises(SystemExit, match="needs pair keys"):
+        lora_fit.main(["--model", "unused", "--pairs", str(pairs_path),
+                       "--out", str(tmp_path / "x"),
+                       "--params-json", _json.dumps({"objective": "ul"}),
+                       "--cache-key", "x"])
+
+
+# ---------------------------------------------------------------------------
 # wandb reporting for the transient fit
 # ---------------------------------------------------------------------------
 

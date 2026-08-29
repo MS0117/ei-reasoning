@@ -1,13 +1,20 @@
-# STAGED baseline: staged bridge SFT — identical to BRIDGE.yaml except the
-# operator and its schedule: stage-1 bridge LoRA fit (fit.steps=2, no anchor)
-# -> rollout_n samples per cliff (correct ones enter the candidate pool) ->
-# num_stages stage-2 fits (unsolved: reuse/regen bridges; solved: self-wash,
-# only with train_scope: full_pool) warm-started from the previous adapter ->
-# final_rollout_n over the still-unsolved cliffs. Paired comparison partner of
-# BRIDGE/LSPO:
+# STAGED_UL: STAGED.yaml with ONE change — stage2_objective: ul. The stage-2
+# fit optimizes NLL(bridge) + mu * bounded unlikelihood on the adapter's OWN
+# modal-wrong failure from the preceding rollout + a displacement guard on the
+# bridge (the outer cliff objective's L_C + mu*L_N + L_G shape, lora_fit
+# objective=ul) instead of DPO. Chosen sides are identical to the dpo arm, so
+# the comparison isolates the objective; negatives target the ADAPTER's modal
+# wrong answer (negative_selection: modal — measured 2026-08-27, the stage-1
+# adapter RELOCATES the base attractor and installs its own mode at share ~0.69,
+# which stage-2 DPO provably does not suppress; runs/_diag/stage_attractor.json).
+# Paired comparison partner of STAGED (dpo):
 #
-#   bash data/run_toy_cliff.sh -c data/configs/STAGED.yaml -b \
-#       -- --reuse-rollout runs/toy_cliff/<BRIDGE or LSPO run dir>
+#   bash data/run_toy_cliff.sh -c data/configs/STAGED_UL.yaml -b \
+#       -- --reuse-rollout runs/toy_cliff/<STAGED/BRIDGE/LSPO run dir>
+#
+# Readouts beyond conversion: stage-2 rollout truncation (length blowup is the
+# one S4-v1 cost the verifier filter does not absorb), fit_meta's
+# guard_active_frac_per_step, and scripts/diag_stage_attractor.py on the run.
 #
 # v1 constraints (rejected at config load): fit.adaptive, project_back,
 # refit_budget, per_problem adapters, the GLOBAL lora_sft.chunk_size, and rl are
@@ -16,7 +23,7 @@
 # sub-shards of their stage-1 shard, so stage2 <= stage1).
 
 run:
-  name: staged_toy_cliff      # wandb group
+  name: staged_ul_toy_cliff   # wandb group
   output_root: runs
   seed: 17
   wandb:
@@ -196,11 +203,13 @@ improve:
       solved_targets: self_wash_min_c  # only work train_scope=fullpool,, self_wash_min_c | bridge | random |
                               # longest | shortest (train_scope: full_pool only)
       train_scope: unsolved_only       # unsolved_only | full_pool
-      stage2_objective: dpo   # sft | dpo | ul. dpo: chosen = the bridge, rejected = a
-                              # failure THIS adapter produced in the preceding
-                              # rollout (on-policy negative, no extra generation);
-                              # one pair per bridge so the chosen side equals the
-                              # SFT arm and the comparison isolates the objective.
+      stage2_objective: ul    # sft | dpo | ul. ul: chosen = the bridge (plain
+                              # NLL), rejected = a failure THIS adapter produced
+                              # in the preceding rollout (on-policy negative, no
+                              # extra generation) pushed DOWN by bounded
+                              # unlikelihood; one pair per bridge so the chosen
+                              # side equals the SFT/dpo arms and the comparison
+                              # isolates the objective.
       dpo:
         beta: 0.1             # DPO temperature
         lr: null              # null -> fit.lr (DPO usually wants lower)
@@ -215,25 +224,24 @@ improve:
         reference: init       # init (= the adapter that made the negatives) |
                               # base (adapter disabled); same thing when
                               # chain_adapter: false
-      ul:                     # read only when stage2_objective: ul
-        mu: 0.1               # weight on the unlikelihood term. MEASURED on the
-                              # toy set: mu 0.1 -> 1.0 moved the per-token
-                              # unlikelihood only 2.79 -> 2.73 (1.36x for a 10x
-                              # dose) because a full-batch fit takes just
-                              # `stage2_steps` AdamW updates, so mu steers the
-                              # step DIRECTION but cannot lengthen it. Raising
-                              # mu starves the chosen-NLL term instead: C(y)
-                              # went 3.65 -> 3.94 (vs dpo 2.91, p=0.001).
-        delta: 0.02           # p clamp; u is bounded by -log(delta) ~= 3.91
+      ul:
+        mu: 1.0               # weight on the unlikelihood term (u bounded by
+                              # -log delta ~= 3.91; the term has its OWN token
+                              # normalizer, so mu is the full dose control)
+        delta: 0.02           # p clamp — same default as the outer objective's
+                              # train.sft.cliff.negative.delta; the uniform
+                              # failure body sits ~p 0.85, well under the clamp
         guard: true           # + relu(mean chosen NLL - reference mean chosen
-                              # NLL) per pair, so the negative cannot displace
-                              # the bridge it protects
+                              # NLL) per pair: the negative must not displace
+                              # the bridge it protects (ref = the reference pass
+                              # below, cached once before the fit)
         lr: null              # null -> fit.lr
-        negative_selection: modal   # modal | random | longest | shortest.
-                              # modal targets the failures boxing this stage's
-                              # modal wrong answer (random hits it only 62-69%)
-        max_pairs_per_question: null
-        reference: init       # guard baseline: init | base
+        negative_selection: modal    # modal | random | longest | shortest —
+                              # modal keeps only failures boxing the stage's
+                              # modal wrong answer (random hits it ~62-69%)
+        max_pairs_per_question: null # null -> one per kept bridge
+        reference: init       # guard baseline: init (= the adapter that made
+                              # the negatives) | base (adapter disabled)
       stage2_steps: 2         # gradient steps per stage-2 fit
       stage1_chunk_size: 0    # 0 = ONE stage-1 adapter (pooled); N = one adapter per
                               # N questions. Size shards by PAIRS PER ADAPTER

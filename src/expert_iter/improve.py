@@ -25,7 +25,7 @@ from .config import Config, load_stage_config, stage_argparser
 from .engine import GenRequest, run_pool
 from .records import AnchorRecord, ImprovedCandidate, UnsolvedQuestion
 from .registry import OPERATORS, build, register
-from .templates import continuation_prompt_ids, render_question_prompt
+from .templates import continuation_prompt_ids, gold_pair_ids, render_question_prompt
 from .utils import is_done, iter_dir, mark_done, stable_seed
 
 
@@ -104,6 +104,69 @@ class SelfResampleOperator(ImprovementOperator):
                     external_context=None,
                     iter=iteration,
                 ))
+        return out
+
+
+@register(OPERATORS, "gold_text")
+class GoldTextOperator(ImprovementOperator):
+    """L5 BASELINE: off-policy gold SFT — the reference solution y* IS the
+    training text.
+
+    Every other operator here routes y* through adapter weights or a
+    generation-time prompt and trains on the POLICY's own writing; this one
+    trains on y* verbatim. That is the control for "does the rescue trajectory
+    have to be on-policy, or is any correct solution enough?", and it is
+    deliberately the one operator that VIOLATES the learnability contract:
+    external_context carries y*, so the no_external_context gate rejects every
+    candidate unless the arm drops that gate (configs/methods/l5_gold_sft.yaml
+    does, and documents why).
+
+    No generation, so the stage is CPU-only and instant. One candidate per
+    cliff question — half the per-question dose of an operator that samples,
+    which is inherent to gold (there is only one y*) and must be read off the
+    dataset stats rather than papered over.
+    """
+
+    def propose(self, questions, anchors, prompts, cfg, *, model_paths, work_dir,
+                iteration, gold_solutions=None):
+        from transformers import AutoTokenizer
+
+        gold = gold_solutions or {}
+        anchors_by_qid = {a.qid: a for a in anchors}
+        tokenizer = AutoTokenizer.from_pretrained(model_paths["policy"])
+        eos = tokenizer.eos_token_id
+        out: list[ImprovedCandidate] = []
+        n_missing = 0
+        for q in questions:
+            a = anchors_by_qid.get(q.qid)
+            if a is None:
+                continue
+            y = (gold.get(q.qid) or "").strip()
+            if not y:
+                n_missing += 1
+                continue
+            # gold_pair_ids is the sanctioned boundary where y* becomes ids: y*
+            # is a training TARGET, not a splice of generated ids, so fresh
+            # tokenization is legitimate exactly here.
+            ids, prompt_len = gold_pair_ids(tokenizer, prompts[q.qid], y, eos)
+            out.append(ImprovedCandidate(
+                qid=q.qid,
+                base_sample_idx=a.base_sample_idx,
+                attempt_idx=0,
+                prompt_token_ids=prompts[q.qid],
+                # y* is a standalone solution, never a continuation of a failed
+                # prefix, so it carries no anchor even when one was computed.
+                anchor_token_ids=[],
+                continuation_token_ids=ids[prompt_len:],
+                continuation_text=y,
+                operator=self.name,
+                op_meta={"source": "meta.gold_solution"},
+                external_context=y,
+                iter=iteration,
+            ))
+        if n_missing:
+            print(f"[improve] gold_text: {n_missing} question(s) without "
+                  "meta.gold_solution — skipped")
         return out
 
 

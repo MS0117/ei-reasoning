@@ -16,8 +16,8 @@ Cliff-objective additions (train.sft.cliff — docs/objective_decision_20260823.
 improved rows carry n_q (kept rescues per question, restamped on the merged set
 every iteration) and ref_mean_nll (the C(y) pass's s_mean, displacement-guard
 reference); negative.mode=v1 adds source="negative" rows = the base policy's
-modal-wrong failures (no EOS appended — unlikelihood must not suppress
-termination); train.dpo.rejected_selection=modal_wrong switches the DPO pairs'
+modal-wrong failures with any trailing EOS STRIPPED — unlikelihood on the
+stop token suppresses termination and blows up generation length; train.dpo.rejected_selection=modal_wrong switches the DPO pairs'
 rejected to the modal-wrong rollout (the v0 arm).
 """
 
@@ -62,7 +62,11 @@ def main(argv: list[str] | None = None) -> None:
             text=s.response_text, iter_created=args.iteration,
         ))
 
-    kept = list(ImprovedCandidate.load_jsonl(it_dir / "filtered" / "kept.jsonl"))
+    # Solved-only arms (RFT/ReST-EM) drop anchor/improve/filters from
+    # loop.stages, so there is no kept.jsonl to join — 0 improved rows,
+    # not an error.
+    kept_path = it_dir / "filtered" / "kept.jsonl"
+    kept = list(ImprovedCandidate.load_jsonl(kept_path)) if kept_path.exists() else []
     cliff = cfg.train.sft.cliff
     # Displacement-guard reference: the C(y) pass's s_mean, keyed like
     # filters._cand_key ("{qid}:{base_sample_idx}:{attempt_idx}").
@@ -106,14 +110,26 @@ def main(argv: list[str] | None = None) -> None:
     if neg_mode == "v1":
         for qid in sorted({c.qid for c in kept}):
             for b in modal_by_qid.get(qid, [])[: cliff.negative.max_per_question]:
-                # NO ensure_eos: unlikelihood on EOS would suppress termination
-                # (the answer-avoidance/length-drift confound). Ids used as-is.
+                # EOS handling (docs/objective_loss_spec_20260825.md §1):
+                # vLLM already puts the stop token in response_token_ids for
+                # finish_reason=="stop", so NOT calling ensure_eos does not keep
+                # EOS out of L_N — it must be dropped explicitly. Default keeps
+                # it (termination is part of the attractor's commitment);
+                # drop_terminal_eos=true is the paired ablation leg, motivated by
+                # the 2026-08-27 S4-v1 measurement (+57% mean generation length,
+                # p90 at the max_tokens cap, 4x truncation on held-out cliffs).
+                resp = list(b.response_token_ids)
+                if cliff.negative.drop_terminal_eos:
+                    while resp and resp[-1] == eos:
+                        resp.pop()
+                if not resp:
+                    continue
                 sft.append(SFTExample(
                     uid=stable_hash("negative", qid, b.sample_idx, args.iteration),
                     qid=qid, source="negative",
-                    input_ids=training_input_ids(b.prompt_token_ids, [], b.response_token_ids),
+                    input_ids=training_input_ids(b.prompt_token_ids, [], resp),
                     prompt_len=len(b.prompt_token_ids), anchor_len=0,
-                    completion_len=len(b.response_token_ids),
+                    completion_len=len(resp),
                     text=b.response_text, iter_created=args.iteration,
                 ))
                 n_negative += 1

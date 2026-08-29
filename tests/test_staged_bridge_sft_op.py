@@ -814,3 +814,79 @@ def test_import_has_no_cycle_back_into_improve():
         capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_stage2_ul_pairs_and_params(monkeypatch, tmp_path):
+    """objective=ul reuses the dpo pair path (chosen = bridge, rejected = own
+    stage-1 failure) and forwards the StagedUlCfg knobs to lora_fit."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=ul",
+               "improve.lora_sft.staged.ul.mu=0.3",
+               "improve.lora_sft.staged.ul.delta=0.05",
+               "improve.lora_sft.staged.ul.guard=false",
+               "improve.lora_sft.staged.ul.lr=7e-5",
+               "improve.lora_sft.staged.ul.negative_selection=shortest")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+
+    assert fits["order"] == ["stage1", "stage2"]
+    assert fits["params"]["stage1"].get("objective", "sft") == "sft"
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    assert set(pairs) == {"q1", "q2"}
+    assert pairs["q1"]["chosen_ids"] == [1, 2, 101, 0]
+    assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 0]      # shortest failure
+    assert all("input_ids" not in p for p in fits["pairs"]["stage2"])
+    p2 = fits["params"]["stage2"]
+    assert p2["objective"] == "ul" and p2["mu"] == 0.3 and p2["delta"] == 0.05
+    assert p2["guard"] is False and p2["lr"] == 7e-5 and p2["reference"] == "init"
+    assert "beta" not in p2 and "sft_weight" not in p2
+    assert str(fits["init"]["stage2"]).endswith("stage1/FAKEKEY")   # chained
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_dpo_pairs"] == 2
+
+
+def _modal_responder(qid, kind, r, stage):
+    """q1's stage-1 failures box 5, 5, 8 -> the modal wrong answer is 5; the
+    boxed-8 sample (103) is longest AND first by attempt order, so both the
+    longest rule and attempt-order would pick it — only `modal` picks a 5."""
+    if kind in ("bridge", "bridge_retry"):
+        return [_sample(101)] if qid == "q1" else [_sample(104)]
+    if stage == "stage1":
+        if qid == "q1":
+            return [_sample(103, ids=[103, 103, 103, 103]),
+                    _sample(102), _sample(102, ids=[102, 102])]
+        return [_sample(106)]      # q2 fails without any boxed answer
+    return [_sample(101)] if qid == "q1" else [_sample(104)]
+
+
+def test_stage2_ul_modal_negative_selection(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=ul")   # default: modal
+    FakeTok.vocab[103] = "also wrong: \\boxed{8}"
+    FakeTok.vocab[106] = "gave up, no box"
+    try:
+        fits, _ = _setup(monkeypatch, _modal_responder)
+        _propose(cfg, tmp_path, _fixtures())
+    finally:
+        FakeTok.vocab.pop(103), FakeTok.vocab.pop(106)
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    # q1: the modal wrong answer is \boxed{5} (2 of 3), first such sample = 102
+    assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 0]
+    # q2: no boxed failure -> random fallback still yields a pair, counted
+    assert pairs["q2"]["rejected_ids"] == [1, 2, 106, 0]
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_neg_modal_fallback"] == 1
+
+
+def test_stage2_dpo_modal_negative_selection(monkeypatch, tmp_path):
+    """`modal` is also a valid dpo selection (a DPO+modal arm needs no code)."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=dpo",
+               "improve.lora_sft.staged.dpo.negative_selection=modal")
+    FakeTok.vocab[103] = "also wrong: \\boxed{8}"
+    FakeTok.vocab[106] = "gave up, no box"
+    try:
+        fits, _ = _setup(monkeypatch, _modal_responder)
+        _propose(cfg, tmp_path, _fixtures())
+    finally:
+        FakeTok.vocab.pop(103), FakeTok.vocab.pop(106)
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 0]
+    assert fits["params"]["stage2"]["objective"] == "dpo"

@@ -63,6 +63,14 @@ DEFAULTS = {
     "beta": 0.1,
     "sft_weight": 0.0,
     "reference": "init",
+    # objective=ul (staged stage2_objective): same pair schema as dpo. Loss is
+    # NLL(chosen) per chosen response token + mu * bounded unlikelihood
+    # (-log(1 - p), p clamped <= 1-delta — train.py's L_N formula) per rejected
+    # response token + (guard) relu(mean chosen NLL - reference mean chosen NLL)
+    # per pair. The guard reference reuses the dpo reference-logprob pass.
+    "mu": 0.1,
+    "delta": 0.02,
+    "guard": True,
 }
 
 
@@ -122,9 +130,9 @@ def main(argv: list[str] | None = None) -> None:
     if not pairs:
         raise SystemExit(f"[lora_fit] {args.pairs} is empty — nothing to fit")
     objective = str(params["objective"])
-    if objective not in ("sft", "dpo"):
-        raise SystemExit(f"[lora_fit] unknown objective {objective!r} (sft | dpo)")
-    need = ("chosen_ids", "rejected_ids") if objective == "dpo" else ("input_ids",)
+    if objective not in ("sft", "dpo", "ul"):
+        raise SystemExit(f"[lora_fit] unknown objective {objective!r} (sft | dpo | ul)")
+    need = ("input_ids",) if objective == "sft" else ("chosen_ids", "rejected_ids")
     bad = [i for i, p in enumerate(pairs) if any(k not in p for k in need)]
     if bad:
         raise SystemExit(
@@ -220,13 +228,22 @@ def main(argv: list[str] | None = None) -> None:
     # response predictions (the CHOSEN response for DPO). Counted over ALL pairs
     # (global) so every rank normalizes by the same denominator. Constant across
     # steps (full batch). DPO's own loss is normalized by the global PAIR count.
-    resp_key = "chosen_ids" if objective == "dpo" else "input_ids"
+    resp_key = "input_ids" if objective == "sft" else "chosen_ids"
     total_resp_tokens = sum(len(p[resp_key]) - p["prompt_len"] for p in pairs)
     if total_resp_tokens <= 0:
         raise SystemExit("[lora_fit] pairs contain no response tokens")
     n_pairs_global = len(pairs)
     beta = float(params["beta"])
     sft_weight = float(params["sft_weight"])
+    mu = float(params["mu"])
+    delta = float(params["delta"])
+    guard = bool(params["guard"])
+    # ul's unlikelihood normalizer: global REJECTED response-token count (its
+    # own denominator, mirroring the outer objective's per-term normalization)
+    total_rej_tokens = (sum(len(p["rejected_ids"]) - p["prompt_len"] for p in pairs)
+                        if objective == "ul" else 0)
+    if objective == "ul" and total_rej_tokens <= 0:
+        raise SystemExit("[lora_fit] ul pairs contain no rejected response tokens")
 
     # Every rank must run the SAME number of micro-batches and synchronize at
     # the SAME indices — otherwise the ranks enqueue different collectives and
@@ -280,12 +297,15 @@ def main(argv: list[str] | None = None) -> None:
         return ([(p["chosen_ids"], p["prompt_len"]) for p in chunk]
                 + [(p["rejected_ids"], p["prompt_len"]) for p in chunk])
 
-    # DPO reference logprobs: ONE no-grad pass over the local pairs from the
-    # fit's starting weights ("init" = the adapter that produced the rejected
-    # samples) or with the adapter disabled ("base"). Precomputing them means
-    # the reference policy never has to be held as a second model.
+    # Reference logprobs — DPO's reference policy AND ul's guard baseline: ONE
+    # no-grad pass over the local pairs from the fit's starting weights ("init"
+    # = the adapter that produced the rejected samples) or with the adapter
+    # disabled ("base"). Precomputing them means the reference policy never has
+    # to be held as a second model. Entries are (logp_chosen, logp_rejected,
+    # chosen_label_count); dpo reads the first two, ul's guard divides the first
+    # by the third for the reference mean chosen NLL.
     ref_logp: dict[int, tuple] = {}
-    if objective == "dpo":
+    if objective == "dpo" or (objective == "ul" and guard):
         import contextlib
 
         ref_ctx = (peft_model.disable_adapter() if params["reference"] == "base"
@@ -295,23 +315,31 @@ def main(argv: list[str] | None = None) -> None:
                 if pad:
                     continue
                 ids, mask, labels = _pack(dpo_seqs(chunk), device)
-                nll, _ = _seq_nll(peft_model(input_ids=ids, attention_mask=mask).logits, labels)
+                nll, cnt = _seq_nll(peft_model(input_ids=ids, attention_mask=mask).logits, labels)
                 half = len(chunk)
                 for i in range(half):
-                    ref_logp[mi * mb + i] = (-float(nll[i]), -float(nll[half + i]))
+                    ref_logp[mi * mb + i] = (-float(nll[i]), -float(nll[half + i]),
+                                             int(cnt[i]))
         if rank == 0:
-            print(f"[lora_fit] dpo reference ({params['reference']}) logprobs cached "
-                  f"for {len(ref_logp)} local pairs")
+            print(f"[lora_fit] {objective} reference ({params['reference']}) logprobs "
+                  f"cached for {len(ref_logp)} local pairs")
 
     loss_per_step: list[float] = []
     margin_per_step: list[float] = []
     acc_per_step: list[float] = []
+    ul_per_step: list[float] = []
+    guard_per_step: list[float] = []
+    guard_active_per_step: list[float] = []
     for step in range(int(params["steps"])):
         optimizer.zero_grad(set_to_none=True)
         step_ce = 0.0          # SFT: summed response NLL (reported per token)
         step_dpo = 0.0         # DPO: summed pair loss (reported per pair)
         step_margin = 0.0
         step_acc = 0.0
+        step_pos = 0.0         # UL: summed chosen NLL (reported per token)
+        step_ul = 0.0          # UL: summed rejected unlikelihood (per token)
+        step_guard = 0.0       # UL: summed guard hinge (reported per pair)
+        step_guard_active = 0.0
         for mi, chunk, pad in micro_chunks():
             if objective == "sft":
                 ids, mask, labels = _pack([(p["input_ids"], p["prompt_len"]) for p in chunk], device)
@@ -325,7 +353,7 @@ def main(argv: list[str] | None = None) -> None:
                 # that averaging — the update then matches the single-process
                 # full-batch one.
                 loss = ce * (0.0 if pad else world / total_resp_tokens)
-            else:
+            elif objective == "dpo":
                 ids, mask, labels = _pack(dpo_seqs(chunk), device)
                 logits = model(input_ids=ids, attention_mask=mask).logits
                 nll, _ = _seq_nll(logits, labels)
@@ -333,7 +361,7 @@ def main(argv: list[str] | None = None) -> None:
                 pol_c, pol_r = -nll[:half], -nll[half:]
                 # filler micro-batches (DDP rank with fewer pairs) have no cached
                 # reference — they are zero-weighted below, so any value works
-                ref = ([(0.0, 0.0)] * half if pad
+                ref = ([(0.0, 0.0, 1)] * half if pad
                        else [ref_logp[mi * mb + i] for i in range(half)])
                 ref_c = torch.tensor([r[0] for r in ref], device=device)
                 ref_r = torch.tensor([r[1] for r in ref], device=device)
@@ -353,6 +381,42 @@ def main(argv: list[str] | None = None) -> None:
                         sft_weight * float(nll_c.detach()) * n_pairs_global / total_resp_tokens)
                     step_margin += float(margin.detach().sum())
                     step_acc += float((margin.detach() > 0).sum())
+            else:
+                # ul: NLL(chosen)/N_C + mu * bounded-unlikelihood(rejected)/N_R
+                # + guard * relu(mean chosen NLL - ref mean chosen NLL)/P — the
+                # outer cliff objective's L_C + mu*L_N + L_G shape (train.py),
+                # minus rho/stratification (no solved slice in a stage-2 fit).
+                ids, mask, labels = _pack(dpo_seqs(chunk), device)
+                logits = model(input_ids=ids, attention_mask=mask).logits
+                half = len(chunk)
+                nll_c, cnt_c = _seq_nll(logits[:half], labels[:half])
+                # rejected half needs PER-TOKEN ce (not the summed _seq_nll):
+                # one sequence at a time in fp32, same slab-size reasoning
+                tgt = labels[:, 1:]
+                u_sum = logits.new_zeros((), dtype=torch.float32)
+                for i in range(half, 2 * half):
+                    ce_i = F.cross_entropy(logits[i, :-1].float(), tgt[i],
+                                           ignore_index=-100, reduction="none")
+                    keep = tgt[i] != -100   # ignored positions come back as ce=0
+                                            # -> p=1 -> clamp -> -log(delta): mask first
+                    p = torch.exp(-ce_i[keep]).clamp(max=1.0 - delta)
+                    u_sum = u_sum + (-torch.log1p(-p)).sum()
+                scale = 0.0 if pad else world
+                loss = (nll_c.sum() * (scale / total_resp_tokens)
+                        + u_sum * (mu * scale / total_rej_tokens))
+                if guard:
+                    ref = ([(0.0, 0.0, 1)] * half if pad
+                           else [ref_logp[mi * mb + i] for i in range(half)])
+                    ref_mean = torch.tensor([-r[0] / max(r[2], 1) for r in ref],
+                                            device=device)
+                    hinge = torch.relu(nll_c / cnt_c.clamp(min=1).float() - ref_mean)
+                    loss = loss + hinge.sum() * (scale / n_pairs_global)
+                    if not pad:
+                        step_guard += float(hinge.detach().sum())
+                        step_guard_active += float((hinge.detach() > 0).sum())
+                if not pad:
+                    step_pos += float(nll_c.detach().sum())
+                    step_ul += float(u_sum.detach())
             sync = mi == n_micro - 1 or (sync_every and (mi + 1) % sync_every == 0)
             if world > 1 and not sync:
                 with model.no_sync():   # accumulate without communicating
@@ -365,26 +429,44 @@ def main(argv: list[str] | None = None) -> None:
             torch.nn.utils.clip_grad_norm_(trainable, float(params["max_grad_norm"]))
         optimizer.step()
         if objective == "sft":
-            stats_t = [step_ce / total_resp_tokens, 0.0, 0.0]
-        else:
+            stats_t = [step_ce / total_resp_tokens, 0.0, 0.0, 0.0]
+        elif objective == "dpo":
             stats_t = [step_dpo / n_pairs_global, step_margin / n_pairs_global,
-                       step_acc / n_pairs_global]
+                       step_acc / n_pairs_global, 0.0]
+        else:  # ul: [combined loss, ul/rejected token, guard/pair, active frac]
+            stats_t = [step_pos / total_resp_tokens
+                       + mu * step_ul / total_rej_tokens
+                       + step_guard / n_pairs_global,
+                       step_ul / total_rej_tokens,
+                       step_guard / n_pairs_global,
+                       step_guard_active / n_pairs_global]
         if world > 1:  # report the GLOBAL numbers, not this rank's shard
             t = torch.tensor(stats_t, device=device)
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
             stats_t = [float(v) for v in t.tolist()]
-        step_loss, step_m, step_a = stats_t
+        step_loss, step_m, step_a, step_g = stats_t
         loss_per_step.append(step_loss)
-        margin_per_step.append(step_m)
-        acc_per_step.append(step_a)
+        if objective == "dpo":
+            margin_per_step.append(step_m)
+            acc_per_step.append(step_a)
+        elif objective == "ul":
+            ul_per_step.append(step_m)
+            guard_per_step.append(step_a)
+            guard_active_per_step.append(step_g)
         if rank == 0:
-            extra = (f" margin {step_m:.4f} pref_acc {step_a:.3f}"
-                     if objective == "dpo" else "")
+            extra = ""
+            if objective == "dpo":
+                extra = f" margin {step_m:.4f} pref_acc {step_a:.3f}"
+            elif objective == "ul":
+                extra = f" ul {step_m:.4f} guard {step_a:.4f} guard_active {step_g:.3f}"
             print(f"[lora_fit] step {step + 1}/{params['steps']} loss {step_loss:.4f}{extra}")
             if wb is not None:
                 log = {"lora_fit_loss": step_loss}
                 if objective == "dpo":
                     log.update(reward_margin=step_m, pref_acc=step_a)
+                elif objective == "ul":
+                    log.update(lora_fit_ul=step_m, lora_fit_guard=step_a,
+                               lora_fit_guard_active=step_g)
                 wb.log(log, step=step + 1)
 
     if world > 1:
@@ -404,6 +486,11 @@ def main(argv: list[str] | None = None) -> None:
         **({"reward_margin_per_step": [round(v, 6) for v in margin_per_step],
             "pref_acc_per_step": [round(v, 6) for v in acc_per_step]}
            if objective == "dpo" else {}),
+        **({"total_rej_tokens": total_rej_tokens,
+            "ul_per_step": [round(v, 6) for v in ul_per_step],
+            "guard_per_step": [round(v, 6) for v in guard_per_step],
+            "guard_active_frac_per_step": [round(v, 6) for v in guard_active_per_step]}
+           if objective == "ul" else {}),
         "seed": int(params["seed"]),
         "seconds": round(time.time() - t0, 1),
         "params": params,
