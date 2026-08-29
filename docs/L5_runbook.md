@@ -58,9 +58,44 @@ bash scripts/l5_gold_sft.sh -b
 **오버라이드를 붙이지 말 것.** 데이터·하이퍼파라미터가 전부 yaml에 고정되어 있고,
 arm 간 정렬이 그것에 의존한다.
 
+arm 간 의도적으로 다른 것은 셋뿐이다:
+
+| | 값 | 왜 |
+|---|---|---|
+| `loop.iterations` | 1~4번 arm은 3, Gold SFT는 1 | offline SFT는 반복이 무의미 |
+| cliff objective | Ours/LSPO는 S3, 나머지는 현행 loss | baseline은 표준 SFT로 읽는다 |
+| `train.sft.epochs` | 1~4번 arm은 2, Gold SFT는 6 | 정적 데이터라 어느 값도 완전 정합이 안 됨. `l5_gold_sft.yaml` 헤더 참조 |
+
+Gold SFT는 rollout이 없어 ~3시간이므로, epochs 2 변형도 같이 돌려 둘 중 강한 쪽을
+baseline 행으로 쓰는 것을 권한다:
+```bash
+bash scripts/l5_gold_sft.sh -b -- --override train.sft.epochs=2
+```
+
+### run 디렉터리 이름
+
+각 명령은 `runs/<yaml의 run.name>_<타임스탬프>/`를 만든다. 예:
+
+| arm | yaml | 만들어지는 디렉터리 (예) | 최종 iteration |
+|---|---|---|---|
+| Ours | `l5_staged_dpo_s3.yaml` | `runs/l5_staged_dpo_s3_20260901_093000/` | `iter_2` |
+| LSPO | `l5_lspo.yaml` | `runs/l5_lspo_20260903_141500/` | `iter_2` |
+| Gold-in-loop | `l5_gold_inloop.yaml` | `runs/l5_gold_inloop_20260906_082000/` | `iter_2` |
+| RFT | `l5_rft.yaml` | `runs/l5_rft_20260908_110000/` | `iter_2` |
+| Gold SFT | `l5_gold_sft.yaml` | `runs/l5_gold_sft_20260909_170000/` | **`iter_0`** |
+
+타임스탬프는 실행할 때 정해지므로, 아래 §2에서는 **실제 만들어진 이름으로 바꿔 쓰거나**
+쉘 glob을 쓴다(arm당 run이 하나뿐일 때만 안전):
+
+```bash
+ls -d runs/l5_*_2026*        # 만들어진 run 이름 확인
+ARM=$(ls -d runs/l5_rft_2026* | tail -1)    # 변수에 담아 쓰면 오타가 없다
+echo $ARM
+```
+
 진행 확인:
 ```bash
-tail -f logs/loop_<run.name>_<timestamp>.log
+tail -f logs/loop_<run 이름>.log
 ```
 
 **중간에 죽으면 같은 이름으로 재개**한다. stage/shard/행 단위로 이어서 돈다:
@@ -93,14 +128,35 @@ Gold SFT는 ~3시간. 더 빠른 GPU면 비례해서 줄어든다.
 ### 2-1. headline cliff 지표 (논문의 주 지표)
 
 ```bash
+ARM=runs/l5_staged_dpo_s3_20260901_093000     # <- 실제 이름으로
+LAST=iter_2                                    # Gold SFT만 iter_0
+
 .venv/bin/python scripts/cliff_reroll.py \
-    --run-dir runs/<arm run> \
+    --run-dir $ARM \
     --qids-file holdout --n 32 --passes 1 \
-    --model-path runs/<arm run>/iter_2/ckpt \
-    --out runs/<arm run>/headline
+    --model-path $ARM/$LAST/ckpt \
+    --out $ARM/headline
+```
+
+5개 arm 전부:
+```bash
+for ARM in runs/l5_staged_dpo_s3_* runs/l5_lspo_* runs/l5_gold_inloop_* runs/l5_rft_*; do
+  .venv/bin/python scripts/cliff_reroll.py --run-dir "$ARM" \
+      --qids-file holdout --n 32 --passes 1 \
+      --model-path "$ARM/iter_2/ckpt" --out "$ARM/headline"
+done
+ARM=$(ls -d runs/l5_gold_sft_* | tail -1)      # Gold SFT는 iter_0
+.venv/bin/python scripts/cliff_reroll.py --run-dir "$ARM" \
+    --qids-file holdout --n 32 --passes 1 \
+    --model-path "$ARM/iter_0/ckpt" --out "$ARM/headline"
 ```
 
 holdout cliff 300문항(`questions/holdout.jsonl`)을 최종 체크포인트로 32번씩 다시 풀린다.
+
+`cliff_reroll`은 **채점 결과만** 남긴다(`verdicts.jsonl` + `summary.json`). 논문에 쓰는
+지표는 `scripts/attractor_mass.py`가 그 verdicts에서 계산한다 — `mean_p_top1`(attractor
+mass, 주 지표), `mean_pass_rate`(= avg@32), `frac_pass_gt0`(≥1정답 coverage),
+`mean_p_top2`, `n_wrong_kinds`. 문항별 paired 비교와 sign test도 그 스크립트가 한다.
 
 > **반드시 확인**: `--model-path`를 빠뜨리면 에러가 아니라 **학습 전 base 모델로 조용히
 > 돈다** — arm의 숫자라고 생각한 게 실은 floor가 된다. 끝나면:
@@ -112,7 +168,9 @@ holdout cliff 300문항(`questions/holdout.jsonl`)을 최종 체크포인트로 
 ### 2-2. 벤치마크
 
 ```bash
-bash scripts/eval_bench.sh runs/<arm run>/iter_2/ckpt -b
+bash scripts/eval_bench.sh runs/l5_staged_dpo_s3_20260901_093000/iter_2/ckpt -b
+#                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 실제 이름으로
+bash scripts/eval_bench.sh runs/l5_gold_sft_20260909_170000/iter_0/ckpt -b   # Gold SFT만 iter_0
 ```
 
 aime24/25/26 + hmmt25를 n=64로, math500_hard를 n=8로 채점한다(arm당 ~4시간).
