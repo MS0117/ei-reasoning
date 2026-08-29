@@ -150,16 +150,32 @@ def test_config_pins_a_rollout_free_stage_list():
 
 
 def test_gold_sft_and_the_other_l5_arms_share_the_trainer():
-    """Only the data recipe may differ — lr/batch/regions/seq len must not."""
+    """Only the data recipe may differ — lr/batch/regions/seq len must not.
+
+    epochs is the ONE documented exception: gold_sft trains offline on a static
+    ~4k-row set, so no single value matches the looped arms (deliverable-matched
+    = 2, step-matched = ~12). It carries 6 deliberately — see the EPOCHS block
+    in configs/methods/l5_gold_sft.yaml. Every other knob still has to match, and
+    the looped arms must match each other on epochs too.
+    """
     from expert_iter.config import Config
 
     arms = ["l5_staged_dpo_s3", "l5_lspo", "l5_rft", "l5_gold_sft", "l5_gold_inloop"]
+    cfgs = {}
     shape = set()
     for name in arms:
         c = Config.load(f"configs/methods/{name}.yaml")
         c.validate()
-        shape.add((c.train.sft.lr, c.train.sft.epochs, c.train.sft.global_batch_size,
+        cfgs[name] = c
+        shape.add((c.train.sft.lr, c.train.sft.global_batch_size,
                    c.train.max_seq_len, c.train.init_from, c.train.backend,
                    json.dumps(c.train.sft.region_weights, sort_keys=True),
                    c.partition.solved_keep_max, c.partition.solved_selection))
     assert len(shape) == 1, shape
+
+    looped = {n: cfgs[n].train.sft.epochs for n in arms if n != "l5_gold_sft"}
+    assert len(set(looped.values())) == 1, looped
+    # Not an arbitrary number: 6 is the "total epochs consumed" reading (3
+    # iterations x 2), the value that cannot be read as under-training the
+    # distillation baseline.
+    assert cfgs["l5_gold_sft"].train.sft.epochs == 6

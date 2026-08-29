@@ -100,7 +100,14 @@ Gold SFT는 ~3시간. 더 빠른 GPU면 비례해서 줄어든다.
     --out runs/<arm run>/headline
 ```
 
-holdout cliff 300문항을 최종 체크포인트로 32번씩 다시 풀린다.
+holdout cliff 300문항(`questions/holdout.jsonl`)을 최종 체크포인트로 32번씩 다시 풀린다.
+
+> **반드시 확인**: `--model-path`를 빠뜨리면 에러가 아니라 **학습 전 base 모델로 조용히
+> 돈다** — arm의 숫자라고 생각한 게 실은 floor가 된다. 끝나면:
+> ```bash
+> grep -o '"model_path": "[^"]*"' runs/<arm run>/headline/summary.json
+> #   arm  -> runs/<arm run>/iter_2/ckpt  여야 정상
+> ```
 
 ### 2-2. 벤치마크
 
@@ -127,8 +134,23 @@ arm별로 돌리지 말 것. 모든 arm이 같은 floor와 비교한다.
     --out runs/floor_holdout
 ```
 
-`--passes 2`인 이유: pass_0은 기준선, 두 pass의 차이가 **측정 절차 자체의 노이즈**를
-재는 null 검정이 된다(L3에서 Δattractor 0.0pp, p=0.78).
+arm의 headline과 **완전히 같은 조건**(같은 holdout 300문항, 같은 32샘플, 같은
+max_tokens 16384, 같은 verifier)에서 **모델만 학습 전 base**로 돌린 것이다. 그래서
+문항별 paired 비교가 성립하고, 5개 arm이 같은 holdout을 쓰므로 한 번이면 전부에 쓰인다.
+
+왜 필요한가: cliff는 "0/8 정답"으로 뽑은 문항이라 **다시 샘플링만 해도 상당수가 뚫린다**
+(평균 회귀). L3 실측으로 base가 공짜로 ≥1정답 29%, avg@32 0.020을 준다. floor 없이는
+arm의 숫자에서 이 몫을 빼낼 수 없다.
+
+`--passes 2`인 이유: 두 pass는 같은 base 모델의 독립적인 두 표본이라, 그 차이가
+**측정 절차 자체의 노이즈**를 재는 null 검정이 된다(L3에서 Δattractor 0.0pp, p=0.78 —
+절차가 가짜 신호를 만들지 않는다는 증거).
+
+> 여기서는 `--model-path`를 **일부러 생략**한다(= cfg.model.base). 확인:
+> ```bash
+> grep -o '"model_path": "[^"]*"' runs/floor_holdout/summary.json
+> #   -> "Qwen/Qwen3-4B-Instruct-2507"  여야 정상
+> ```
 
 ---
 

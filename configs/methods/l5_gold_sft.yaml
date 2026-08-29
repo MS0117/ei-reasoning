@@ -38,16 +38,32 @@
 #    plausible and reportable outcome, not a bug. It is the honest reading of
 #    what off-policy distillation on this data does at this scale.
 #
-# EPOCHS. Default 2, matching every other L5 arm, and that IS the right match:
-# train.init_from: base means each iteration retrains from the base model and
-# discards the previous checkpoint, so a 3-iteration arm's FINAL model has also
-# seen exactly 2 passes over its (accumulated) dataset — the 3x2 epochs never
-# compound into the deliverable. The alternative reading, matching the 6 epochs
-# the looped arms CONSUME, is available by setting `epochs: 6` below (or
-# --override train.sft.epochs=6); note that 6 passes over a static ~5k-row set
-# risks memorization (L3 precedent: cliff CE fell to 0.005 under heavy cliff
-# pressure). Either way, report total optimizer steps and training tokens per
-# arm in the compute column — that is the number this question is really about.
+# EPOCHS: 6, and the reason is not obvious — read this before changing it.
+#
+# There is no single value that "matches" the looped arms, because two ways of
+# matching disagree:
+#
+#   deliverable-matched -> 2.  train.init_from: base means every iteration
+#     retrains FROM BASE and throws the previous checkpoint away, so a
+#     3-iteration arm's FINAL model has itself seen exactly 2 passes over its
+#     (accumulated) data. The 3x2=6 epochs are spread across two models nobody
+#     ships. On this reading 6 gives this arm 3x the training of every other.
+#   step-matched -> ~12.  The looped arms' final dataset is far bigger
+#     (accumulated: ~24k rows at 6k vs ~4.1k gold rows), so at equal epochs they
+#     take ~1,500 optimizer steps against this arm's ~255. 6 epochs is 765 —
+#     closer, but still only half. Actual parity would need ~12, which is
+#     plainly into memorization.
+#
+# 6 is chosen as the value that cannot be read as UNDER-training the
+# distillation baseline. The risk runs the other way: 6 passes over a static
+# ~4k-row set can memorize (L3 precedent: cliff CE fell to 0.005 under heavy
+# cliff pressure), and an overfit baseline is just as unfair as a starved one.
+#
+# This arm costs ~3h (no rollout), so RUN BOTH and report whichever is stronger:
+#   bash scripts/l5_gold_sft.sh -b                                  # epochs 6
+#   bash scripts/l5_gold_sft.sh -b -- --override train.sft.epochs=2 # epochs 2
+# Either way the compute column must carry total optimizer steps and training
+# tokens per arm — that is the number this question is really about.
 
 run:
   name: l5_gold_sft
@@ -116,7 +132,7 @@ train:                        # IDENTICAL to l5_rft.yaml (today's loss)
   max_seq_len: 18432
   sft:
     lr: 1.0e-5
-    epochs: 2                 # 6 = the "total epochs consumed" reading; see header
+    epochs: 6                 # NOT 2 — see the EPOCHS block in the header
     global_batch_size: 32
     micro_batch_size: 1
     region_weights:
