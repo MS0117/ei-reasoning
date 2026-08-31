@@ -18,6 +18,11 @@
 #   iter_*/logs/*.log               loss + guard curves, stage timings
 #   **/verdicts.jsonl               per-sample grading — attractor_mass.py reads these
 #   headline/, floor_holdout/       cliff_reroll output, if present
+#   benchmark_eval/*/samples_slim.jsonl   PER-QUESTION benchmark grading, derived
+#                                   here from samples.jsonl by dropping
+#                                   response_text (57 MB -> 1.2 MB per model).
+#                                   metrics.json only has aggregates; the paired
+#                                   arm-vs-arm bootstrap needs these rows.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -30,10 +35,28 @@ trap 'rm -f "$LIST"' EXIT
 for run in "$@"; do
   run="${run%/}"
   [ -d "$run" ] || { echo "not a run dir: $run" >&2; exit 1; }
+  # benchmark samples: ship per-question grading without the generated text.
+  # Written next to the source (derived, idempotent, ~1 MB) so the tar keeps one
+  # root; delete samples_slim.jsonl any time, it is rebuilt from samples.jsonl.
+  while IFS= read -r sam; do
+    "$REPO_ROOT/.venv/bin/python" - "$sam" <<'PYSLIM'
+import json, sys
+from pathlib import Path
+src = Path(sys.argv[1]); dst = src.with_name("samples_slim.jsonl")
+if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+    sys.exit(0)
+with open(src) as fin, open(dst, "w") as fout:
+    for line in fin:
+        r = json.loads(line)
+        r.pop("response_text", None)
+        fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+PYSLIM
+  done < <(find "$run" -path "*/benchmark_eval/*" -name "samples.jsonl")
   find "$run" \
     \( -name "config.yaml" -o -name "config.hash.json" -o -name "metrics.jsonl" \
        -o -name "stats.json" -o -name "report.json" -o -name "metrics.json" \
        -o -name "verdicts.jsonl" -o -name "summary.json" -o -name "*.log" \
+       -o -name "samples_slim.jsonl" \
        -o -path "$run/questions/*.jsonl" \) \
     -not -path "*/wandb/*" -print >> "$LIST"
 done

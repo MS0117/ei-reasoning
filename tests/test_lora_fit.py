@@ -488,3 +488,48 @@ def test_lora_fit_accepts_wandb_json():
     r = sp.run([sys.executable, "-m", "expert_iter.lora_fit", "--help"],
                capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[1]))
     assert "--wandb-json" in r.stdout
+
+
+# --- ul span localization --------------------------------------------------
+# `rejected_span_start` narrows BOTH the unlikelihood mask and its global
+# normalizer to the answer the failure committed to, so mu keeps its meaning
+# while the per-token gradient rises by the concentration ratio.
+
+SPAN_PAIRS = [{**p, "rejected_span_start": len(p["rejected_ids"]) - 1}
+              for p in DPO_PAIRS]
+
+
+@pytest.mark.slow
+def test_ul_span_narrows_normalizer_and_targets_only_the_span(tmp_path, monkeypatch):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    out, meta = _run_ul(tmp_path, "ul_span", SPAN_PAIRS, span="boxed")
+    # uniform would charge 3+4+3 rejected tokens; the span is the last token of
+    # each rejected sequence, so the denominator is one per pair
+    assert meta["total_rej_tokens"] == 3
+    assert meta["params"]["span"] == "boxed"
+    # the chosen side is untouched by the span
+    assert meta["total_resp_tokens"] == 4 + 3 + 2
+
+    # behaviour: the span token loses probability, and it loses MORE than the
+    # unpenalized prefix of the same rejected sequence does through weight tying
+    p = SPAN_PAIRS[0]
+    s0 = p["rejected_span_start"]
+    span_base = _seq_logp(tmp_path / "base", None, p["rejected_ids"], s0)
+    span_fit = _seq_logp(tmp_path / "base", out, p["rejected_ids"], s0)
+    pre_base = _seq_logp(tmp_path / "base", None, p["rejected_ids"][:s0], p["prompt_len"])
+    pre_fit = _seq_logp(tmp_path / "base", out, p["rejected_ids"][:s0], p["prompt_len"])
+    assert span_fit < span_base, "span-localized unlikelihood did not push the answer down"
+    assert (span_base - span_fit) > (pre_base - pre_fit), (
+        "the penalty was not localized: the unpenalized prefix moved at least as much"
+    )
+
+
+@pytest.mark.slow
+def test_ul_span_absent_field_matches_uniform(tmp_path, monkeypatch):
+    """Pairs without the field keep the pre-span behaviour exactly."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    _, meta = _run_ul(tmp_path, "ul_nospan", DPO_PAIRS)
+    assert meta["total_rej_tokens"] == 3 + 4 + 3

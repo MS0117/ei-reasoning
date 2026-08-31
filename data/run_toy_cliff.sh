@@ -5,7 +5,7 @@
 # MODEL is optional (default: the config's model.base = Qwen/Qwen3-4B-Instruct-2507).
 #
 # Usage:
-#   bash data/run_toy_cliff.sh [MODEL] [-c CONFIG] [-g GPUS] [-r RUN_DIR] [-b] [-- EXTRA_ARGS]
+#   bash data/run_toy_cliff.sh [MODEL] [-c CONFIG] [-g GPUS] [-o OUT_ROOT] [-r RUN_DIR] [-b] [-- EXTRA_ARGS]
 #
 #   bash data/run_toy_cliff.sh -g 0,1
 #   bash data/run_toy_cliff.sh -g 0 -b
@@ -13,9 +13,15 @@
 #   bash data/run_toy_cliff.sh -g 0 -- --override improve.lora_sft.project_back.enabled=false
 #   bash data/run_toy_cliff.sh -r runs/toy_cliff/<dir> -g 0 -- --force filters
 #
-# Every launch gets a FRESH timestamped dir runs/toy_cliff/<slug>_<ts>/ so
+# Every launch gets a FRESH timestamped dir <OUT_ROOT>/<slug>_<ts>/ so
 # ablations never overwrite each other. To RESUME a crashed/partial run
 # (stages skip via their .done markers), point -r at its dir.
+#
+# -o OUT_ROOT (default runs/toy_cliff) keeps runs over DIFFERENT question sets
+# apart. rank_toy_runs.py globs its --runs-dir and prints one table, so mixing
+# two cliff sets there would put two different denominators in one conversion
+# column. The ~300-cliff arms live in runs/toy_cliff_2:
+#   bash data/run_toy_cliff.sh -c data/configs/CONTROL.yaml -o runs/toy_cliff_2 -b
 #
 # Prerequisite (one-time): backfill gold solutions —
 #   .venv/bin/python scripts/backfill_gold_solutions.py \
@@ -35,11 +41,13 @@ CONFIG="data/configs/toy_cliff.yaml"
 GPUS=""
 BACKGROUND=false
 RESUME_DIR=""
+OUT_ROOT="runs/toy_cliff"
 
-while getopts ":c:g:r:bh" opt; do
+while getopts ":c:g:o:r:bh" opt; do
   case "$opt" in
     c) CONFIG="$OPTARG" ;;
     g) GPUS="$OPTARG" ;;
+    o) OUT_ROOT="$OPTARG" ;;
     r) RESUME_DIR="$OPTARG" ;;
     b) BACKGROUND=true ;;
     h) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -71,7 +79,7 @@ if [ -n "$RESUME_DIR" ]; then
   [ -d "$RESUME_DIR" ] || { echo "resume dir not found: $RESUME_DIR" >&2; exit 1; }
   RUN_DIR="$RESUME_DIR"
 else
-  RUN_DIR="runs/toy_cliff/${SLUG}_$(date +%Y%m%d_%H%M%S)"
+  RUN_DIR="${OUT_ROOT%/}/${SLUG}_$(date +%Y%m%d_%H%M%S)"
 fi
 echo ">>> model=${MODEL:-<config model.base>}  config=$CONFIG  run_dir=$RUN_DIR  GPUs=${CUDA_VISIBLE_DEVICES:-<all visible>}"
 

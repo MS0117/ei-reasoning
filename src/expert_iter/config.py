@@ -31,7 +31,7 @@ LOOP_STAGES = (
 # run). The operator decides what the transient LoRA is fitted on; the
 # optional post-SFT RL phase is NOT an operator (improve.rl.enabled).
 IMPROVE_OPERATORS = ("self_resample", "lora_sft", "bridge_sft", "staged_bridge_sft",
-                     "gold_text", "teacher")
+                     "bridge_text", "gold_text", "teacher")
 
 # anchor.params is a free-form dict, so a key belonging to a DIFFERENT policy
 # would otherwise be read by nobody and leave the active policy silently on its
@@ -306,6 +306,27 @@ class StagedUlCfg:
                                        # (measured: random hits it only ~62-69%)
     max_pairs_per_question: int | None = None   # null -> one pair per kept bridge
     reference: str = "init"            # guard baseline: init | base (as in dpo)
+    span: str = "uniform"              # uniform | boxed — WHICH rejected tokens
+                                       # carry the unlikelihood.
+                                       #   uniform: every response token (~4.7k
+                                       #     per failure, of which the committed
+                                       #     answer is ~10). Measured inert at
+                                       #     the toy 2-step budget, and at full
+                                       #     budget (L3 S4-v1) it does collapse
+                                       #     the attractor — by suppressing
+                                       #     confident well-formed math prose,
+                                       #     which costs +57% length and sends
+                                       #     the mass to the wrong-answer tail.
+                                       #   boxed: only the final \boxed span, so
+                                       #     the penalty lands on the answer and
+                                       #     leaves the reasoning alone (~600x
+                                       #     concentration at the same mu — the
+                                       #     normalizer shrinks with the span).
+                                       # Pairs whose negative has no \boxed are
+                                       # dropped under boxed (stats:
+                                       # stage{k}_span_no_boxed).
+    span_pad: int = 0                  # boxed only: extra tokens kept before the
+                                       # \boxed token
 
 
 @dataclass
@@ -1061,6 +1082,12 @@ class Config:
             )
         if ul.reference not in ("init", "base"):
             raise ValueError(f"improve.lora_sft.staged.ul.reference: {ul.reference!r}")
+        if ul.span not in ("uniform", "boxed"):
+            raise ValueError(
+                f"improve.lora_sft.staged.ul.span: {ul.span!r} (uniform | boxed)"
+            )
+        if ul.span_pad < 0:
+            raise ValueError("improve.lora_sft.staged.ul.span_pad must be >= 0")
         if st.unsolved_targets not in ("reuse_bridge", "regen_bridge", "add_bridge"):
             raise ValueError(f"improve.lora_sft.staged.unsolved_targets: {st.unsolved_targets!r}")
         if st.stage_bridge_n is not None and st.stage_bridge_n < 1:
@@ -1104,6 +1131,22 @@ class Config:
                 raise ValueError(
                     "not implemented for improve.operator=staged_bridge_sft yet: "
                     + ", ".join(bad)
+                )
+        if self.improve.operator == "bridge_text":
+            # bridges are emitted as training text: nothing is fitted, sampled
+            # through an adapter, or RL-tuned, so these phases would silently
+            # not run — reject them at load like the staged block above.
+            unsupported = [
+                ("improve.lora_sft.project_back.enabled", pb.enabled),
+                ("improve.lora_sft.fit.adaptive.enabled", ad.enabled),
+                ("improve.lora_sft.refit_budget > 0", ls.refit_budget > 0),
+                ("improve.rl.enabled", self.improve.rl.enabled),
+            ]
+            bad = [name for name, hit in unsupported if hit]
+            if bad:
+                raise ValueError(
+                    "not applicable to improve.operator=bridge_text (no adapter is "
+                    "fitted): " + ", ".join(bad)
                 )
         if self.improve.operator in ("lora_sft", "bridge_sft", "staged_bridge_sft"):
             if not self.engine.enable_lora:

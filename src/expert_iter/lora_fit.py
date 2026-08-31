@@ -68,9 +68,14 @@ DEFAULTS = {
     # (-log(1 - p), p clamped <= 1-delta — train.py's L_N formula) per rejected
     # response token + (guard) relu(mean chosen NLL - reference mean chosen NLL)
     # per pair. The guard reference reuses the dpo reference-logprob pass.
+    # span="boxed" narrows the unlikelihood (and its normalizer) to each pair's
+    # `rejected_span_start`..end — the committed answer — instead of the whole
+    # failure. Only a cache-key/reporting knob here: the mask itself rides on the
+    # per-pair field, which staged_bridge_sft stamps.
     "mu": 0.1,
     "delta": 0.02,
     "guard": True,
+    "span": "uniform",
 }
 
 
@@ -238,9 +243,16 @@ def main(argv: list[str] | None = None) -> None:
     mu = float(params["mu"])
     delta = float(params["delta"])
     guard = bool(params["guard"])
-    # ul's unlikelihood normalizer: global REJECTED response-token count (its
-    # own denominator, mirroring the outer objective's per-term normalization)
-    total_rej_tokens = (sum(len(p["rejected_ids"]) - p["prompt_len"] for p in pairs)
+    # ul's unlikelihood normalizer: global PENALIZED rejected-token count (its
+    # own denominator, mirroring the outer objective's per-term normalization).
+    # With span="boxed" the pairs carry `rejected_span_start` and both the mask
+    # and this denominator shrink to the answer, so mu keeps its meaning while
+    # the per-token gradient rises by the concentration ratio.
+    def _rej_start(p):
+        s = p.get("rejected_span_start")
+        return p["prompt_len"] if s is None else max(int(s), p["prompt_len"])
+
+    total_rej_tokens = (sum(len(p["rejected_ids"]) - _rej_start(p) for p in pairs)
                         if objective == "ul" else 0)
     if objective == "ul" and total_rej_tokens <= 0:
         raise SystemExit("[lora_fit] ul pairs contain no rejected response tokens")
@@ -399,6 +411,13 @@ def main(argv: list[str] | None = None) -> None:
                                            ignore_index=-100, reduction="none")
                     keep = tgt[i] != -100   # ignored positions come back as ce=0
                                             # -> p=1 -> clamp -> -log(delta): mask first
+                    rp = chunk[i - half]
+                    start = _rej_start(rp)
+                    if start > rp["prompt_len"]:
+                        # tgt index j predicts absolute position j+1, so the span
+                        # [start, end) is j >= start - 1.
+                        keep = keep & (torch.arange(tgt.shape[1], device=tgt.device)
+                                       >= start - 1)
                     p = torch.exp(-ce_i[keep]).clamp(max=1.0 - delta)
                     u_sum = u_sum + (-torch.log1p(-p)).sum()
                 scale = 0.0 if pad else world

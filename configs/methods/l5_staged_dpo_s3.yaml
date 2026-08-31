@@ -41,6 +41,15 @@ run:
   seed: 17
   wandb:
     project: ei_reasoning
+    # null -> whichever account is logged in on THIS machine, so a run logs to
+    # its own operator's wandb and nothing can fail on a team membership the
+    # machine does not have. Runs therefore live in two places when two people
+    # run arms; that is fine, because NOTHING in the analysis reads wandb —
+    # every paper number comes from metrics.jsonl / verdicts.jsonl, which
+    # scripts/collect_run_artifacts.sh packs. Set a shared team entity here
+    # only if both accounts are members (wandb.init raises otherwise and
+    # loop.py does not catch it -> the run dies at startup).
+    entity: null
     mode: online
 
 model:
@@ -482,7 +491,7 @@ eval:
   # Regression canaries on the trained checkpoint.
   benchmark_verifier: math_strict
   # Regression canaries on the trained checkpoint — NOT the paper's benchmark
-  # numbers (those come from scripts/eval_bench.sh at n=64 on the final ckpt,
+  # numbers (those come from scripts/eval_bench.sh at n=32 on the final ckpt,
   # docs/L5_protocol_20260829.md §3). Their job is only to show that learning
   # cliffs hard does not break general math.
   #

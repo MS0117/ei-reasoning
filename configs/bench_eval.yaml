@@ -1,7 +1,13 @@
 # Standalone benchmark evaluation config — currently set up for Qwen3-4B-Instruct
 # -2507 in NON-THINKING mode: enable_thinking off, temp .6 / top_p .95 / top_k 20,
-# 16k generation room, n=64 so summarize_benchmark reports unbiased
-# pass@{1,2,...,64} on the 30-problem competition sets.
+# 16k generation room, n=32 on every set (math500_hard included) so the paper's
+# headline is avg@32 everywhere — the same n as the cliff holdout endpoint. Paired
+# sampling SE at n=32: ~1.1-1.4pp per 30-problem set, 0.66pp pooled over the four
+# competition sets (measured from the base run's per-question rates); n=64 buys
+# only 1/sqrt(2) of that at twice the cost (6.9h vs ~4.5h per model on 2 GPUs).
+# EVERY compared model, the base included, must run at this same n — avg@n is
+# unbiased at any n but pass@k is not comparable across n.
+#   bash scripts/eval_bench.sh -b        # base floor, once (model.base below)
 #
 #   bash scripts/eval_bench.sh -g 0,1 -b                        # model.base below
 #   bash scripts/eval_bench.sh Qwen/Qwen3-4B -g 0,1 -b
@@ -21,6 +27,8 @@ run:
   name: bench_eval
   wandb:
     project: ei_reasoning
+    entity: null                # the logged-in account's own entity (see the L5
+                                # arm yamls: analysis never reads wandb)
     mode: online                # no API key -> auto-falls back to offline (wandb sync later)
 
 model:
@@ -48,8 +56,8 @@ eval:
   greedy_pass1: false           # holdout eval not used standalone
   benchmark_verifier: math_strict
   benchmarks:
-    - {name: aime24, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: aime25, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: aime26, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: hmmt25, n: 64, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: math500_hard, n: 8, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: aime24, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: aime25, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: aime26, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: hmmt25, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: math500_hard, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}

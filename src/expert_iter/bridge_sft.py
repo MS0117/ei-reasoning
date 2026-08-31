@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import random
 import re
+from pathlib import Path
 
 from .config import Config
 from .engine import GenRequest
 from .records import ImprovedCandidate, QuestionRecord
-from .registry import OPERATORS, register
+from .registry import OPERATORS, VERIFIERS, build, register
 from .templates import bridge_pair_ids, continuation_prompt_ids, render_bridge_prompt
-from .utils import stable_seed, write_jsonl
+from .utils import stable_seed, write_json, write_jsonl
 from . import lora_sft as _ls
 
 
@@ -171,6 +172,9 @@ class BridgeSftOperator(_ls.LoraSftOperator):
         targets: dict[str, list[dict]] = {}
         n_pairs_kept = 0
         max_keep = getattr(self, "_bridge_max_keep", None) or br.max_keep
+        # (sample_idx, sample, pass) of every kept bridge — read by bridge_text,
+        # which emits them as candidates instead of fitting on them
+        kept: dict[str, list[tuple[int, dict, str]]] = {}
         for qid, items in accepted.items():
             anchor_ids = list(anchors_by_qid[qid].anchor_token_ids)
             if br.keep_selection == "random":
@@ -186,8 +190,11 @@ class BridgeSftOperator(_ls.LoraSftOperator):
                     prompts[qid], anchor_ids, it["sample"]["token_ids"], eos)
                 pairs.append({"qid": qid, "input_ids": ids, "prompt_len": plen})
                 it["row"]["kept"] = True
+                kept.setdefault(qid, []).append(
+                    (it["sample_idx"], it["sample"], it["row"]["pass"]))
             targets[qid] = pairs
             n_pairs_kept += len(pairs)
+        self._kept_bridges = kept
 
         write_jsonl(improve_dir / "bridge" / "bridges.jsonl", log_rows)
         stats.update({
@@ -240,4 +247,104 @@ class BridgeSftOperator(_ls.LoraSftOperator):
         for key in kept_keys:
             qid, it = origin[key]
             out.setdefault(qid, []).append(it)
+        return out
+
+
+@register(OPERATORS, "bridge_text")
+class BridgeTextOperator(BridgeSftOperator):
+    """L5 BASELINE: STaR-style rationalization on cliffs — the bridge
+    trajectories z+ ARE the training text.
+
+    Same bridge generation as bridge_sft / staged_bridge_sft (privileged prompt
+    showing y*, verifier acceptance, one retry, keep_selection / max_keep), but
+    the accepted bridges are emitted as candidates directly: no LoRA fit, no
+    plain-prompt resample, no adapter served. z+ was written while y* was
+    visible, so like gold_text this operator VIOLATES the learnability contract
+    on purpose — external_context carries y* and the arm has to drop the
+    no_external_context gate (configs/methods/l5_bridge_inloop.yaml does, and
+    says why).
+
+    What the resample step does for the LoRA operators and this one skips,
+    MEASURED on runs/L2_freeze_20260825_040504: 35.5% of kept bridges mention a
+    "reference solution" (regex over filter.leakage.patterns) against 0.2% of
+    the plain-prompt candidates; verbatim y* copying is ~0 (8-gram) either way.
+    Leakage screening stays OFF here — the STaR original does not screen — and
+    the phrasing rate is REPORTED in stats.json, never filtered on.
+    """
+
+    PROVENANCE = {
+        "privileged": "gold_solution",
+        "channel": "training_text",
+        "via": "bridge_trajectories",
+    }
+
+    def propose(self, questions, anchors, prompts, cfg: Config, *,
+                model_paths, work_dir, iteration, gold_solutions=None):
+        from transformers import AutoTokenizer
+
+        gold_solutions = gold_solutions or {}
+        pool_base = Path(work_dir)
+        improve_dir = pool_base.parent
+        policy = model_paths["policy"]
+        tokenizer = AutoTokenizer.from_pretrained(policy)
+        grader = build(VERIFIERS, cfg.partition.verifier)
+
+        # Mirrors LoraSftOperator.propose up to the fit-target hook, then stops.
+        anchors_by_qid = {a.qid: a for a in anchors}
+        questions_by_qid = {q.qid: q for q in questions}
+        eligible = sorted(q.qid for q in questions if q.qid in anchors_by_qid)
+        with_gold = [qid for qid in eligible if gold_solutions.get(qid)]
+        stats: dict = {
+            "operator": self.name,
+            "n_eligible": len(eligible),
+            "n_with_gold": len(with_gold),
+            "n_no_gold": len(eligible) - len(with_gold),
+        }
+        if eligible and not with_gold:
+            raise RuntimeError(
+                f"{self.name}: no eligible question has meta.gold_solution — set "
+                "data.adapter_args.include_solution=true or backfill the dataset "
+                "(scripts/backfill_gold_solutions.py)"
+            )
+        if not with_gold:
+            write_json(improve_dir / "stats.json", stats)
+            return []
+
+        self._kept_bridges = {}
+        self._build_targets(
+            with_gold, tokenizer=tokenizer, prompts=prompts,
+            anchors_by_qid=anchors_by_qid, questions_by_qid=questions_by_qid,
+            grader=grader, cfg=cfg, policy=policy, pool_base=pool_base,
+            improve_dir=improve_dir, iteration=iteration,
+            gold_solutions=gold_solutions, stats=stats,
+        )
+
+        # Report-only: the same regex the leakage_rules gate would apply. It
+        # counts, it never drops — the arm's definition.
+        rules = [re.compile(p, re.IGNORECASE) for p in cfg.filter.leakage.patterns]
+        out: list[ImprovedCandidate] = []
+        n_leak = 0
+        for qid in sorted(self._kept_bridges):
+            anchor = anchors_by_qid[qid]
+            for sample_idx, sample, pass_name in self._kept_bridges[qid]:
+                if rules and any(rx.search(sample["text"]) for rx in rules):
+                    n_leak += 1
+                out.append(ImprovedCandidate(
+                    qid=qid,
+                    base_sample_idx=anchor.base_sample_idx,
+                    attempt_idx=sample_idx,
+                    prompt_token_ids=list(prompts[qid]),
+                    anchor_token_ids=list(anchor.anchor_token_ids),
+                    # ids straight from generation — never re-tokenized
+                    continuation_token_ids=list(sample["token_ids"]),
+                    continuation_text=sample["text"],
+                    correct=True,               # bridge acceptance is verifier-gated
+                    operator=self.name,
+                    op_meta={**self.PROVENANCE, "pass": pass_name},
+                    external_context=gold_solutions[qid],
+                    iter=iteration,
+                ))
+        stats["n_bridge_leak_phrasing_reported"] = n_leak
+        stats["n_candidates"] = len(out)
+        write_json(improve_dir / "stats.json", stats)
         return out

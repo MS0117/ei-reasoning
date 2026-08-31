@@ -33,7 +33,7 @@ class FakeTok:
     def __call__(self, text, **kw):
         return {"input_ids": list(self.PROMPT_IDS)}
 
-    def decode(self, ids):
+    def decode(self, ids, **kw):
         return " ".join(self.vocab.get(i, "") for i in ids)
 
 
@@ -890,3 +890,113 @@ def test_stage2_dpo_modal_negative_selection(monkeypatch, tmp_path):
     pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
     assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 0]
     assert fits["params"]["stage2"]["objective"] == "dpo"
+
+
+# --- ul span localization --------------------------------------------------
+# The unlikelihood's normalizer is global, so WHICH rejected tokens carry it is
+# the whole methodology: uniform spreads mu over ~4.7k tokens of confident math
+# prose (measured inert at 2 steps, and harmful at full budget — L3 S4-v1),
+# boxed charges it to the answer the trajectory committed to.
+
+
+def test_ul_span_boxed_stamps_last_boxed_token(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=ul",
+               "improve.lora_sft.staged.ul.span=boxed",
+               "improve.lora_sft.staged.ul.negative_selection=longest")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    # rejected = [1, 2, 102, 102, 102, 0]: prompt_len 2, three boxed tokens.
+    # The span must start at the LAST one (index 4), not the first.
+    assert pairs["q1"]["rejected_ids"] == [1, 2, 102, 102, 102, 0]
+    assert pairs["q1"]["rejected_span_start"] == 4
+    assert fits["params"]["stage2"]["span"] == "boxed"     # in the fit cache key
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_span_no_boxed"] == 0
+    # 2 penalized tokens per pair (the boxed token + EOS) instead of the 4
+    # response tokens uniform would charge
+    assert stats["stage2_span_tokens_mean"] == 2.0
+
+
+def test_ul_span_pad_widens_the_span(monkeypatch, tmp_path):
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=ul",
+               "improve.lora_sft.staged.ul.span=boxed",
+               "improve.lora_sft.staged.ul.span_pad=2",
+               "improve.lora_sft.staged.ul.negative_selection=longest")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    assert pairs["q1"]["rejected_span_start"] == 2          # 4 - 2, clamped at plen
+
+
+def test_ul_span_boxed_drops_negatives_with_no_answer(monkeypatch, tmp_path):
+    """A negative with no \\boxed has no attractor to aim at. It must be dropped,
+    not silently widened back to the full response: one 4.7k-token fallback pair
+    would dominate a normalizer the other pairs contribute ~10 tokens to."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=ul",
+               "improve.lora_sft.staged.ul.span=boxed",
+               "improve.lora_sft.staged.ul.negative_selection=modal")
+    FakeTok.vocab[103] = "also wrong: \\boxed{8}"
+    FakeTok.vocab[106] = "gave up, no box"
+    try:
+        fits, _ = _setup(monkeypatch, _modal_responder)
+        _propose(cfg, tmp_path, _fixtures())
+    finally:
+        FakeTok.vocab.pop(103), FakeTok.vocab.pop(106)
+
+    pairs = {p["qid"]: p for p in fits["pairs"]["stage2"]}
+    assert set(pairs) == {"q1"}                             # q2's negative had no box
+    assert "rejected_span_start" in pairs["q1"]
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert stats["stage2_span_no_boxed"] == 1
+
+
+def test_ul_span_uniform_is_unchanged(monkeypatch, tmp_path):
+    """Default stays byte-identical to the pre-span behaviour: no span field, so
+    lora_fit falls back to prompt_len and charges every response token."""
+    cfg = _cfg("improve.lora_sft.staged.stage2_objective=ul",
+               "improve.lora_sft.staged.ul.negative_selection=longest")
+    fits, _ = _setup(monkeypatch, _dpo_responder)
+    _propose(cfg, tmp_path, _fixtures())
+    assert all("rejected_span_start" not in p for p in fits["pairs"]["stage2"])
+    assert fits["params"]["stage2"]["span"] == "uniform"
+    stats = json.loads((tmp_path / "stats.json").read_text())
+    assert "stage2_span_no_boxed" not in stats
+
+
+class _CharTok:
+    """decode(ids) = the ids as characters — lets the suffix search be checked
+    against an exact, hand-countable string."""
+
+    def decode(self, ids, **kw):
+        return "".join(chr(i) for i in ids)
+
+
+def _ids(text):
+    return [ord(c) for c in text]
+
+
+@pytest.mark.parametrize("text", [
+    "2+2 is \\boxed{4}",
+    "a \\boxed{1} then \\boxed{2}",          # the LAST one wins
+    "\\boxed{9}",                            # at position 0
+    "\\boxed{1} and a tail long enough to force the doubling probe past 8",
+    "no answer at all",
+    "",
+])
+def test_boxed_span_start_finds_the_last_boxed(text):
+    """Checked against an independent oracle: with a 1-char-per-token decoder the
+    token index IS the character index, so str.rfind is the ground truth."""
+    from expert_iter.templates import boxed_span_start
+    want = text.rfind("\\boxed")
+    got = boxed_span_start(_CharTok(), _ids(text))
+    assert got == (None if want < 0 else want)
+
+
+def test_boxed_span_start_pad_is_clamped_at_zero():
+    from expert_iter.templates import boxed_span_start
+    ids = _ids("ab \\boxed{4}")
+    assert boxed_span_start(_CharTok(), ids) == 3
+    assert boxed_span_start(_CharTok(), ids, pad=2) == 1
+    assert boxed_span_start(_CharTok(), ids, pad=99) == 0

@@ -1,29 +1,42 @@
 # ---------------------------------------------------------------------------
-# 2026-08-30 STATUS: CONCLUDED, and still pointed at the OLD 137-question set.
-# The negative term is settled for the in-operator fit: uniform UL was inert at
-# the toy budget and REGRESSED the attractor (mass on the stage-1 mode .482/.497
-# vs .460 for plain SFT); span localization fixed that regression (.450) but
-# bought nothing over doing nothing and cost 16.2% stage-2 truncation. Left on
-# the old data path deliberately — repointing would invite a re-run of a
-# question that is answered. See docs/toy_cliff_lora_fits.md.
+# 2026-08-30: this arm now targets the 350-candidate / ~300-cliff set
+# (data/cliff_sets/openr1_default_cliff450_k16_with_gold.jsonl, cliff = 0/16 on
+# the full default sweep). The earlier 137-question / 107-cliff results are NOT
+# comparable to runs from this file and live in docs/results/toy_cliff/ plus
+# each old run's own frozen config. New runs go to runs/toy_cliff_2/ (-o) so
+# rank_toy_runs.py never puts two different denominators in one table.
+# Budget is matched ACROSS ALL FIVE ARMS — round 2 (2026-08-31): 6 gradient
+# steps, 16 samples/question (round 1 was 4 / 24: measured on the finished 250
+# runs, samples 17-24 bought only +4-5pp absolute and left the BRIDGE-vs-gold
+# contrast unchanged, +17.6 -> +16.8pp at identical 36.8% discordance, while the
+# fit loss was still falling linearly at step 4; a sample costs ~9 min, a step
+# ~13 min at 250 cliffs). Round-1 runs stay comparable at conversion@16 —
+# recompute from the first 16 attempts in improved.jsonl. Staged's final-rollout
+# curve is steeper (16->8 = -7.6pp vs -5.2pp for single fits), so this budget
+# slightly disfavours the staged arms — say so when reading the numbers.
+# ~100 questions per transient adapter (the old pooled condition was 107/adapter
+# — leaving 300 pooled would trade the arm effect for adapter dilution).
 # ---------------------------------------------------------------------------
-# STAGED_UL: STAGED.yaml with ONE change — stage2_objective: ul. The stage-2
-# fit optimizes NLL(bridge) + mu * bounded unlikelihood on the adapter's OWN
-# modal-wrong failure from the preceding rollout + a displacement guard on the
-# bridge (the outer cliff objective's L_C + mu*L_N + L_G shape, lora_fit
-# objective=ul) instead of DPO. Chosen sides are identical to the dpo arm, so
-# the comparison isolates the objective; negatives target the ADAPTER's modal
-# wrong answer (negative_selection: modal — measured 2026-08-27, the stage-1
-# adapter RELOCATES the base attractor and installs its own mode at share ~0.69,
-# which stage-2 DPO provably does not suppress; runs/_diag/stage_attractor.json).
-# Paired comparison partner of STAGED (dpo):
+# STAGED_DPO: STAGED.yaml with ONE change — stage2_objective: dpo (sft_weight 0).
+# The stage-2 fit optimizes a preference loss (chosen = the same bridge the SFT
+# arm fits, rejected = a failure THIS adapter produced in the preceding rollout)
+# instead of plain NLL, so the pair isolates the stage-2 objective. On the 107
+# set this was 0.533 vs 0.551 for STAGED — inside the noise band that N could
+# resolve, which is precisely why it is being re-run at ~300.
+# Note DPO saturates fast here: 2 steps took pref_acc to 1.00 and the reward
+# margin to 5.5 without moving conversion, so more stage-2 steps is not the
+# lever if this arm underperforms again.
 #
-#   bash data/run_toy_cliff.sh -c data/configs/STAGED_UL.yaml -b \
-#       -- --reuse-rollout runs/toy_cliff/<STAGED/BRIDGE/LSPO run dir>
+# STAGED baseline: staged bridge SFT — identical to BRIDGE.yaml except the
+# operator and its schedule: stage-1 bridge LoRA fit (fit.steps=2, no anchor)
+# -> rollout_n samples per cliff (correct ones enter the candidate pool) ->
+# num_stages stage-2 fits (unsolved: reuse/regen bridges; solved: self-wash,
+# only with train_scope: full_pool) warm-started from the previous adapter ->
+# final_rollout_n over the still-unsolved cliffs. Paired comparison partner of
+# BRIDGE/LSPO:
 #
-# Readouts beyond conversion: stage-2 rollout truncation (length blowup is the
-# one S4-v1 cost the verifier filter does not absorb), fit_meta's
-# guard_active_frac_per_step, and scripts/diag_stage_attractor.py on the run.
+#   bash data/run_toy_cliff.sh -c data/configs/STAGED.yaml -b \
+#       -- --reuse-rollout runs/toy_cliff/<BRIDGE or LSPO run dir>
 #
 # v1 constraints (rejected at config load): fit.adaptive, project_back,
 # refit_budget, per_problem adapters, the GLOBAL lora_sft.chunk_size, and rl are
@@ -32,7 +45,7 @@
 # sub-shards of their stage-1 shard, so stage2 <= stage1).
 
 run:
-  name: staged_ul_toy_cliff   # wandb group
+  name: staged_dpo_toy_cliff  # wandb group
   output_root: runs
   seed: 17
   wandb:
@@ -67,7 +80,7 @@ engine:
 data:
   adapter: local_jsonl
   adapter_args:
-    path: data/cliff_sets/openr1_qwen3-4b-2507_n2000_with_gold.jsonl
+    path: data/cliff_sets/openr1_default_cliff450_k16_with_gold.jsonl
   question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
   eval_holdout: 0
   accumulate: true
@@ -148,7 +161,9 @@ improve:
       r: 16
       lora_alpha: 32
       lr: 1.0e-4
-      steps: 1               # STAGE-1 fit steps (staged spec default)
+      steps: 3               # STAGE-1 fit steps — 3+3 = the shared 6-step
+                             # budget (symmetric split; on the 107 set total
+                             # steps dominated and the split was noise)
       max_pair_tokens: 16384
       dropout: 0.0
       micro_batch_size: 1     # grad-accum reaches the full batch each step
@@ -212,13 +227,12 @@ improve:
       solved_targets: self_wash_min_c  # only work train_scope=fullpool,, self_wash_min_c | bridge | random |
                               # longest | shortest (train_scope: full_pool only)
       train_scope: unsolved_only       # unsolved_only | full_pool
-      stage2_objective: ul    # sft | dpo | ul. ul: chosen = the bridge (plain
-                              # NLL), rejected = a failure THIS adapter produced
-                              # in the preceding rollout (on-policy negative, no
-                              # extra generation) pushed DOWN by bounded
-                              # unlikelihood; one pair per bridge so the chosen
-                              # side equals the SFT/dpo arms and the comparison
-                              # isolates the objective.
+      stage2_objective: dpo   # <- THIS ARM. The sft variant is STAGED.yaml.
+                              # sft | dpo | ul. dpo: chosen = the bridge, rejected = a
+                              # failure THIS adapter produced in the preceding
+                              # rollout (on-policy negative, no extra generation);
+                              # one pair per bridge so the chosen side equals the
+                              # SFT arm and the comparison isolates the objective.
       dpo:
         beta: 0.1             # DPO temperature
         lr: null              # null -> fit.lr (DPO usually wants lower)
@@ -233,26 +247,28 @@ improve:
         reference: init       # init (= the adapter that made the negatives) |
                               # base (adapter disabled); same thing when
                               # chain_adapter: false
-      ul:
-        mu: 1.0               # weight on the unlikelihood term (u bounded by
-                              # -log delta ~= 3.91; the term has its OWN token
-                              # normalizer, so mu is the full dose control)
-        delta: 0.02           # p clamp — same default as the outer objective's
-                              # train.sft.cliff.negative.delta; the uniform
-                              # failure body sits ~p 0.85, well under the clamp
+      ul:                     # read only when stage2_objective: ul
+        mu: 0.1               # weight on the unlikelihood term. MEASURED on the
+                              # toy set: mu 0.1 -> 1.0 moved the per-token
+                              # unlikelihood only 2.79 -> 2.73 (1.36x for a 10x
+                              # dose) because a full-batch fit takes just
+                              # `stage2_steps` AdamW updates, so mu steers the
+                              # step DIRECTION but cannot lengthen it. Raising
+                              # mu starves the chosen-NLL term instead: C(y)
+                              # went 3.65 -> 3.94 (vs dpo 2.91, p=0.001).
+        delta: 0.02           # p clamp; u is bounded by -log(delta) ~= 3.91
         guard: true           # + relu(mean chosen NLL - reference mean chosen
-                              # NLL) per pair: the negative must not displace
-                              # the bridge it protects (ref = the reference pass
-                              # below, cached once before the fit)
+                              # NLL) per pair, so the negative cannot displace
+                              # the bridge it protects
         lr: null              # null -> fit.lr
-        negative_selection: modal    # modal | random | longest | shortest —
-                              # modal keeps only failures boxing the stage's
-                              # modal wrong answer (random hits it ~62-69%)
-        max_pairs_per_question: null # null -> one per kept bridge
-        reference: init       # guard baseline: init (= the adapter that made
-                              # the negatives) | base (adapter disabled)
-      stage2_steps: 3         # gradient steps per stage-2 fit
-      stage1_chunk_size: 0    # 0 = ONE stage-1 adapter (pooled); N = one adapter per
+        negative_selection: modal   # modal | random | longest | shortest.
+                              # modal targets the failures boxing this stage's
+                              # modal wrong answer (random hits it only 62-69%)
+        max_pairs_per_question: null
+        reference: init       # guard baseline: init | base
+      stage2_steps: 3         # gradient steps per stage-2 fit (3+3 = 6)
+      stage1_chunk_size: 100  # ~100 questions per adapter (old pooled = 107).
+                              # 0 = ONE stage-1 adapter (pooled); N = one adapter per
                               # N questions. Size shards by PAIRS PER ADAPTER
                               # (~250-320 validated): at 107 cliffs, shards of 25
                               # (~85 pairs) hurt; at 2000 cliffs chunk 100 restores
@@ -262,7 +278,8 @@ improve:
                               # is sub-split (100 -> 5x20) with every child warm-
                               # started from its parent adapter. A pooled stage 2
                               # after a sharded stage 1 needs chain_adapter: false.
-      stage2_chunk_size: 0    # 0 = ONE stage-2 adapter (pooled, as every run so
+      stage2_chunk_size: 100  # matches stage-1 (must be <= it).
+                              # 0 = ONE stage-2 adapter (pooled, as every run so
                               # far); N = one adapter per N questions of the
                               # stage-2 fit set, so a question's gradient share
                               # rises from 1/|fit set| to 1/N (concentration at
@@ -271,7 +288,7 @@ improve:
                               # adapter adds ~50 s of model load, and more chunks
                               # than engine.max_loras makes vLLM swap adapters
                               # during the rollout.
-      final_rollout_n: 16
+      final_rollout_n: 8      # 8+8 = the shared 16-sample budget
       final_rollout_scope: unsolved    # unsolved | all
       emit: all               # all (should be pair with final_rollout_scope: all) | final_only
   rl:                         # ---- optional post-SFT RL phase (NOT an operator) ----

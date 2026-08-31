@@ -1,59 +1,52 @@
-# L5 CONTROL: GOLD-IN-LOOP — the same EI loop as the main arm, but the cliff
-# rows are the reference solution y* VERBATIM instead of a rescue trajectory.
+# L5 BASELINE: BRIDGE-IN-LOOP — the same EI loop as the main arm, but the cliff
+# rows are the BRIDGE trajectories z+ VERBATIM: the verifier-accepted solutions
+# the base policy writes from the privileged (x + y*) prompt, trained on the
+# plain prompt x. No LoRA fit, no plain-prompt resample.
 #
-# This is NOT the "Gold SFT / distillation" baseline. That one is offline, has no
-# rollout and no cliff detection, and trains on y* for EVERY question — it lives
-# in configs/methods/l5_gold_sft.yaml. THIS file is the MATCHED control: the
-# solved substrate, the rollout budget, the filters, the trainer and the
-# iteration count are identical to l5_staged_dpo_s3.yaml, and the single thing
-# that changes is where a cliff question's training row comes from. It answers
-# "does the rescue trajectory have to be ON-POLICY, or is any correct solution
-# enough?", which the offline arm cannot answer because its whole dataset differs.
+# This is STaR's *rationalization* (hint-conditioned rationale, trained without
+# the hint) applied to cliffs, so it is the baseline a reviewer will ask for.
+# Read it against the other cliff-row sources on ONE axis — how far the
+# training text sits from the policy's own plain-prompt distribution:
+#   l5_gold_inloop.yaml     y* verbatim                 dataset author's text
+#   THIS FILE (bridge_text) z+ verbatim                 policy's words, y* visible
+#   l5_staged_dpo_s3.yaml   LoRA(z+) -> plain-prompt    policy's words, y* NOT
+#                           samples                     visible at generation
+# The single difference to the main arm's improve stage is that the LoRA fit +
+# resample is skipped: with the `bridge` block below copied verbatim, the
+# iteration-0 bridge requests (prompt, n, temperature, max_tokens, seed) are
+# the SAME ones the main arm fits its adapter on.
 #
-#   bash scripts/run.sh -c configs/methods/l5_gold_inloop.yaml -b
+#   bash scripts/run.sh -c configs/methods/l5_bridge_inloop.yaml -b
 #
-# WHERE IT SITS AMONG THE GOLD ARMS — four different questions, do not conflate:
-#   l5_gold_sft.yaml        y* for ALL questions, no rollout, no  offline
-#                           loop: the distillation baseline       distillation
-#   THIS FILE (gold_text)   y* only on cliffs, inside the loop,   off-policy text,
-#                           solved rows unchanged                 matched control
-#   l5_lspo.yaml (lora_sft) fits an adapter on y*, trains on the  on-policy text,
-#                           policy's own samples from it          gold in weights
-#   l5_staged_dpo_s3.yaml   bridges z+ the policy wrote from a    on-policy text,
-#                           y*-showing prompt, staged + stage-2 DPO gold in prompt
+# THREE DECISIONS THAT DEFINE THE ARM (state all three in the paper):
 #
-# TWO GATES ARE DELIBERATELY DIFFERENT HERE. Both are the arm's definition, and
-# both must be stated in the paper rather than buried:
+#  * LOSS = today's SFT loss (train.sft.cliff.enabled: false), like l5_rft and
+#    l5_gold_inloop: a baseline row read as standard SFT. The S3-objective
+#    variant ("ours minus the LoRA step") is a separate ablation, not this arm.
+#  * CORRECTNESS is screened at bridge acceptance (verifier-gated; the filter's
+#    `correctness` gate keeps that verdict, as it does for every operator's
+#    candidates); LEAKAGE is NOT — the STaR original does not screen.
+#    MEASURED on runs/L2_freeze_20260825_040504: 35.5% of the kept bridges
+#    mention a "reference solution" (regex over filter.leakage.patterns), 0.4%
+#    copy y* verbatim (8-gram), and the LoRA resample the main arm runs
+#    launders the phrasing to 0.2%. The improve stage REPORTS the phrasing
+#    rate (stats.json: n_bridge_leak_phrasing_reported) and never drops on it.
+#  * COVERAGE differs by construction: in L3 the bridge succeeded on 79% of
+#    cliffs (280/353) while the full LoRA route converted 46%. This arm will
+#    therefore have cliff rows for ~1.7x more questions than the main arm —
+#    that is part of what it measures (privilege buys coverage), not a bug.
+#    Report n_questions_bridged per iteration next to the main arm's conversion.
 #
-#  * no_external_context is DROPPED. y* rides in external_context (the operator
-#    records it, per the learnability contract in improve.py), so the gate would
-#    reject 100% of this arm's rows. This arm exists precisely to measure what
-#    that gate is protecting against.
-#  * correctness is KEPT. MEASURED on this mix: MathVerifier accepts 68.1% of
-#    cliff gold solutions (89.6% of the ones carrying \boxed, 52.0% of the rest).
-#    Dropping the gate to recover the other 32% would train the model on
-#    solutions that never emit a boxed answer, which wrecks format compliance
-#    under the math_strict benchmark verifier — i.e. it would HANDICAP this
-#    baseline, not help it. Report the 68.1% as this arm's yield.
+# CAPS ARE MATCHED. solved <= 4/question (partition.solved_keep_max) and cliff
+# <= 2/question shortest (filter.max_per_question) through the standard filter
+# path; bridge.max_keep: 4 is the pre-filter cap exactly as in the main arm.
 #
-# EPOCHS ARE NOT ITERATIONS. train.init_from: base means every iteration
-# retrains from the base model, so epochs do NOT accumulate across iterations —
-# what accumulates is the dataset (data.accumulate: true). Setting
-# sft.epochs = loop.iterations would therefore not "match" anything; it would
-# just give this arm 3x the optimizer steps of every other arm on the same data.
-# epochs stays 2 and iterations stays 3, identical to every other L5 arm. The
-# arm still moves per iteration (fresh rollouts -> new solved rows, a shrinking
-# cliff set -> different gold rows), so the iteration axis is meaningful here.
-#
-# The improve stage does no generation at all (y* is already text), so
-# improve+filters are CPU-only and effectively free in this arm.
-#
-# 2x2 variant — gold TEXT under the cliff objective instead of today's loss:
-#   --override train.sft.cliff.enabled=true --override train.sft.cliff.rho=0.3 \
-#   --override train.sft.cliff.guard.enabled=true --override filter.selection.always_score=true
+# no_external_context is DROPPED from filter.gates (as in l5_gold_inloop): z+
+# rides with external_context = y*, per the learnability contract, and the gate
+# would reject 100% of this arm's rows.
 
 run:
-  name: l5_gold_inloop
+  name: l5_bridge_inloop
   output_root: runs
   seed: 17
   wandb:
@@ -88,13 +81,14 @@ engine:
   gpu_memory_utilization: 0.95   # srun owns these GPUs outright; the
                               # score path still drops to 0.80 below
   max_model_len: 20480        # >= train.max_seq_len
-  enable_lora: false          # gold_text fits no adapter and samples nothing
+  enable_lora: false          # bridges come from the base policy; nothing is fitted or served
   max_logprobs: 20
   score_gpu_memory_utilization: 0.80
   score_max_num_batched_tokens: 4096
 
 data:
-  # IDENTICAL to every other L5 arm. y* rides in meta.gold_solution.
+  # IDENTICAL to every other L5 arm. y* rides in meta.gold_solution and reaches
+  # the model only through the privileged bridge prompt.
   adapter: local_jsonl
   adapter_args:
     path: data/mixes/openr1_mix6k_qwen3-4b-2507.jsonl
@@ -116,8 +110,7 @@ partition:
   cliff_max_correct: 0
 
 anchor:
-  policy: none                # y* is not a continuation of a failed prefix, so
-                              # the operator emits no anchor regardless
+  policy: none                # bridges are whole solutions, never continuations
   base_selection: first_failed   # NOT min_mean_nll: with policy=none the pick
                               # only stamps base_sample_idx onto ids, but
                               # min_mean_nll pays a full vLLM score pass over
@@ -125,26 +118,38 @@ anchor:
                               # iteration on 500 questions, ~3.4h at 8k.
 
 improve:
-  operator: gold_text         # <-- THE treatment variable: y* as training TEXT
+  operator: bridge_text       # <-- THE treatment variable: z+ as training TEXT
+  # Sampling knobs are the main arm's: the bridge pass reads improve.temperature
+  # (bridge.temperature: null) and improve.max_tokens (bridge.max_tokens: null).
+  # improve.n is the q_phi sample count and is unused here (no resample).
+  n: 16
+  temperature: 1.2
+  top_p: 0.98
+  max_tokens: 16384
   rounds: 1
+  lora_sft:
+    fit:
+      max_pair_tokens: 16384  # the bridge GENERATION budget (pair_room) — keep
+                              # equal to the main arm so the requests match
+    bridge:                   # copied VERBATIM from l5_staged_dpo_s3.yaml
+      n: 8                    # N_B bridge samples per cliff (base policy + y* prompt)
+      temperature: null       # null -> improve.temperature
+      retry_temperature: 1.5
+      max_keep: 4             # pre-filter cap; the filter below cuts to 2
+      keep_selection: shortest
+      max_tokens: null        # null -> improve.max_tokens
+      leakage_rules: false    # OFF by definition of the arm — see the header
+      judge_enabled: false
+      sample_skipped: true    # unused here (no adapter to sample from)
   rl:
     enabled: false
 
 filter:
   # no_external_context removed — see the header. Everything else is the arm-
-  # matched gate list from configs/methods/l5_staged_dpo_s3.yaml.
+  # matched gate list; leakage_rules is deliberately NOT added.
   gates: [correctness, length, dedup]
   max_total_tokens: 18432
-  max_per_question: 2         # matched cap, but gold is structurally 1 row per
-                              # question while the operator arms average ~1.17
-                              # (measured). Under the LEGACY loss this arm runs
-                              # (cliff.enabled: false) the dose is per ROW, so
-                              # that ~17% gap is real — report rows/question and
-                              # rho per arm rather than claiming an exact match.
-                              # (The cliff objective's per_question_norm would
-                              # equalise it, which is one more reason the
-                              # objective-on variant below is the cleaner
-                              # single-variable contrast against the main arm.)
+  max_per_question: 2         # matched cap: cliff rows per question, shortest
   selection:
     method: shortest
     always_score: false       # no cliff guard in this arm -> no C(y) pass needed
@@ -157,7 +162,7 @@ train:                        # IDENTICAL to l5_rft.yaml (today's loss)
   max_seq_len: 18432
   sft:
     lr: 1.0e-5
-    epochs: 2                 # NOT loop.iterations — see the header
+    epochs: 2                 # NOT loop.iterations — see l5_gold_inloop.yaml
     global_batch_size: 32
     micro_batch_size: 1
     region_weights:

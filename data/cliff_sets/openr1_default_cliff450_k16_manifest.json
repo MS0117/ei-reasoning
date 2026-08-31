@@ -1,0 +1,39 @@
+{
+  "out": "data/cliff_sets/openr1_default_cliff450_k16_with_gold.jsonl",
+  "built_by": "data/make_toy_cliff_set.py",
+  "source_table": "runs/passrate/friend_openr1_default/openr1-math-220k_default_passrate.jsonl",
+  "source_sweep": {
+    "hf_name": "open-r1/OpenR1-Math-220k",
+    "config": "default",
+    "split": "train",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "k": 16,
+    "rows": 59344
+  },
+  "criterion": "c == 0 at k=16 (base policy gets 0/16 correct)",
+  "seed": 17,
+  "counts": {
+    "cliffs_in_table": 2627,
+    "dropped_gold_stub": 169,
+    "dropped_gold_unparsable": 0,
+    "usable": 2458,
+    "continuity_from_toy107": 74,
+    "fresh_sampled": 376,
+    "total_candidates": 450
+  },
+  "legacy": {
+    "set": "data/cliff_sets/openr1_qwen3-4b-2507_n2000_with_gold.jsonl",
+    "questions": 137,
+    "toy_cliffs": 107,
+    "toy_cliffs_that_are_0_of_16": 74
+  },
+  "expected_cliffs_after_own_rollout": {
+    "retention_estimate": 0.75,
+    "note": "MEASURED on a 20-candidate probe of this very set (runs/toy_cliff_2_smoke, 2026-08-30): 15/20 stayed 0/8 — continuity 4/5, fresh-only 11/15. The legacy figure 0.908 (79/87) came from questions selected 0/8 AND 0/16 and is optimistic for fresh-only-0/16 candidates, which is why this set is oversized. n=20, so the 95% CI is [.53, .89]; the realized N is what gets reported.",
+    "point": 338,
+    "ci_range": [
+      238,
+      400
+    ]
+  }
+}

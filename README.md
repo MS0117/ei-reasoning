@@ -41,10 +41,10 @@ bash data/run_toy_cliff.sh -c data/configs/STAGED.yaml -b \
 
 ## L5 main experiment
 
-Five arms on the same 6k question mix, the same held-out 300-cliff set, and the same
+Six arms on the same 6k question mix, the same held-out 300-cliff set, and the same
 trainer.
 
-Run all five **with the same code revision** — the vLLM pool's batch composition changes
+Run all six **with the same code revision** — the vLLM pool's batch composition changes
 kernel numerics, so a different revision draws a different sample and the arm-to-arm
 comparison stops being one. No overrides: the arms are aligned by their YAMLs.
 
@@ -65,9 +65,13 @@ bash scripts/run.sh -c configs/methods/l5_rft.yaml -b
 
 # 5) Gold SFT — offline distillation on y*, no rollout (dedicated launcher)
 bash scripts/l5_gold_sft.sh -b
+
+# 6) Bridge-in-loop — bridge trajectories z* verbatim as the cliff row, no LoRA
+#    (STaR rationalization; leakage NOT screened, phrasing rate reported)
+bash scripts/run.sh -c configs/methods/l5_bridge_inloop.yaml -b
 ```
 
-Arms 1-4 run 3 iterations (final checkpoint `iter_2`); arm 5 runs one (`iter_0`).
+Arms 1-4 and 6 run 3 iterations (final checkpoint `iter_2`); arm 5 runs one (`iter_0`).
 Resume a crashed run with `-r <run name>` — stages, shards and rows all skip what is done.
 
 ### Evaluation (after a run reaches `[loop] done`)
@@ -75,9 +79,10 @@ Resume a crashed run with `-r <run name>` — stages, shards and rows all skip w
 `<arm>` below is the run directory, e.g. `runs/l5_staged_dpo_s3_20260901_093000`.
 
 ```bash
-# competition benchmarks — aime24/25/26 + hmmt25 at n=64, math500_hard at n=8
+# competition benchmarks — aime24/25/26 + hmmt25 + math500_hard, all at n=32 (avg@32)
 bash scripts/eval_bench.sh <arm>/iter_2/ckpt -b          # arms 1-4
 bash scripts/eval_bench.sh <arm>/iter_0/ckpt -b          # arm 5
+bash scripts/eval_bench.sh -b                            # base model — ONCE, same n
 
 # held-out cliff transfer, per arm (the paper's headline measurement)
 .venv/bin/python scripts/cliff_reroll.py --run-dir <arm> \

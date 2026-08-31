@@ -1,3 +1,22 @@
+# ---------------------------------------------------------------------------
+# 2026-08-30: this arm now targets the 350-candidate / ~300-cliff set
+# (data/cliff_sets/openr1_default_cliff450_k16_with_gold.jsonl, cliff = 0/16 on
+# the full default sweep). The earlier 137-question / 107-cliff results are NOT
+# comparable to runs from this file and live in docs/results/toy_cliff/ plus
+# each old run's own frozen config. New runs go to runs/toy_cliff_2/ (-o) so
+# rank_toy_runs.py never puts two different denominators in one table.
+# Budget is matched ACROSS ALL FIVE ARMS — round 2 (2026-08-31): 6 gradient
+# steps, 16 samples/question (round 1 was 4 / 24: measured on the finished 250
+# runs, samples 17-24 bought only +4-5pp absolute and left the BRIDGE-vs-gold
+# contrast unchanged, +17.6 -> +16.8pp at identical 36.8% discordance, while the
+# fit loss was still falling linearly at step 4; a sample costs ~9 min, a step
+# ~13 min at 250 cliffs). Round-1 runs stay comparable at conversion@16 —
+# recompute from the first 16 attempts in improved.jsonl. Staged's final-rollout
+# curve is steeper (16->8 = -7.6pp vs -5.2pp for single fits), so this budget
+# slightly disfavours the staged arms — say so when reading the numbers.
+# ~100 questions per transient adapter (the old pooled condition was 107/adapter
+# — leaving 300 pooled would trade the arm effect for adapter dilution).
+# ---------------------------------------------------------------------------
 # CONTROL arm: NO improvement operator at all — just draw improve.n fresh
 # samples from the BASE policy on the same cliff questions.
 #
@@ -56,7 +75,7 @@ engine:
 data:
   adapter: local_jsonl
   adapter_args:
-    path: data/cliff_sets/openr1_qwen3-4b-2507_n2000_with_gold.jsonl
+    path: data/cliff_sets/openr1_default_cliff450_k16_with_gold.jsonl
   question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
   eval_holdout: 0
   accumulate: true

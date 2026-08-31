@@ -4,6 +4,7 @@
 `build_dataset.py`, `config.py`)과 1:1로 맞춰 모든 기호를 정의한 명세.
 결정의 *근거*는 원문서에 있고, 수식 *표기*는 이 문서가 기준이다.
 원문서 §3 스케치와 구현이 다른 지점은 §7 정오표에 모아 두었다 (특히 F1/F2 — 실험 arm 설계에 영향).
+cliff 항이 **왜** 문항 단위인지(길이·NLL·$n_q$ 실측과 근거, L3/L5 차이)는 §9.
 
 ---
 
@@ -288,7 +289,8 @@ token-level이냐"가 **아니다** — $m_C=1$에서는 두 모드가 똑같이
 | **S3 ($\rho=0.3$)** | **30%, 매 step 고정** |
 
 따라서 이 objective가 하는 일은 새 손실을 발명한 것이 아니라, **데이터 길이가 우연히 정하던 계수
-$\beta_j$를 떼어내고 그 자리에 통제 가능한 상수 $\rho$를 꽂은 것**이다. 이때 **증량**(≈5.7% → 30%)과
+$\beta_j$를 떼어내고 그 자리에 통제 가능한 상수 $\rho$를 꽂은 것**이다. (위 표의 1.8k/5k는 원문서 추정치 — L3 실측 길이로 다시 계산한
+$\beta_j$ 표와 정규화 단위의 근거는 §9.) 이때 **증량**(≈5.7% → 30%)과
 **균일 전달**(대부분 0이던 것을 매 step)이 동시에 바뀌므로, 그 둘을 분리하는 것이 S1′ arm
 (ρ=legacy, sampler만 on)이다.
 
@@ -470,7 +472,7 @@ L3 1라운드는 **v0만** 돈다 (`bash scripts/l3_arm.sh S4v0 <frozen>`), v1�
 |---|---|---|---|---|
 | $\rho$ | `train.sft.cliff.rho` | 0.1 | {legacy≈0.03–0.06, 0.1, 0.3} | **{legacy, 0.3}** (`scripts/rho_legacy.py`가 frozen dataset 토큰 질량에서 legacy 값 산출) |
 | $\mu$ | `cliff.negative.mu` | 0.1 | {0, 0.1, 0.3} | **0 고정**, S4는 μ-v0(sft+dpo) 단일 arm |
-| $m_C$ | `cliff.m_per_batch` | 1 | — | 1 (S3-tok을 살리려면 ≥2 필요 — F2) |
+| $m_C$ | `cliff.m_per_batch` | 1 | — | 1 (S3-tok을 살리려면 ≥2 필요 — F2). **L5: `auto`** = 모든 improved 행을 epoch당 ≥1회 보는 최소값 (§9.4) |
 | $m_N$ | `cliff.negative.m_per_batch` | 1 | — | v1일 때만 |
 | $\delta$ | `cliff.negative.delta` | 0.02 | — | — |
 | $n_q$ 상한 | `filter.max_per_question` | 2 | — | — |
@@ -496,6 +498,7 @@ arm은 반드시 `scripts/fork_run.py`/`l3_arm.sh`로 fresh run dir에.
    행 단위 균등 순환이라 문제 질량 ∝ $n_q$ (≤2배, 의도와 반대 방향). "성공 수 무관 1 단위"는 미실현.
    **sampler는 고치지 않기로 결정(2026-08-26)** — 현 처치가 잘 정의되어 있고 A→B 전이 질문을
    훼손하지 않으며, 문제 단위 순환은 수정이 아니라 다른 처치이므로 L4/L5의 별도 arm 사안.
+   실측 크기(어려운 : 쉬운 문항 = 1 : 2)와 L5 `auto`에서의 해소는 §9.2/§9.4.
 4. **F2**: 그 따름정리로 cookbook의 S3-tok arm(= `per_question_norm=false`만 변경)은 S3(0.3)의
    seed-twin. 폐기(권고) / `m_per_batch=2` 짝으로 재설계 / L4 연기 중 **미결**.
 5. **guard 기준의 policy**: §3의 $\theta_0$(base)는 iter-0에서만 엄밀히 성립.
@@ -521,3 +524,134 @@ arm은 반드시 `scripts/fork_run.py`/`l3_arm.sh`로 fresh run dir에.
 | EOS unlikelihood 압력 측정 (CPU, diag 덤프 기반) | [scripts/diag_eos_pressure.py](../scripts/diag_eos_pressure.py) → `runs/toy_cliff/_diag_summaries/eos_pressure.json` |
 | L3 arm 실행 | [scripts/l3_arm.sh](../scripts/l3_arm.sh) (fork + train/eval + B readout) |
 | 검증 | tests/test_cliff_objective.py (topology 불변성, 분모 가산성, legacy byte-identical); GPU smoke `runs/smoke_20260824_221441` |
+
+---
+
+## 9. 왜 cliff 항만 문항(sequence) 단위인가 — 길이 실측과 근거 (2026-08-31 추가)
+
+§4.1/§4.2의 두 정규화가 **왜 다른가**를 한곳에 모은다. 원문서 §2의 길이 추정(solved ≈1.8k / 구제 ≈5.6k,
+2000문항 toy mix)은 L3 실측과 다르므로 여기 숫자가 기준이다. 모든 값은 L3 S3 arm이 실제로 학습한 행
+(`runs/L3_S3_20260826_011420/iter_0/dataset/train_sft.jsonl`, B 제외 후 solved 5,366 / improved 118,
+converted A 문항 82)에서 잰 것. loss 토큰 = `len(input_ids) − prompt_len` (improved 행의 `anchor_len`은 전부 0 확인).
+
+### 9.1 실측 — 두 slice의 길이·NLL·문항당 행 수
+
+| slice | 행 | loss 토큰 평균 | 중앙 | p10 | p90 | 최대 | 토큰 합 | 토큰 share | 행 share |
+|---|---|---|---|---|---|---|---|---|---|
+| solved | 5,366 | 2,941 | 2,196 | 644 | 6,491 | 12,606 | 15.78M | 97.2% | 97.8% |
+| improved(구제) | 118 | 3,819 | 2,758 | 630 | 8,679 | 12,071 | 0.45M | **2.8%** | 2.2% |
+
+- **평균 격차는 1.3배**에 그친다 (원문서의 3배 추정은 toy operator·shortest 선택 전 값). 큰 것은 **slice 안의
+  산포**다 — 구제는 p10 630 → p90 8,679로 **14배**, solved도 644 → 6,491로 10배.
+- **per-token NLL은 base 하에서 ~3배**: 구제의 $\mathrm{ref}_j$(= base $s_\text{mean}$) 평균 0.327 / 중앙 0.297;
+  학습 로그 첫 기록(epoch 0.03, warm-up lr ≤3.6e-6) `loss/solved` 0.088 vs `loss/cliff` 0.260.
+  즉 구제 토큰 하나는 solved 토큰 하나보다 gradient 신호가 ~3배 크다 — 토큰 pooling에서 구제의
+  실효 몫이 토큰 share(2.8%)보다 커지는 이유이자, 그 몫이 길이·NLL이라는 데이터 속성에 끌려다니는 이유.
+- legacy 토큰-질량 share (`scripts/rho_legacy.py`): **0.0278** (S3 학습셋, A만 118행). L3 문서의
+  0.0556은 B 제외 전 frozen 셋(A+B 243행) 값 — 둘 다 맞고 데이터셋이 다르다.
+
+**문항당 행 수 $n_q$와 난이도·길이** (converted A 82문항):
+
+| $n_q$ | 문항 | 구제 길이 평균 / 중앙 | base floor 정답 수/64 | ≥1정답 (64) | adapter 정답 후보/문항 |
+|---|---|---|---|---|---|
+| 1 | 46 (**56%**) | **4,727** / 4,317 | 1.74 | 0.587 | 1.00 |
+| 2 | 36 (44%) | 3,239 / 1,810 | **3.22** | 0.583 | **4.06** |
+
+- $n_q{=}2$인 문항은 **더 쉬운 cliff**다: base가 64샘플에서 맞힌 수가 1.9배, adapter의 정답 후보가 4배.
+  $n_q$는 "그 문항의 중요도"가 아니라 operator 샘플링에서 몇 개가 verifier를 통과했는가의 우연이고,
+  그 우연은 쉬운 쪽으로 기운다.
+- **어려운(singleton) 문항의 구제가 더 길다** (4.7k vs 3.2k). 길이는 operator의 장황함만이 아니라
+  난이도도 일부 반영한다 — 아래 9.3 ①에서 이 점을 다룬다.
+
+### 9.2 분석 — 길이가 dose를 정하면 무슨 일이 일어나나
+
+§4.2 ★의 전개($L^\text{plain} = (1-\beta_j)L_S + \beta_j m_j$, $\beta_j = W_j/(\Sigma+W_j)$)에 실측 길이를 넣으면
+(window = solved 31행 × 2,941 = 91.2k 토큰 + 구제 1행):
+
+| 구제 1행의 길이 | 평범한 SFT에서 그 step의 구제 몫 $\beta_j$ | S3 ($\rho$=0.3) |
+|---|---|---|
+| p10 630 | 0.7% | 30% |
+| 중앙 2,758 | 2.9% | 30% |
+| 평균 3,819 | 4.0% | 30% |
+| p90 8,679 | 8.7% | 30% |
+| 최대 12,071 | 11.7% | 30% |
+| epoch 평균 (대부분 window에 구제 0개) | **2.8%** (= legacy share) | 30% |
+
+같은 "구제 1개"인데 **길이만으로 17배**(0.7% → 11.7%) 출렁인다. 어느 문항을 얼마나 배우는지가
+그 문항의 bridge가 몇 토큰이었는가로 정해지는 것이다. S3는 이 계수를 떼어내고 상수 $\rho$를 꽂는다.
+
+**slice 안에서** ($m_C > 1$인 L5 regime, §9.4) 토큰 pooling(S3-tok)과 문항 단위(S3)의 차이 — window에
+cliff 행 4개가 들었다고 하면:
+
+| 행 | 문항 | 길이 | $n_q$ | S3-tok 몫 $W_j/\sum W$ | S3 몫 $(1/n_q)/\sum(1/n_q)$ |
+|---|---|---|---|---|---|
+| $j_1$ | $q_1$ | 8,000 | 1 | **50%** | 33% |
+| $j_2$ | $q_2$ | 2,000 | 1 | **12.5%** | 33% |
+| $j_3, j_4$ | $q_3$ | 3,000 ×2 | 2 | 37.5% (행 2개 합) | 33% (½+½) |
+
+토큰 단위에서는 $q_1$이 $q_2$의 4배를 배우고, 이유는 구제가 길다는 것 하나다. 문항 단위에서는 셋이 같다.
+
+**$n_q$ 편향을 epoch 질량으로 환산** (9.1의 실측: singleton 1행 4.7k vs $n_q{=}2$ 2행 × 3.2k = 6.5k):
+
+| 방식 | 어려운 문항($n_q{=}1$) : 쉬운 문항($n_q{=}2$) |
+|---|---|
+| legacy 토큰 pooling | 4.7k : 6.5k = **1 : 1.4** |
+| S3, $m_C{=}1$ (L3 실제 — 행 단위 순환, $1/n_q$ inert, F1) | 방문 1 : 2 = **1 : 2** |
+| S3, $m_C>1$ (L5 `auto` — $1/n_q$ 유효) | **1 : 1** |
+
+즉 L3의 S3가 실제로 투여한 문항 가중은 이 축에서 legacy보다 **더** 쉬운 쪽으로 기울어 있었다(F1이
+말한 "의도와 반대 방향"의 크기). L5에서 처음 1:1이 된다.
+
+### 9.3 근거 — 왜 cliff는 문항 1표이고 solved는 토큰 1표인가
+
+토큰 단위 정규화는 "모든 토큰이 같은 무게 = 같은 한 표"다. 행들이 서로 교환 가능한 i.i.d. 텍스트라면 그게
+MLE이고 옳다. cliff 행은 그 전제를 세 가지 이유로 어긴다.
+
+1. **길이는 문항의 속성이 아니라 operator의 산물이다.** 구제 길이는 bridge 프롬프트가 얼마나 길게 썼는가로
+   정해지고(9.1: slice 안 14배 산포), sequence-level 신호 $\Lambda$는 사실상 길이 통계였다
+   (원문서 §2: Spearman(Λ, 길이) = −0.82). 토큰으로 가중하면 "operator가 장황할수록 그 문항을 많이 배운다"가
+   된다. 단, 9.1이 보여주듯 길이는 난이도와도 상관한다(singleton 4.7k vs 3.2k). 그렇더라도 어려운 문항에
+   가중을 더 주고 싶다면 그것은 **명시적 난이도 가중**으로 해야지 장황함을 대리변수로 쓸 일이 아니다 —
+   그리고 9.2의 환산이 보여주듯 토큰 pooling은 결과적으로 어려운 문항에 **덜** 준다(1 : 1.4).
+2. **$n_q$는 operator 샘플링의 우연이고 쉬운 cliff 쪽으로 기운다** (9.1: $n_q{=}2$ 문항은 base 정답 1.9배,
+   adapter 정답 후보 4배). 행/토큰 단위로 세면 쉬운 cliff가 더 많이, converted의 56%인 가장 어려운
+   singleton이 가장 적게 학습된다. 또한 같은 문항의 구제 2개는 독립 증거가 아니라 **같은 사실을 두 번 적은
+   것**이다(dedup 후 shortest 2개).
+3. **측정 단위와 학습 단위가 같아야 한다.** endpoint는 문항별 attractor mass와 문항별 paired sign test — 문항이
+   1표다. 학습에서 긴 구제 문항에 4표를 주고 평가에서 1표로 세면 objective와 논문의 estimand가 어긋난다.
+
+**solved를 토큰 단위로 두는 이유**는 반대로 단순하다. (a) solved는 처치가 아니라 기질(substrate)이고 이미
+문항당 shortest ≤4로 정리된 표준 SFT 데이터다. (b) 무엇보다 **현행 loss 그대로여야** S3 vs S1의 차이가
+cliff 항 하나로 국한된다 — solved 정규화까지 바꾸면 두 arm의 차이에 두 번째 변수가 들어간다.
+
+**비용.** 문항 단위에서는 긴 구제의 **개별 토큰**이 약하게 학습된다 — 8k 행의 토큰 하나는 2k 행의 토큰보다
+¼ 무게. "긴 풀이에 내용이 더 많다"고 믿으면 손해인데, ①의 실측이 그 믿음을 지지하지 않고, `filter.selection.method=shortest`가
+어차피 짧은 구제를 고르므로 노출은 작다.
+
+**검증 상태 — 주의.** L3는 "자기 길이로 나누기 + $\rho$ 고정 + 매 step 공급"을 **묶음으로** legacy와 대조한
+것이다(S3 −11.0pp vs S1 −4.0pp). 문항 단위 vs 토큰 단위 자체는 **분리 검정된 적이 없다** — $m_C{=}1$에서 두
+식이 대수적으로 같기 때문(F2). 이 절의 근거는 실측 + 논증이지 arm 결과가 아니며, 분리 검정은 $m_C>1$인
+L5 regime에서 `per_question_norm=false` 짝으로만 가능하다.
+
+### 9.4 L3에서 실현된 것, L5에서 실현되는 것 (`cliff.m_per_batch: auto`)
+
+F1(§7-3) 요약: $m_C{=}1$이면 window에 cliff 행이 하나라 $1/n_q$이 분자·분모에서 상쇄되고, 살아남는 것은
+$1/W_j$뿐이다. L3의 S3는 그래서 9.3 ①만 실현했고 ②는 못 했다(9.2 환산표의 1 : 2). 참고로 L3 규모
+(5,366/118)는 $m_C{=}1$로도 173 windows ≥ 118행이라 **coverage 1.0**(행당 ~1.5회/epoch)이었다 — 굶은 게
+아니라 문항 균등화가 안 된 것이다.
+
+L5는 solved : cliff 비가 훨씬 작아 $m_C{=}1$이면 구제 대부분이 학습에 못 들어간다. `auto` =
+$n_\text{win}(m_C)\cdot m_C \ge |\mathcal{D}_C^\text{rows}|$를 만족하는 최소 $m_C$
+(`StratifiedWindowSampler._auto_m_c`, fill이 줄면 $n_\text{win}$도 변하므로 스캔). smoke run 실측:
+
+| run (solved/cliff 행) | $m_C{=}1$ coverage | `auto` $m_C$ | windows/epoch | coverage |
+|---|---|---|---|---|
+| L3 S3 (5,366/118) | 1.00 | 1 | 173 | 1.00 |
+| L5 lspo 500문항 iter2 (1,237/110) | 0.35 | **3** | 42 | 1.00 |
+| L5 lspo 500문항 iter0 (526/61) | 0.26 | 4 | 18 | 1.00 |
+| L5 staged mix300 (194/153, smoke) | 0.04 | 15 | 11 | 1.00 |
+
+$m_C > 1$이면 §4.2의 $L_C$가 원식 그대로 작동한다: window 안에서 행 $j$의 몫은 $(1/n_q)/\sum_{B_C} 1/n_q$,
+sampler가 행을 균등 순환하므로 문항 $q$의 epoch 질량 $\propto n_q \times 1/n_q = 1$. **"성공 수·길이와 무관하게
+cliff 하나 = 1 단위"는 L5에서 처음 온전히 실현된다.** 논문 서술 시 L3 arm과 L5 arm의 cliff 항이 이 점에서
+다르다는 것을 각주로 남길 것. (본 run의 실제 $m_C$는 `iter_k/logs/train.log`의 `[train] cliff objective on:` 줄.)

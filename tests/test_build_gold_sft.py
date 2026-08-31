@@ -160,7 +160,8 @@ def test_gold_sft_and_the_other_l5_arms_share_the_trainer():
     """
     from expert_iter.config import Config
 
-    arms = ["l5_staged_dpo_s3", "l5_lspo", "l5_rft", "l5_gold_sft", "l5_gold_inloop"]
+    arms = ["l5_staged_dpo_s3", "l5_lspo", "l5_rft", "l5_gold_sft", "l5_gold_inloop",
+            "l5_bridge_inloop"]
     cfgs = {}
     shape = set()
     for name in arms:

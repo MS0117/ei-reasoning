@@ -169,6 +169,41 @@ def bridge_pair_ids(
     return ids, len(prompt_token_ids) + len(anchor_token_ids)
 
 
+def boxed_span_start(tokenizer, token_ids: list[int], *, pad: int = 0) -> int | None:
+    r"""Index of the token where the FINAL ``\boxed`` of ``token_ids`` begins —
+    the id-space boundary of the answer a trajectory commits to.
+
+    Found by DECODING suffixes, never by re-tokenizing: "the suffix of length k
+    still contains \boxed" is monotone in k, so a doubling probe plus a binary
+    search returns the smallest such k in O(log n) decodes and the span starts at
+    ``len(token_ids) - k``. Returns None when there is no \boxed to aim at.
+
+    ``pad`` extends the span leftward by that many tokens (clamped at 0), keeping
+    part of the sentence that introduces the answer.
+    """
+    n = len(token_ids)
+    if n == 0:
+        return None
+
+    def has_boxed(k: int) -> bool:
+        return "\\boxed" in tokenizer.decode(token_ids[n - k:], skip_special_tokens=True)
+
+    k = 8
+    while k < n and not has_boxed(k):
+        k *= 2
+    k = min(k, n)
+    if not has_boxed(k):
+        return None
+    lo, hi = 1, k                      # hi satisfies the predicate, lo may not
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if has_boxed(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return max(0, n - lo - max(0, pad))
+
+
 def gold_pair_ids(
     tokenizer,
     prompt_token_ids: list[int],

@@ -39,7 +39,7 @@ from .bridge_sft import BridgeSftOperator
 from .config import Config
 from .records import ImprovedCandidate
 from .registry import OPERATORS, VERIFIERS, build, register
-from .templates import bridge_pair_ids
+from .templates import boxed_span_start, bridge_pair_ids
 from .utils import stable_seed, write_json, write_jsonl
 from .verifier import last_boxed
 from . import lora_sft as _ls
@@ -300,6 +300,8 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                     max_per_question=neg_cfg.max_pairs_per_question,
                     seed_of=lambda q: stable_seed(cfg.run.seed, "dpo_neg", iteration, q, k),
                     stats=stats, prefix=f"stage{k + 1}",
+                    span=st.ul.span if st.stage2_objective == "ul" else "uniform",
+                    span_pad=st.ul.span_pad, tokenizer=tokenizer,
                 )
                 if st.stage2_objective == "dpo":
                     fit_extra = {"objective": "dpo", "beta": st.dpo.beta,
@@ -309,7 +311,7 @@ class StagedBridgeSftOperator(BridgeSftOperator):
                 else:
                     fit_extra = {"objective": "ul", "mu": st.ul.mu,
                                  "delta": st.ul.delta, "guard": st.ul.guard,
-                                 "reference": st.ul.reference,
+                                 "reference": st.ul.reference, "span": st.ul.span,
                                  "lr": st.ul.lr if st.ul.lr is not None else ls.fit.lr}
                 if not pairs_k:
                     stats[f"stage{k + 1}_skipped"] = "no_dpo_pairs"
@@ -453,7 +455,8 @@ class StagedBridgeSftOperator(BridgeSftOperator):
 def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
                neg_stage: str, prompts, anchors_by_qid, eos: int,
                max_pair_tokens: int, selection: str, max_per_question: int | None,
-               seed_of, stats: dict, prefix: str) -> list[dict]:
+               seed_of, stats: dict, prefix: str, span: str = "uniform",
+               span_pad: int = 0, tokenizer=None) -> list[dict]:
     """Turn the stage-2 SFT pairs (chosen = bridges) into preference/negative
     pairs (chosen_ids/rejected_ids — consumed by lora_fit objective=dpo AND
     objective=ul) whose rejected side is a failure the CURRENT adapter produced
@@ -470,7 +473,15 @@ def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
     answer (exact-string grouping of last_boxed, ties broken by (-count, answer)
     — the build_dataset._modal_wrong_failures rule applied to the adapter's own
     failures); questions with no boxed failure fall back to random (counted in
-    stats as {prefix}_neg_modal_fallback)."""
+    stats as {prefix}_neg_modal_fallback).
+
+    span="boxed" (ul only) additionally stamps each pair with
+    `rejected_span_start`, the absolute index in rejected_ids where the
+    negative's final \boxed begins, so lora_fit charges the unlikelihood to the
+    committed answer instead of the whole trajectory. A negative with no \boxed
+    has no answer to aim at, so the pair is DROPPED rather than silently falling
+    back to the full response — one 4.7k-token fallback pair would otherwise
+    dominate the (now span-sized) global normalizer."""
     negs: dict[str, list[ImprovedCandidate]] = defaultdict(list)
     for c in pool:
         if not c.correct and c.op_meta.get("stage") == neg_stage:
@@ -480,7 +491,7 @@ def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
         by_qid[p["qid"]].append(p)
 
     out: list[dict] = []
-    n_no_neg = n_long = n_modal_fallback = 0
+    n_no_neg = n_long = n_modal_fallback = n_no_boxed = 0
     for qid in sorted(by_qid):
         cands = sorted(negs.get(qid, []), key=lambda c: c.attempt_idx)
         if not cands:
@@ -515,14 +526,26 @@ def _dpo_pairs(sft_pairs: list[dict], pool: list[ImprovedCandidate], *,
             if len(rej_ids) > max_pair_tokens or len(chosen["input_ids"]) > max_pair_tokens:
                 n_long += 1
                 continue
-            out.append({"qid": qid, "prompt_len": plen,
-                        "chosen_ids": list(chosen["input_ids"]),
-                        "rejected_ids": rej_ids})
+            pair = {"qid": qid, "prompt_len": plen,
+                    "chosen_ids": list(chosen["input_ids"]),
+                    "rejected_ids": rej_ids}
+            if span == "boxed":
+                rel = boxed_span_start(tokenizer, rej_ids[plen:], pad=span_pad)
+                if rel is None:
+                    n_no_boxed += 1
+                    continue
+                pair["rejected_span_start"] = plen + rel
+            out.append(pair)
     stats[f"{prefix}_dpo_pairs"] = len(out)
     stats[f"{prefix}_dpo_no_negative"] = n_no_neg
     stats[f"{prefix}_dpo_dropped_long"] = n_long
     if selection == "modal":
         stats[f"{prefix}_neg_modal_fallback"] = n_modal_fallback
+    if span == "boxed":
+        stats[f"{prefix}_span_no_boxed"] = n_no_boxed
+        spans = [len(p["rejected_ids"]) - p["rejected_span_start"] for p in out]
+        stats[f"{prefix}_span_tokens"] = sum(spans)
+        stats[f"{prefix}_span_tokens_mean"] = round(sum(spans) / len(spans), 1) if spans else 0.0
     return out
 
 

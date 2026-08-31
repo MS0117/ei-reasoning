@@ -7,23 +7,62 @@
 # the old data path deliberately — repointing would invite a re-run of a
 # question that is answered. See docs/toy_cliff_lora_fits.md.
 # ---------------------------------------------------------------------------
-# STAGED_UL: STAGED.yaml with ONE change — stage2_objective: ul. The stage-2
-# fit optimizes NLL(bridge) + mu * bounded unlikelihood on the adapter's OWN
-# modal-wrong failure from the preceding rollout + a displacement guard on the
-# bridge (the outer cliff objective's L_C + mu*L_N + L_G shape, lora_fit
-# objective=ul) instead of DPO. Chosen sides are identical to the dpo arm, so
-# the comparison isolates the objective; negatives target the ADAPTER's modal
-# wrong answer (negative_selection: modal — measured 2026-08-27, the stage-1
-# adapter RELOCATES the base attractor and installs its own mode at share ~0.69,
-# which stage-2 DPO provably does not suppress; runs/_diag/stage_attractor.json).
-# Paired comparison partner of STAGED (dpo):
+# STAGED_UL_SPAN: STAGED_UL.yaml with ONE change — ul.span: boxed. Same budget
+# as every other 2-staged arm (fit.steps 2 + stage2_steps 2 = 4 gradient steps,
+# rollout_n 8 + final_rollout_n 16 = 24 samples), same chosen side, same modal
+# negatives. The only difference is WHICH rejected tokens carry the
+# unlikelihood.
 #
-#   bash data/run_toy_cliff.sh -c data/configs/STAGED_UL.yaml -b \
-#       -- --reuse-rollout runs/toy_cliff/<STAGED/BRIDGE/LSPO run dir>
+# WHY. Uniform UL is settled, and it is settled twice:
+#   * toy, 2 steps (runs/toy_cliff/default_STAGED_UL_20260828_{042737,102141},
+#     mu 0.1 and 1.0): inert. The UL term moved 2.79 -> 2.73 (2%) while DPO in
+#     the same 2 steps went 0.693 -> 0.057. On its OWN readout it did worse than
+#     doing nothing — stage-2 mass left on the stage-1 modal wrong answer was
+#     0.482 / 0.497 vs 0.460 for plain SFT, with NO dose-response between the two
+#     mu values (scripts/diag_stage_attractor.py).
+#   * outer objective, full budget (L3 S4-v1, docs/objective_loss_spec_20260825.md):
+#     it DOES collapse the attractor (-23pp), but by suppressing confident,
+#     well-formed, terminated math prose — so the mass goes to the wrong-answer
+#     tail, generations grow +57% and 11.2% hit the token cap. The dropEOS arm
+#     ruled out the terminator as the cause: it is the ~3.5k-token BODY.
+# So there is no dose of uniform UL worth buying, and that doc names the one
+# survivor: "부정항을 계속 쓴다면 span 국소화만 남은 선택지" (panel OPAL, the
+# modal-wrong boxed span). This arm is that.
 #
-# Readouts beyond conversion: stage-2 rollout truncation (length blowup is the
-# one S4-v1 cost the verifier filter does not absorb), fit_meta's
-# guard_active_frac_per_step, and scripts/diag_stage_attractor.py on the run.
+# WHAT CHANGES MECHANICALLY. `rejected_span_start` (stamped per pair by
+# staged_bridge_sft, found by decoding suffixes — never re-tokenizing) narrows
+# both the unlikelihood mask AND its global normalizer to the final \boxed span.
+# A failure is ~4,700 response tokens of which the committed answer is ~10, so
+# at the SAME mu the answer tokens take ~2 orders of magnitude more gradient
+# while the reasoning body takes none. That is also why this arm can be
+# informative inside a 2-step toy budget at all: the dilution that made uniform
+# UL inert here is exactly what is removed.
+#
+# WHY mu 0.1 AND NOT 1.0. mu is a per-token weight on a term that now has a
+# ~300x smaller denominator, so mu 0.1 with the span is already a far stronger
+# answer-directed intervention than mu 1.0 uniform ever was — 1.0 uniform is the
+# wrong reference point for dose. 0.1 also matches the outer objective's
+# train.sft.cliff.negative.mu, so a positive result transfers as-is to an L5
+# S4-v2 arm. Pair this run against default_STAGED_UL_20260828_042737 (mu 0.1,
+# uniform): span is then the single variable.
+#
+# READOUTS, in the order they decide anything:
+#   1. scripts/diag_stage_attractor.py — stage-2 "mass on stage1 mode". The
+#      judgment line is the SFT floor 0.460; uniform UL sits at 0.482/0.497.
+#      Nothing below 0.460 means the negative term is done, span included.
+#   2. stage-2 rollout length / truncation — the S4-v1 cost this is meant to
+#      avoid. Toy baselines (median tokens): SFT 5,100, DPO 4,791,
+#      UL mu=.1 5,231, UL mu=1 5,455. Span must not add length.
+#   3. conversion, and stage-2 correct rate (SFT 10.9%, UL mu=1 5.3% — uniform
+#      UL halved it). Conversion alone cannot judge this arm; see the playbook.
+#   4. improve/stats.json stage2_span_tokens_mean (how many tokens the penalty
+#      actually covers) and stage2_span_no_boxed (negatives dropped for having
+#      no answer to aim at), plus fit_meta's guard_active_frac_per_step.
+#
+# Run it paired, on the shared rollout:
+#
+#   bash data/run_toy_cliff.sh -c data/configs/STAGED_UL_SPAN.yaml -b \
+#       -- --reuse-rollout runs/toy_cliff/default_LSPO_20260813_155520
 #
 # v1 constraints (rejected at config load): fit.adaptive, project_back,
 # refit_budget, per_problem adapters, the GLOBAL lora_sft.chunk_size, and rl are
@@ -32,7 +71,7 @@
 # sub-shards of their stage-1 shard, so stage2 <= stage1).
 
 run:
-  name: staged_ul_toy_cliff   # wandb group
+  name: staged_ul_span_toy_cliff   # wandb group
   output_root: runs
   seed: 17
   wandb:
@@ -148,7 +187,8 @@ improve:
       r: 16
       lora_alpha: 32
       lr: 1.0e-4
-      steps: 1               # STAGE-1 fit steps (staged spec default)
+      steps: 2               # STAGE-1 fit steps — 2+2 matches every other
+                             # 2-staged arm (4 gradient steps total)
       max_pair_tokens: 16384
       dropout: 0.0
       micro_batch_size: 1     # grad-accum reaches the full batch each step
@@ -234,9 +274,19 @@ improve:
                               # base (adapter disabled); same thing when
                               # chain_adapter: false
       ul:
-        mu: 1.0               # weight on the unlikelihood term (u bounded by
+        mu: 0.1               # weight on the unlikelihood term (u bounded by
                               # -log delta ~= 3.91; the term has its OWN token
-                              # normalizer, so mu is the full dose control)
+                              # normalizer — which the span shrinks ~300x, so
+                              # this is a STRONGER dose on the answer than the
+                              # mu 1.0 uniform run was; see the header).
+        span: boxed           # <- THE methodological difference. uniform |
+                              # boxed: uniform spreads mu over the whole ~4.7k
+                              # token failure (settled: inert here, harmful at
+                              # full budget); boxed charges it to the final
+                              # \boxed span the trajectory committed to.
+        span_pad: 0           # extra tokens kept BEFORE the \boxed token. 0 =
+                              # the answer only. Raise (8-32) if the fit turns
+                              # out to need the sentence that introduces it.
         delta: 0.02           # p clamp — same default as the outer objective's
                               # train.sft.cliff.negative.delta; the uniform
                               # failure body sits ~p 0.85, well under the clamp
@@ -251,7 +301,8 @@ improve:
         max_pairs_per_question: null # null -> one per kept bridge
         reference: init       # guard baseline: init (= the adapter that made
                               # the negatives) | base (adapter disabled)
-      stage2_steps: 3         # gradient steps per stage-2 fit
+      stage2_steps: 2         # gradient steps per stage-2 fit (2+2 = the
+                              # shared 4-step budget)
       stage1_chunk_size: 0    # 0 = ONE stage-1 adapter (pooled); N = one adapter per
                               # N questions. Size shards by PAIRS PER ADAPTER
                               # (~250-320 validated): at 107 cliffs, shards of 25

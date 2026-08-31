@@ -33,7 +33,7 @@ bash scripts/setup.sh --skip-lean          # 최초 1회 (uv 기반, sudo 불필
 
 ---
 
-## 1. 훈련 — 5개 arm
+## 1. 훈련 — 6개 arm
 
 GPU를 공유하므로 **한 번에 하나씩** 돌린다. 각 명령은 새 타임스탬프 run 디렉터리를
 만들며(덮어쓰기 없음), `-b`는 백그라운드 실행이다.
@@ -53,18 +53,36 @@ bash scripts/run.sh -c configs/methods/l5_rft.yaml -b
 
 # 5) Gold SFT — offline 전량 y* (rollout 없음, 전용 런처)
 bash scripts/l5_gold_sft.sh -b
+
+# 6) Bridge-in-loop — cliff 행을 bridge z* 원문으로, LoRA 없음 (STaR rationalization)
+bash scripts/run.sh -c configs/methods/l5_bridge_inloop.yaml -b
 ```
 
 **오버라이드를 붙이지 말 것.** 데이터·하이퍼파라미터가 전부 yaml에 고정되어 있고,
 arm 간 정렬이 그것에 의존한다.
 
+### wandb (선택 — 안 해도 실험에는 지장 없다)
+
+`run.wandb.entity: null`이라 **그 머신에 로그인된 계정의 개인 프로젝트**
+`<그 계정>/ei_reasoning`에 찍힌다. 실행 중 곡선을 보고 싶으면 arm을 띄울 그 셸에서
+먼저 `wandb login`을 해 둘 것 — 키가 없으면 조용히 offline로 떨어지고
+(`[wandb] no API key ...` 로그가 남는다) run 자체는 정상 진행한다. 나중에 올리려면:
+
+```bash
+wandb sync <run 디렉터리>/wandb/offline-run-*
+```
+
+**분석은 wandb를 전혀 읽지 않는다.** 논문 숫자는 전부 `metrics.jsonl`·`verdicts.jsonl`에서
+나오고 §3의 tar에 담긴다. 곡선을 공유하고 싶으면 wandb 프로젝트를 공개로 돌려 URL을
+넘기거나, 그냥 tar를 받아 `metrics.jsonl`로 다시 그리면 된다.
+
 arm 간 의도적으로 다른 것은 셋뿐이다:
 
 | | 값 | 왜 |
 |---|---|---|
-| `loop.iterations` | 1~4번 arm은 3, Gold SFT는 1 | offline SFT는 반복이 무의미 |
+| `loop.iterations` | 1~4·6번 arm은 3, Gold SFT는 1 | offline SFT는 반복이 무의미 |
 | cliff objective | Ours/LSPO는 S3, 나머지는 현행 loss | baseline은 표준 SFT로 읽는다 |
-| `train.sft.epochs` | 1~4번 arm은 2, Gold SFT는 6 | 정적 데이터라 어느 값도 완전 정합이 안 됨. `l5_gold_sft.yaml` 헤더 참조 |
+| `train.sft.epochs` | 1~4·6번 arm은 2, Gold SFT는 6 | 정적 데이터라 어느 값도 완전 정합이 안 됨. `l5_gold_sft.yaml` 헤더 참조 |
 
 Gold SFT는 rollout이 없어 ~3시간이므로, epochs 2 변형도 같이 돌려 둘 중 강한 쪽을
 baseline 행으로 쓰는 것을 권한다:
@@ -83,6 +101,7 @@ bash scripts/l5_gold_sft.sh -b -- --override train.sft.epochs=2
 | Gold-in-loop | `l5_gold_inloop.yaml` | `runs/l5_gold_inloop_20260906_082000/` | `iter_2` |
 | RFT | `l5_rft.yaml` | `runs/l5_rft_20260908_110000/` | `iter_2` |
 | Gold SFT | `l5_gold_sft.yaml` | `runs/l5_gold_sft_20260909_170000/` | **`iter_0`** |
+| Bridge-in-loop | `l5_bridge_inloop.yaml` | `runs/l5_bridge_inloop_20260911_090000/` | `iter_2` |
 
 타임스탬프는 실행할 때 정해지므로, 아래 §2에서는 **실제 만들어진 이름으로 바꿔 쓰거나**
 쉘 glob을 쓴다(arm당 run이 하나뿐일 때만 안전):
@@ -138,9 +157,10 @@ LAST=iter_2                                    # Gold SFT만 iter_0
     --out $ARM/headline
 ```
 
-5개 arm 전부:
+looped arm 전부:
 ```bash
-for ARM in runs/l5_staged_dpo_s3_* runs/l5_lspo_* runs/l5_gold_inloop_* runs/l5_rft_*; do
+for ARM in runs/l5_staged_dpo_s3_* runs/l5_lspo_* runs/l5_gold_inloop_* runs/l5_rft_* \
+           runs/l5_bridge_inloop_*; do
   .venv/bin/python scripts/cliff_reroll.py --run-dir "$ARM" \
       --qids-file holdout --n 32 --passes 1 \
       --model-path "$ARM/iter_2/ckpt" --out "$ARM/headline"
@@ -173,7 +193,10 @@ bash scripts/eval_bench.sh runs/l5_staged_dpo_s3_20260901_093000/iter_2/ckpt -b
 bash scripts/eval_bench.sh runs/l5_gold_sft_20260909_170000/iter_0/ckpt -b   # Gold SFT만 iter_0
 ```
 
-aime24/25/26 + hmmt25를 n=64로, math500_hard를 n=8로 채점한다(arm당 ~4시간).
+5개 세트 전부 n=32(avg@32)로 채점한다 — cliff holdout endpoint와 같은 n. arm당 **~4.5시간**
+(GPU 2개 실측 환산: n=64 시절 AIME 4세트 6.4h → 3.2h, math500_hard n=8 20분 → n=32 ~80분).
+**base 모델도 같은 설정으로 한 번** 돌린다 (`bash scripts/eval_bench.sh -b`, MODEL 인자 없이 →
+`model.base`). 비교되는 모든 모델이 같은 n이어야 하고, 과거 n=64 base run은 재사용하지 않는다.
 결과는 `runs/bench/<slug>_<timestamp>/`에 별도로 떨어진다.
 
 > **확인**: 끝나면 `runs/bench/<...>/iter_0/benchmark_eval/metrics.json`의
@@ -219,14 +242,17 @@ arm의 숫자에서 이 몫을 빼낼 수 없다.
 ```bash
 bash scripts/collect_run_artifacts.sh \
     runs/l5_staged_dpo_s3_* runs/l5_lspo_* runs/l5_gold_inloop_* \
-    runs/l5_rft_* runs/l5_gold_sft_* runs/floor_holdout runs/bench/*
-# -> l5_artifacts_<timestamp>.tar.gz  (5 arm 합쳐 ~10MB)
+    runs/l5_rft_* runs/l5_gold_sft_* runs/l5_bridge_inloop_* runs/floor_holdout runs/bench/*
+# -> l5_artifacts_<timestamp>.tar.gz  (6 arm 합쳐 ~12MB)
 ```
 
 **§2를 먼저 다 끝낸 뒤에** 실행할 것 — headline/floor/bench 결과가 함께 담긴다.
 
 담기는 것: 동결 config, `metrics.jsonl`, 각 stage의 stats/report JSON,
-train 로그(loss·guard 곡선), 모든 `verdicts.jsonl`(샘플별 채점), questions 분할.
+train 로그(loss·guard 곡선), 모든 `verdicts.jsonl`(샘플별 채점), questions 분할,
+그리고 벤치마크의 **문항별** 채점(`benchmark_eval/*/samples_slim.jsonl` — 스크립트가
+`samples.jsonl`에서 생성 텍스트만 떼어 만든다, 모델당 57MB → 1.2MB). `metrics.json`에는
+집계값만 있어서 arm 간 paired 검정을 하려면 이 행들이 필요하다.
 
 체크포인트는 **그쪽 서버에 그대로 두면 된다.** 나중에 추가 분석이 필요하면 그때 요청.
 
