@@ -195,13 +195,26 @@ eval:
   # the canary curve and the final n=32 number stay the same quantity (only `n`
   # differs, and avg@n is unbiased at any n).
   #
-  # SET CHOICE: aime25 + hmmt25, the two sets this base is WEAKEST on (avg@64
-  # 0.480 / 0.305 measured) — aime24 (0.620) and math500_hard (0.854) leave too
-  # little headroom to show movement. The cost is precision: 30 questions x 4
-  # samples is a coarse canary (paired SE ~4pp per set, ~2.8pp pooled over the
-  # 60), so read the TREND across iterations, never a single-iteration gap.
-  # math500_hard was also the most precise regression detector here (134
-  # questions); its job now falls to the final n=32 sweep alone.
+  # SET CHOICE: one probe per direction, not two of the same thing. The three
+  # AIME sets are near-duplicates of each other and, at n=4 on 30 questions, all
+  # too coarse to read (paired SE ~4pp each, ~2.6pp for any two of them pooled).
+  # MEASURED on the base at n=32 (runs/bench/Qwen_Qwen3-4B-Instruct-2507_bench_eval_20260901_110721):
+  #
+  #   set            Q    avg    p=0   p>=.9   paired SE @n=4
+  #   hmmt25        30   0.321  33.3%  20.0%       3.35pp
+  #   math500_hard 134   0.863   5.2%  76.1%       1.19pp
+  #   (aime24/25/26 30   .61/.48/.50               ~4.0pp each)
+  #
+  #  * hmmt25 — the hardest set and the most cliff-like (a third of its
+  #    questions are 0/32 for the base), so this is where transfer OUT of the
+  #    training distribution would show up first.
+  #  * math500_hard — the regression alarm. 134 questions make it 3x more
+  #    precise than any AIME set at the same n, and 76% of them sit at p>=0.9,
+  #    so breakage shows immediately. "Too easy to show improvement" is not a
+  #    defect here: showing improvement is the final n=32 sweep's job, and that
+  #    sweep covers all five sets anyway.
+  #
+  # Still read the TREND across iterations, not a single-iteration gap.
   benchmarks:
-    - {name: aime25, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: hmmt25, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
