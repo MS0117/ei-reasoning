@@ -193,6 +193,10 @@ bash scripts/eval_bench.sh runs/l5_staged_dpo_s3_20260901_093000/iter_2/ckpt -b
 bash scripts/eval_bench.sh runs/l5_gold_sft_20260909_170000/iter_0/ckpt -b   # Gold SFT만 iter_0
 ```
 
+**GPU 한 세트에 모델 하나씩.** `-b`는 nohup 백그라운드라, 여러 줄을 한 셸에 붙여 넣으면
+vLLM 엔진이 동시에 여러 개 떠서 같은 GPU를 물고 OOM 난다. **노드를 나눠 병렬로 돌리는 것은
+문제없고 오히려 가장 빠르다** — 한 노드에서 몰아 돌릴 때만 하나씩 순차로.
+
 5개 세트 전부 n=32(avg@32)로 채점한다 — cliff holdout endpoint와 같은 n. arm당 **~4.5시간**
 (GPU 2개 실측 환산: n=64 시절 AIME 4세트 6.4h → 3.2h, math500_hard n=8 20분 → n=32 ~80분).
 **base 모델도 같은 설정으로 한 번** 돌린다 (`bash scripts/eval_bench.sh -b`, MODEL 인자 없이 →
