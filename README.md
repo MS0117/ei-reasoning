@@ -79,10 +79,7 @@ Resume a crashed run with `-r <run name>` — stages, shards and rows all skip w
 `<arm>` below is the run directory, e.g. `runs/l5_staged_dpo_s3_20260901_093000`.
 
 ```bash
-# competition benchmarks — aime24/25/26 + hmmt25 + math500_hard, all at n=32 (avg@32).
-# ONE MODEL PER SET OF GPUs: -b backgrounds the job, so pasting several of these
-# into one shell starts several vLLM engines on the same cards and they OOM.
-# Different nodes in parallel is fine — and fastest.
+# competition benchmarks — aime24/25/26 + hmmt25 + math500_hard, all at n=32 (avg@32)
 bash scripts/eval_bench.sh <arm>/iter_2/ckpt -b          # arms 1-4 and 6
 bash scripts/eval_bench.sh <arm>/iter_0/ckpt -b          # arm 5 (gold_sft: one iteration)
 bash scripts/eval_bench.sh -b                            # base model — ONCE, same n
