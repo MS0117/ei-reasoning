@@ -5,15 +5,28 @@
 # comparable to runs from this file and live in docs/results/toy_cliff/ plus
 # each old run's own frozen config. New runs go to runs/toy_cliff_2/ (-o) so
 # rank_toy_runs.py never puts two different denominators in one table.
-# Budget is matched ACROSS ALL FIVE ARMS — round 2 (2026-08-31): 6 gradient
-# steps, 16 samples/question (round 1 was 4 / 24: measured on the finished 250
-# runs, samples 17-24 bought only +4-5pp absolute and left the BRIDGE-vs-gold
-# contrast unchanged, +17.6 -> +16.8pp at identical 36.8% discordance, while the
-# fit loss was still falling linearly at step 4; a sample costs ~9 min, a step
-# ~13 min at 250 cliffs). Round-1 runs stay comparable at conversion@16 —
-# recompute from the first 16 attempts in improved.jsonl. Staged's final-rollout
-# curve is steeper (16->8 = -7.6pp vs -5.2pp for single fits), so this budget
-# slightly disfavours the staged arms — say so when reading the numbers.
+# Budget is matched ACROSS ALL FIVE ARMS: 4 gradient steps, 24 samples/question.
+#
+# ROUND 2 TRIED 6 STEPS / 16 SAMPLES AND IT WAS REVERTED (2026-09-01). Paired on
+# the same 250 cliffs, with round 1 re-scored at conversion@16 so the sample
+# budget matches, NO arm moved: CONTROL +1.6pp (p=.64 — this is the resampling
+# noise floor, since CONTROL has no fit at all), LSPO -0.8 (p=.90), BRIDGE +3.6
+# (p=.35), STAGED -1.2 (p=.82), STAGED_DPO +4.0 (p=.29). Step 3->4 had bought
+# +9pp, so diminishing returns start around 4.
+#
+# The extra steps COST candidate quality instead. C(y) under the base policy
+# (lower = easier for the student to learn) got worse everywhere a fit exists,
+# in proportion to how far the fit target sits from the base:
+#     CONTROL (no fit)  2.76 -> 2.83      LSPO   3.44 -> 7.03   (target NLL 1.24)
+#     BRIDGE            3.73 -> 4.91      STAGED 3.63 -> 3.77   (target NLL ~.52)
+# LSPO is the warning: at 6 steps its candidates' s_mean reaches 1.286, i.e. the
+# adapter has started REPLICATING a target that is far off-policy, and buys no
+# conversion for it. Staged suffers least because 3+3 splits the fit.
+#
+# Also: 8+8 disfavours the staged arms (their final-rollout curve is steeper,
+# 16->8 = -7.6pp vs -5.2pp for single fits) — BRIDGE vs STAGED flipped from
+# -0.8pp to +6.4pp purely from the budget. Keep 8+16 for that comparison.
+# Full record: docs/toy_cliff_lora_fits.md Part II.
 # ~100 questions per transient adapter (the old pooled condition was 107/adapter
 # — leaving 300 pooled would trade the arm effect for adapter dilution).
 # ---------------------------------------------------------------------------
@@ -100,7 +113,7 @@ improve:
   operator: self_resample     # <-- THE ONLY METHODOLOGICAL DIFFERENCE:
                               # no LoRA fit, no gold y*, no bridges. Gold
                               # solutions are never read on this arm.
-  n: 16                       # same sampling budget as the operator arms
+  n: 24                       # same sampling budget as the operator arms
   temperature: 1.2
   top_p: 0.98
   max_tokens: 16384

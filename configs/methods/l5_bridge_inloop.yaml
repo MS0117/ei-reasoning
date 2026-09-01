@@ -199,9 +199,26 @@ eval:
   # math500_hard used to be capped at 8192 and MEASURED 6.5% -> 8.8% truncation
   # across iterations, which censors exactly the arms that reason longest and
   # drifts as the policy does.
-  benchmark_every: 2          # every other iteration: a canary needs a trend,
-                              # not a reading per step (~25 min saved per arm,
-                              # measured 1424-1497s per benchmark_eval)
+  benchmark_every: 1          # EVERY iteration — the per-iteration benchmark curve
+                              # is wanted in the paper, and back-filling a skipped
+                              # iteration later would need that checkpoint to still
+                              # exist on the machine that trained it.
+  # SAMPLING = temp .7 / top_p .8 / top_k 20, the setting Qwen3-*-Instruct-2507
+  # ships as its own recommendation for NON-thinking use (which is how this base
+  # runs, model.chat_template_kwargs.enable_thinking: false). .6/.95 is the
+  # THINKING-mode / DeepSeek-R1 setting and is wrong for this model; it is what
+  # configs/bench_eval.yaml still carried on 2026-09-01, and the L3 preliminary
+  # bench sweep ran under it. The L5 headline sweep must use THESE values, so
+  # the canary curve and the final n=32 number stay the same quantity (only `n`
+  # differs, and avg@n is unbiased at any n).
+  #
+  # SET CHOICE: aime25 + hmmt25, the two sets this base is WEAKEST on (avg@64
+  # 0.480 / 0.305 measured) — aime24 (0.620) and math500_hard (0.854) leave too
+  # little headroom to show movement. The cost is precision: 30 questions x 4
+  # samples is a coarse canary (paired SE ~4pp per set, ~2.8pp pooled over the
+  # 60), so read the TREND across iterations, never a single-iteration gap.
+  # math500_hard was also the most precise regression detector here (134
+  # questions); its job now falls to the final n=32 sweep alone.
   benchmarks:
-    - {name: aime24, n: 8, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
-    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: aime25, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: hmmt25, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

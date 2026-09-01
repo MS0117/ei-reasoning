@@ -258,14 +258,50 @@ train 로그(loss·guard 곡선), 모든 `verdicts.jsonl`(샘플별 채점), que
 
 ---
 
-## 4. 자주 걸리는 것
+## 4. 80GB 미만 GPU에서 돌릴 때 (A6000 48GB 실측)
+
+H100/H200/A100 80GB면 이 절은 건너뛴다 — 아래 실측 41.9GB가 카드의 절반도 안 된다.
+**A6000(47.4GB) 같은 48GB 카드에서는 train 단계가 기본 설정으로 터진다.** 2026-08-31
+`l5_bridge_inloop` mix300 스모크에서 세 번 시도해 얻은 실측:
+
+| 시도 | 설정 | 결과 |
+|---|---|---|
+| 1 | A6000 **2장** | step **0**/34에서 OOM (7.49 GiB 요청 실패) |
+| 2 | A6000 **4장** | step **3**/34에서 OOM (5.60 GiB 요청, free 5.51 GiB — 90MB 부족) |
+| 3 | A6000 4장 + `expandable_segments` | **34/34 완주**, 22분, ckpt 8.82GB ✅ |
+
+그래서 48GB 카드에서는 **둘 다** 필요하다:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+bash scripts/run.sh -c configs/methods/l5_bridge_inloop.yaml -b
+```
+
+* **GPU 4장** — ZeRO-2는 optimizer state(4B 파라미터 × 12바이트 = 48GB)를 rank 수로 나눈다.
+  2장이면 24GB/GPU라 파라미터 8GB·통신 버퍼와 합쳐 자리가 안 남는다. 4장이면 12GB로 준다.
+  srun으로 잡을 때 `--gres=gpu:4`.
+* **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — 4장으로도 부족했던 이유는 총량이
+  아니라 **파편화**였다(시도 2에서 "reserved but unallocated 7.68 GiB"). 환경변수라 config
+  해시가 안 바뀌어 **`-r` 재개가 그대로 되고 실험 설정(seq len·batch·epoch)도 불변**이다.
+
+그래도 터지면 실험을 바꾸지 않는 카드가 둘 더 있다: `configs/deepspeed/zero2.json`의
+`reduce_bucket_size`/`allgather_bucket_size`를 5e8 → 5e7(약 7GB 절약), 그다음
+`--override train.backend=zero3`(파라미터도 샤딩, 약 4GB. 단 해시가 바뀌어 재개 불가 →
+새 run으로).
+
+> **srun 안에서는 `-g`를 주지 말 것.** SLURM이 이미 `CUDA_VISIBLE_DEVICES`를 할당분으로
+> 좁혀 놨고, 바깥 `nvidia-smi` 번호를 넘기면 엉뚱한 카드를 잡는다. 같은 이유로 GPU 사용량
+> 확인도 srun 셸 안에서 해야 한다(밖에서는 다른 카드가 보인다).
+
+## 5. 자주 걸리는 것
 
 | 증상 | 원인 / 대처 |
 |---|---|
 | `run config mismatch for runs/...` | 같은 run 이름에 다른 오버라이드를 준 것. 오버라이드를 빼거나 새 이름으로. |
 | `[wandb] no API key ... falling back to offline` | 정상. 무시해도 된다. |
 | `[pool] 0/N results` 가 한참 유지 | 정상. shard 하나가 끝나야 카운트가 오른다. 로그가 안 늘고 GPU가 0%면 그때 확인. |
-| GPU OOM | `--override engine.gpu_memory_utilization=0.90` (기본 0.95). 그래도 나면 0.85. |
+| GPU OOM — **생성 단계**(rollout/improve/eval) | `--override engine.gpu_memory_utilization=0.90` (기본 0.95). 그래도 나면 0.85. |
+| GPU OOM — **train 단계** | 위 노브는 vLLM 전용이라 train에는 무효(별도 프로세스). 80GB 미만 카드면 §4 참조. |
 | flash-attn 로드 실패 | GPU 아키텍처 불일치. `scripts/check_env.py` 결과와 함께 알려줄 것. |
 | 학습 중 중단 | 같은 이름으로 `-r` 재개. stage/shard/행 단위로 이어진다. |
 
