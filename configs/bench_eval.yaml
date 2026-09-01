@@ -56,8 +56,8 @@ eval:
   greedy_pass1: false           # holdout eval not used standalone
   benchmark_verifier: math_strict
   benchmarks:
-    - {name: aime24, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: aime25, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: aime26, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: hmmt25, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
-    - {name: math500_hard, n: 32, temperature: 0.6, top_p: 0.95, top_k: 20, max_tokens: 16384}
+    - {name: aime24, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: aime25, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: aime26, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: hmmt25, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: math500_hard, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

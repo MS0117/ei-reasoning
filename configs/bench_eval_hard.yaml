@@ -1,0 +1,64 @@
+# Harder / cliff-richer competition sets — a SECOND sweep, kept separate from
+# configs/bench_eval.yaml so the running L3 sweep's grading key is untouched
+# (eval_bench_sweep.sh compares benchmark lists and would otherwise re-run).
+# Same sampling as bench_eval.yaml (non-thinking Qwen3-4B-2507, temp .7 /
+# top_p .8 / top_k 20, 16k, n=32 -> avg@32). Every compared model, the base
+# included, must run at this same n.
+#
+# Why these (MathArena *_outputs, per-problem 0/4 counts for base-level
+# proxies, 2026-09-02): hmmt_feb_2025 (our hmmt25) has 16/30 problems at 0/4
+# for DeepSeek-R1-Distill-14B (32% = our base's level). hmmt_nov_2025 and
+# hmmt_feb_2026 are same-family sets (Qwen3-4B-2507-Think 53% on feb_2026,
+# 10/33 at 0/4); smt_2025 is 53 problems, 17 at 0/4 (55% for Distill-14B);
+# apex-shortlist is 47 national-olympiad problems, 33/47 at 0/4 even for the
+# THINKING 4B (16%) -> expect our non-thinking base near the floor: read it via
+# the stratified 0/32-bucket endpoint (bench_stratified.py), not the mean.
+# brumo_2025 (Distill-14B 68%, 7/30 at 0/4) was judged too easy and left out.
+# AMO-Bench full has 16/50 description/set/variable answers our math_strict
+# grader cannot score; haoranli-ml/AMO-Bench-Int (30) is the InT paper's
+# filter (arXiv 2601.14209, CMU-AIRe, base = Qwen3-4B-Instruct-2507 — OUR
+# base): drops all 16 non-number answers plus 4 number answers that are
+# nested-radical closed forms (AMO ids 8, 12, 22, 34); == the AMO slice of
+# CMU-AIRe/InT-test-set. Their APEX-Int (49) is a 2026-02 snapshot of
+# apex-shortlist (one restated problem, one extra, and idx 17 graded 3 vs
+# MathArena's current 4) — we use MathArena's maintained 47. InT Table 4 base
+# scores (T=1.0, 16k): AMO pass@8 26.2%, Apex pass@8 20.8%, HMMT Nov pass@1
+# 41.6%, IMO-AnswerBench(40-subset) pass@1 11.7% — so the base is NOT at zero.
+#   bash scripts/eval_bench_sweep.sh -c configs/bench_eval_hard.yaml -b base <ckpts...>
+
+run:
+  name: bench_eval_hard
+  wandb:
+    project: ei_reasoning
+    entity: null
+    mode: online
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  chat_template_kwargs: {enable_thinking: false}
+
+engine:
+  gpus: null
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 12288
+
+eval:
+  greedy_pass1: false
+  benchmark_verifier: math_strict
+  benchmarks:
+    # hmmt25 = the preset (MathArena/hmmt_feb_2025), duplicated from
+    # bench_eval.yaml on purpose so this config can stand alone if the first
+    # sweep is discarded.
+    # hmmt25 dropped 2026-09-02 (time): reuse the finished bench_eval.yaml sweep's
+    # hmmt25 rows (T=0.6/top_p .95) — within-set paired comparisons stay valid;
+    # note the sampling difference if pooling across sets.
+    # - {name: hmmt25, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: hmmt_feb26, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/hmmt_feb_2026, split: train, bench_name: hmmt_feb26},
+       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: smt25, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/smt_2025, split: train, bench_name: smt25},
+       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: apex_short, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/apex-shortlist, split: train, bench_name: apex_short},
+       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: amo_int, adapter: hf_benchmark, adapter_args: {hf_name: haoranli-ml/AMO-Bench-Int, split: train, bench_name: amo_int},
+       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

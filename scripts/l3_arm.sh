@@ -23,6 +23,11 @@ SPLIT="$SRC/iter_0/cliff_split.json"
 [ -f "$SPLIT" ] || { echo "missing $SPLIT — run scripts/cliff_split.py first"; exit 1; }
 S1P_RHO="${S1P_RHO:-0.06}"
 
+# eval only when the frozen run actually has a holdout split (data.eval_holdout>0
+# at freeze time; the InT freeze runs eval_holdout=0 -> no holdout, no eval stage).
+STAGES="rollout,partition,anchor,improve,filters,build_dataset,train"
+[ -s "$SRC/questions/holdout.jsonl" ] && STAGES="$STAGES,eval"
+
 TS="$(date +%Y%m%d_%H%M%S)"
 # ARM_TAG labels a variant of the same arm (e.g. ARM_TAG=dropEOS). It must move
 # the run DIR and run.name TOGETHER: loop.py derives its run_dir from
@@ -33,7 +38,7 @@ DST="runs/$NAME"
 COMMON=(
   --override "run.name=$NAME"
   # the frozen L2 config stops at build_dataset with 4 iterations — arms train once:
-  --override "loop.stages=[rollout,partition,anchor,improve,filters,build_dataset,train,eval]"
+  --override "loop.stages=[$STAGES]"
   --override "loop.iterations=1"
   --override "eval.benchmarks=[]"
   --override "data.exclude_train_qids=$SPLIT"
@@ -78,12 +83,16 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU" .venv/bin/python -m expert_iter.l
 NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU" .venv/bin/python scripts/cliff_reroll.py \
   --run-dir "$SRC" --model-path "$DST/iter_0/ckpt" \
   --qids-file "$SPLIT:B" --passes 1 --out "$DST/iter_0/reroll_B"
+# base floor: pass_1 only exists on 2-pass rerolls (the InT freeze floor is B-only x32 x1)
+FLOOR=("$SRC/iter_0/reroll/pass_0/verdicts.jsonl")
+[ -f "$SRC/iter_0/reroll/pass_1/verdicts.jsonl" ] && FLOOR+=("$SRC/iter_0/reroll/pass_1/verdicts.jsonl")
 .venv/bin/python scripts/attractor_mass.py \
-  --verdicts "$SRC/iter_0/reroll/pass_0/verdicts.jsonl" "$SRC/iter_0/reroll/pass_1/verdicts.jsonl" \
+  --verdicts "${FLOOR[@]}" \
   --compare "$DST/iter_0/reroll_B/pass_0/verdicts.jsonl" \
   --qids-file "$SPLIT:B" --out "$DST/iter_0/attractor_B_compare.json"
 
 echo
 echo ">>> arm $ARM${ARM_TAG:+ ($ARM_TAG)} done: $DST"
-echo ">>> holdout: $DST/metrics.jsonl | dataset: $DST/iter_0/dataset/stats.json"
+case "$STAGES" in *,eval) echo ">>> holdout: $DST/metrics.jsonl";; esac
+echo ">>> dataset: $DST/iter_0/dataset/stats.json"
 echo ">>> B transfer: $DST/iter_0/attractor_B_compare.json (printed above)"

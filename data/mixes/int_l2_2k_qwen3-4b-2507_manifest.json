@@ -1,0 +1,12 @@
+{
+  "name": "int_l2_2k_qwen3-4b-2507",
+  "total": 2000,
+  "cliff": 400,
+  "frontier": 150,
+  "solved": 1450,
+  "subset_of": "data/mixes/int_mix6k_qwen3-4b-2507.jsonl",
+  "cliff_rule": "first 400 of the mix's InT cliff stratum in its stable_hash('int-mix',problem) order (disjoint from the 300-row L5 cliff holdout by construction)",
+  "frontier_solved_rule": "stable_hash('int-l2', question) order over int_mix6k's frontier/solved strata (verbatim mix6k rows)",
+  "mirrors": "L2 hybrid openr1_hybrid_c400_n2000 (cliff 400 / frontier 150 / solved 1450)",
+  "gold": "meta.gold_solution present on all rows"
+}

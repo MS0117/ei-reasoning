@@ -1,0 +1,32 @@
+{
+  "name": "int_mix6k_qwen3-4b-2507",
+  "total": 6000,
+  "solved_frontier_from": "openr1_mix6k_qwen3-4b-2507.jsonl (verbatim, passrate_class in {solved,frontier})",
+  "n_solved_frontier": 3270,
+  "n_cliff": 2730,
+  "n_cliff_int": 2022,
+  "n_cliff_openr1_topup": 708,
+  "n_cliff_holdout": 300,
+  "cliff_source": "CMU-AIRe/InT-hard-set[train] (+ openr1 mix6k cliff top-up, hash-ordered, to keep the 2,730 quota)",
+  "cliff_pool_after_filters": 2322,
+  "drops": {
+    "empty_answer": 0,
+    "proof_worded": 510,
+    "gold_not_self_gradable": 747,
+    "no_reference_solution": 295,
+    "intra_dedup": 62,
+    "dup_vs_bench_or_mix6k": 572
+  },
+  "dup_hit_by": {
+    "mix6k": 530,
+    "bench:aime25": 3,
+    "bench:aime24": 1,
+    "bench:apex_short": 2,
+    "openr1_holdout": 34,
+    "bench:math500_hard": 1,
+    "bench:smt25": 1
+  },
+  "order": "stable_hash('int-mix', problem) — hash-deterministic, holdout drawn from the SAME ordered split (exchangeable)",
+  "filters": "empty-answer, proof-worded regex, math_strict gold self-grade, reference_solution required (mix AND holdout), intra-set prefix dedup, rename-robust shingle dedup (>=5 rare 8-word shingles) vs 10 benchmarks + mix6k + openr1 mix8k cliff holdout",
+  "gold_solution": "meta.gold_solution = InT reference_solution (human/gemini)"
+}
