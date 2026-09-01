@@ -50,10 +50,10 @@ eval:
     # hmmt25 = the preset (MathArena/hmmt_feb_2025), duplicated from
     # bench_eval.yaml on purpose so this config can stand alone if the first
     # sweep is discarded.
-    # hmmt25 dropped 2026-09-02 (time): reuse the finished bench_eval.yaml sweep's
-    # hmmt25 rows (T=0.6/top_p .95) — within-set paired comparisons stay valid;
-    # note the sampling difference if pooling across sets.
-    # - {name: hmmt25, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    # hmmt25 re-run here at T=0.7/top_p 0.8 (user decision 2026-09-02) so every
+    # set in this config shares one sampling setting; the old bench_eval.yaml
+    # sweep's hmmt25 (T=0.6/top_p .95) stays comparable only within itself.
+    - {name: hmmt25, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: hmmt_feb26, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/hmmt_feb_2026, split: train, bench_name: hmmt_feb26},
        n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: smt25, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/smt_2025, split: train, bench_name: smt25},
