@@ -30,7 +30,17 @@ export HF_HOME="$EI_BASE/hf_cache"
 export UV_CACHE_DIR="$EI_BASE/uv_cache"
 export VLLM_CACHE_ROOT="$EI_BASE/vllm_cache"
 export TRITON_CACHE_DIR="$EI_BASE/triton_cache"
-mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" 2>/dev/null || true
+
+# uv itself and the Python 3.11 it provisions must ALSO live on the NAS.
+# setup.sh installs both under $HOME by default, and `.venv/bin/python` is a
+# symlink into the interpreter's install dir — so a NAS-resident .venv whose
+# interpreter sat in the container's $HOME comes back DANGLING after a recycle.
+export UV_INSTALL_DIR="$EI_BASE/bin"
+export UV_PYTHON_INSTALL_DIR="$EI_BASE/uv_python"
+export PATH="$UV_INSTALL_DIR:$PATH"
+
+mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" \
+         "$UV_INSTALL_DIR" "$UV_PYTHON_INSTALL_DIR" 2>/dev/null || true
 
 # WANDB_API_KEY (and anything else secret) from the NAS-only file.  Without it
 # wandb_utils silently downgrades an `online` config to offline, and offline
