@@ -15,3 +15,7 @@ logs/
 
 # local scratch
 *.tmp
+
+# secrets (scripts/env_nhn.sh reads $EI_BASE/secrets.env off the NAS)
+secrets.env
+.env
