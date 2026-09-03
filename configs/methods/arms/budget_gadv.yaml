@@ -1,0 +1,47 @@
+# L3 arm overlay: the group-advantage objective at an S1/S3-comparable budget.
+# Same objective as arms/gadv.yaml; only the data budget differs. Rationale
+# (measured on the InT freeze, B excluded, 2026-09-04):
+#   - the full gadv set is 75.9M tokens vs S1's 23.0M, because every wrong row
+#     is trained and failures are long; 2 epochs of it took 6.3h on srv08 and
+#     the theta0 clip had already zeroed 1/3 of the negative mass by epoch 2
+#     (clip/frac_neg 0.20 -> 0.34), so the second pass is the wrong regime for
+#     an offline buffer anyway
+#   - 1 epoch x {correct all, wrong <= 4, truncated <= 1} = 54.3M tokens,
+#     275 optimizer steps (S1/S3: 282) -> ~1.2x S1 tokens, same step count
+#   - truncated failures are answer-less singletons (lightest negative mass,
+#     12% of it) yet 23% of the tokens at 16,384 each; one per question keeps
+#     the "ran out of budget" signal and drops the copies (tokens 23% -> 12%,
+#     mass 12% -> 9%). 0 would leave frontier questions whose failures are all
+#     truncated with no negative row at all.
+#
+# NAME: "budget_gadv", not "gadv_budget", on purpose -- scripts/gadv_arm_int.sh
+# resolves its checkpoint with the glob runs/L3_P_gadv_*/iter_0/ckpt, which a
+# run dir named L3_P_gadv_budget_* would hijack (ls -dt picks the newest).
+# L3_P_budget_gadv_* stays out of that glob.
+#
+#   PRESET=configs/methods/arms/budget_gadv.yaml bash scripts/l3_arm.sh P <FROZEN> 0,1
+
+train:
+  objective: gadv
+  sft:
+    epochs: 1.0
+    cliff:
+      enabled: false
+  gadv:
+    gamma: 1.0
+    rescue_dose: 1.0
+    neg_scale: 1.0
+    solved_floor: 0.0
+    solved_floor_max_per_question: 1
+    correct_max_per_question: 8
+    wrong_max_per_question: 4
+    wrong_truncated_max_per_question: 1
+    clip:
+      enabled: true
+      eps_lo: 0.2
+      eps_hi: 0.2
+    guard_weight: 1.0
+    accumulate: false
+    wrong_drop_terminal_eos: false
+    prepass_batch_size: 1
+    cache_dtype: float32

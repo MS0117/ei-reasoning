@@ -1,0 +1,125 @@
+# One-iteration smoke test of the GROUP-ADVANTAGE objective (train.objective:
+# gadv) on a tiny model: same staged bridge-SFT operator as smoke_staged.yaml,
+# then build_dataset's gadv branch (frontier groups + rescue groups from the raw
+# rollouts) and the GadvTrainer with the theta0 pre-pass + clipped surrogate.
+# Minutes on one GPU; validates plumbing, not quality. Needs >= 1 frontier or
+# rescued question in the 16-question smoke set — rollout.n=4 with a 2048 cap
+# gives Qwen3-0.6B a chance at partial credit (run_gadv errors out loudly if
+# no group produced a row).
+#
+#   bash scripts/smoke.sh 0 configs/methods/smoke_gadv.yaml
+
+run:
+  name: smoke_gadv
+  seed: 17
+  wandb:
+    mode: disabled
+
+model:
+  base: Qwen/Qwen3-0.6B
+
+engine:
+  max_model_len: 8192         # bridge prompt (question + y*) + 4096-token bridges
+  gpu_memory_utilization: 0.60
+  enable_lora: true
+  max_loras: 4
+  max_lora_rank: 16
+
+data:
+  adapter: hf_math
+  adapter_args:
+    preset: openr1
+    include_solution: true
+    max_items: 300            # stop scanning after 300 kept rows (smoke fast-path)
+    n_questions: 16
+    seed: 17
+  eval_holdout: 4
+
+rollout:
+  n: 4
+  max_tokens: 2048            # fewer truncations -> more frontier groups for the smoke
+
+partition:
+  cliff_max_correct: 0
+
+anchor:
+  policy: none                # staged spec: no anchor
+
+improve:
+  operator: staged_bridge_sft
+  n: 4
+  max_tokens: 4096            # 1024 truncated EVERY bridge on Qwen3-0.6B
+                              # (48/48 finish_reason=length -> zero fit pairs)
+  lora_sft:
+    adapter_scope: pooled
+    fit:
+      steps: 2
+      max_pair_tokens: 6144
+      num_processes: null
+    bridge:
+      n: 4                    # 0.6B needs the extra attempts even with y* shown
+      max_keep: 2
+    staged:
+      rollout_n: 2
+      num_stages: 1
+      chain_adapter: true
+      unsolved_targets: regen_bridge   # exercises bridge regen THROUGH the adapter
+      solved_targets: self_wash_min_c  # exercises the wash C(y) scoring pass
+      train_scope: full_pool
+      stage2_objective: dpo   # exercises the preference path: chosen = the bridge,
+                              # rejected = this adapter's own stage-1 failure
+      dpo:
+        beta: 0.1
+        sft_weight: 0.5       # also exercises the RPO NLL term
+        negative_selection: random
+        reference: init
+      stage2_steps: 2
+      final_rollout_n: 4
+      final_rollout_scope: unsolved
+      emit: all
+
+filter:
+  max_total_tokens: 6144
+  selection:
+    method: c_score           # exercises the S_mean/S_tail scoring pass
+    always_score: false     # true -> measure C(y) even when method != c_score
+    lambda_tail: 1.0
+    gamma_dtail: 0.0
+    tail_fraction: 0.1
+
+train:
+  objective: gadv
+  backend: single
+  max_seq_len: 8192
+  sft:
+    epochs: 2                 # 2 epochs so the clip actually binds in epoch 2
+    global_batch_size: 8
+    logging_steps: 1
+    cliff:
+      enabled: false          # mutually exclusive with gadv
+  gadv:
+    gamma: 1.0
+    rescue_dose: 1.0
+    neg_scale: 1.0
+    solved_floor: 0.0
+    correct_max_per_question: 8
+    wrong_max_per_question: 8
+    wrong_truncated_max_per_question: 8   # per-question cap on 16k truncated failures (budget arm: 1)
+    clip:
+      enabled: true
+      eps_lo: 0.2
+      eps_hi: 0.2
+    guard_weight: 1.0         # selection.method=c_score above provides the refs
+    accumulate: false
+    prepass_batch_size: 1
+    cache_dtype: float32
+
+loop:
+  iterations: 1
+
+eval:
+  passk:
+    k: 4
+  max_tokens: 1024
+  benchmarks:
+    - {name: math500_hard, adapter_args: {max_items: 5}, n: 2, max_tokens: 1024}

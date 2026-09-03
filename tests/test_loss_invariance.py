@@ -180,3 +180,71 @@ def test_cliff_accum_topology_invariance(tmp_path, monkeypatch):
             f"parameter {k} diverged between accum topologies (cliff objective): "
             f"max diff {(sd_a[k] - sd_b[k]).abs().max().item():.3e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# group-advantage objective: same invariance with the clipped surrogate, the
+# theta0 pre-pass callback (runs inside trainer.train()) and the guard
+# ---------------------------------------------------------------------------
+
+def gadv_rows():
+    torch.manual_seed(202)
+    rows = []
+    spec = [("solved", 0.75), ("solved", 0.5), ("solved", 0.25), ("improved", 0.8),
+            ("wrong", -0.75), ("wrong", -0.5), ("wrong", -0.25), ("wrong", -0.8)]
+    for i, (src, adv) in enumerate(spec):
+        p, a, c = 3 + i % 3, (2 if src == "improved" else 0), 4 + i % 5
+        ids = torch.randint(1, 127, (p + a + c,)).tolist()
+        rows.append({"uid": f"g{i}", "source": src, "input_ids": ids, "prompt_len": p,
+                     "anchor_len": a, "completion_len": c, "n_q": 1 if src == "improved" else 0,
+                     "ref_mean_nll": 0.5 if src == "improved" else None,
+                     "advantage": adv, "row_idx": i})
+    return rows
+
+
+def run_once_gadv(model, rows, micro_bs, accum, tmp_path, tag, epochs=2):
+    from datasets import Dataset
+    from transformers import TrainingArguments
+
+    from expert_iter.config import Config
+    from expert_iter.train import GadvCollator, make_gadv_prepass_callback, make_gadv_trainer_cls
+
+    cfg = Config.load(None, overrides=["train.objective=gadv", "filter.selection.always_score=true"])
+    g = cfg.train.gadv
+    args = TrainingArguments(
+        output_dir=str(tmp_path / tag),
+        per_device_train_batch_size=micro_bs,
+        gradient_accumulation_steps=accum,
+        num_train_epochs=epochs, learning_rate=1e-3, lr_scheduler_type="constant",
+        weight_decay=0.0, max_grad_norm=1e9, logging_steps=1,
+        save_strategy="no", report_to=[], seed=7, use_cpu=True,
+        average_tokens_across_devices=True, remove_unused_columns=False,
+        dataloader_num_workers=0,
+    )
+    collator = GadvCollator(pad_token_id=0, region_weights=W)
+    trainer = make_gadv_trainer_cls()(
+        model=model, args=args, train_dataset=Dataset.from_list(rows),
+        data_collator=collator, gadv_cfg=g,
+    )
+    trainer.add_callback(make_gadv_prepass_callback(trainer, collator, batch_size=g.prepass_batch_size,
+                                                    cache_dtype=g.cache_dtype))
+    trainer.train()
+    assert trainer._old_logp is not None and len(trainer._old_logp) == len(rows)
+    return model
+
+
+@pytest.mark.slow
+def test_gadv_accum_topology_invariance(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    base = tiny_model()
+    rows = gadv_rows()                                     # 8 rows -> 1 window of G=8 per epoch
+
+    m_a = run_once_gadv(copy.deepcopy(base), rows, micro_bs=8, accum=1, tmp_path=tmp_path, tag="ga")
+    m_b = run_once_gadv(copy.deepcopy(base), rows, micro_bs=1, accum=8, tmp_path=tmp_path, tag="gb")
+
+    sd_a, sd_b = m_a.state_dict(), m_b.state_dict()
+    for k in sd_a:
+        assert torch.allclose(sd_a[k], sd_b[k], atol=1e-5, rtol=1e-4), (
+            f"parameter {k} diverged between accum topologies (gadv objective): "
+            f"max diff {(sd_a[k] - sd_b[k]).abs().max().item():.3e}"
+        )

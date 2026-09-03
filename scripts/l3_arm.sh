@@ -3,7 +3,13 @@
 # (docs/objective_decision_20260823.md §3 arm table + §8 amendments)
 #
 #   [ARM_TAG=<variant>] bash scripts/l3_arm.sh <ARM> <FROZEN_RUN_DIR> [GPU_IDS=0,1] [--override k=v ...]
-#   ARM ∈ S0 | S1 | S1p | S3 | S3tok | S4v0 | S4v1   (S4v1 mu via S4_MU env)
+#   ARM ∈ S0 | S1 | S1p | S3 | S3tok | S4v0 | S4v1 | P   (S4v1 mu via S4_MU env)
+#
+#   P = preset arm: PRESET=configs/methods/arms/<name>.yaml is deep-merged onto
+#   the frozen snapshot (scripts/fork_run.py --overlay) before the COMMON
+#   overrides below, so every knob of the arm lives in that YAML. Examples:
+#     PRESET=configs/methods/arms/gadv.yaml bash scripts/l3_arm.sh P <FROZEN> 0,1
+#     PRESET=configs/methods/arms/s3.yaml   bash scripts/l3_arm.sh P <FROZEN> 0,1  # == S3, rho from YAML
 #
 # All arms exclude the B cliffs from training (data.exclude_train_qids ->
 # <frozen>/iter_0/cliff_split.json); S0 additionally excludes the A cliffs
@@ -14,7 +20,7 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-ARM="${1:?usage: l3_arm.sh <S0|S1|S1p|S3|S3tok|S4v0> <FROZEN_RUN_DIR> [GPUS]}"
+ARM="${1:?usage: l3_arm.sh <S0|S1|S1p|S3|S3tok|S4v0|S4v1|P> <FROZEN_RUN_DIR> [GPUS]}"
 SRC="${2:?frozen L2 run dir required}"
 GPU="${3:-0,1}"
 shift $(( $# > 3 ? 3 : $# ))    # anything after the GPU arg = extra --override pairs
@@ -33,7 +39,13 @@ TS="$(date +%Y%m%d_%H%M%S)"
 # the run DIR and run.name TOGETHER: loop.py derives its run_dir from
 # cfg.run.name, so overriding run.name alone sends the loop to an empty dir and
 # it re-runs rollout from scratch. Never pass --override run.name=... here.
-NAME="L3_${ARM}${ARM_TAG:+_$ARM_TAG}_${TS}"
+ARM_LABEL="$ARM"
+if [ "$ARM" = "P" ]; then
+  [ -f "${PRESET:-}" ] || { echo "arm P needs PRESET=<configs/methods/arms/*.yaml>"; exit 1; }
+  PRESET_BASE="$(basename "$PRESET")"
+  ARM_LABEL="P_${PRESET_BASE%.yaml}"
+fi
+NAME="L3_${ARM_LABEL}${ARM_TAG:+_$ARM_TAG}_${TS}"
 DST="runs/$NAME"
 COMMON=(
   --override "run.name=$NAME"
@@ -71,6 +83,8 @@ json.dump({'exclude': sorted(set(d['A'])|set(d['B']))}, open('$ALLQ','w'))"
             --override "train.sft.cliff.negative.mode=v0"
             --override "train.objective=sft+dpo"
             --override "train.dpo.rejected_selection=modal_wrong") ;;
+  P)    # preset overlay: every arm knob comes from $PRESET (COMMON still wins)
+    ARM_OV=(--overlay "$PRESET") ;;
   *) echo "unknown arm: $ARM"; exit 1 ;;
 esac
 
@@ -78,6 +92,15 @@ esac
 
 NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU" .venv/bin/python -m expert_iter.loop \
   --config "$DST/config.yaml"
+
+# SKIP_READOUT=1: train only, leave the B re-roll + attractor compare to the caller
+# (used when the base floor does not exist yet, or the allocation is about to end).
+if [ "${SKIP_READOUT:-0}" = "1" ]; then
+  echo
+  echo ">>> arm $ARM_LABEL${ARM_TAG:+ ($ARM_TAG)} TRAINED (readout skipped): $DST"
+  echo ">>> ckpt: $DST/iter_0/ckpt"
+  exit 0
+fi
 
 # B transfer readout: re-roll B under the arm's checkpoint, compare vs base floor
 NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU" .venv/bin/python scripts/cliff_reroll.py \
@@ -92,7 +115,7 @@ FLOOR=("$SRC/iter_0/reroll/pass_0/verdicts.jsonl")
   --qids-file "$SPLIT:B" --out "$DST/iter_0/attractor_B_compare.json"
 
 echo
-echo ">>> arm $ARM${ARM_TAG:+ ($ARM_TAG)} done: $DST"
+echo ">>> arm $ARM_LABEL${ARM_TAG:+ ($ARM_TAG)} done: $DST"
 case "$STAGES" in *,eval) echo ">>> holdout: $DST/metrics.jsonl";; esac
 echo ">>> dataset: $DST/iter_0/dataset/stats.json"
 echo ">>> B transfer: $DST/iter_0/attractor_B_compare.json (printed above)"

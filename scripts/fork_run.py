@@ -11,6 +11,8 @@ arm's exclusion/negative/rejected_selection settings), then trains.
 Usage (CPU, seconds):
   .venv/bin/python scripts/fork_run.py --src runs/<frozen L2 run> \
       --dst runs/L3_S3_<ts> --override train.sft.cliff.enabled=true [...]
+  # or apply a whole arm preset (sparse YAML deep-merged onto the snapshot,
+  # BEFORE any --override): --overlay configs/methods/arms/gadv.yaml
 Then:
   .venv/bin/python -m expert_iter.loop --config runs/L3_S3_<ts>/config.yaml
 """
@@ -51,12 +53,18 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--dst", required=True)
     ap.add_argument("--iteration", type=int, default=0)
     ap.add_argument("--override", action="append", default=[], metavar="a.b.c=value")
+    ap.add_argument("--overlay", action="append", default=[], metavar="sparse.yaml",
+                    help="arm preset YAML deep-merged onto the frozen snapshot "
+                         "(applied in order, before --override)")
     args = ap.parse_args(argv)
 
     src, dst = Path(args.src), Path(args.dst)
     if dst.exists():
         raise SystemExit(f"[fork_run] {dst} already exists — arms get fresh dirs")
-    cfg = Config.load(src / "config.yaml", overrides=args.override)
+    for ovl in args.overlay:
+        if not Path(ovl).is_file():
+            raise SystemExit(f"[fork_run] overlay not found: {ovl}")
+    cfg = Config.load(src / "config.yaml", overrides=args.override, overlays=args.overlay)
 
     dst.mkdir(parents=True)
     cfg.save(dst / "config.yaml")
@@ -78,7 +86,8 @@ def main(argv: list[str] | None = None) -> None:
         mark_done(artifact, count=payload.get("count", 0), config_hash=cfg.hash(),
                   extra={k: v for k, v in payload.items() if k not in ("count", "config_hash")})
 
-    print(f"[fork_run] {src} -> {dst}  (hash {cfg.hash()}; {len(args.override)} overrides)")
+    print(f"[fork_run] {src} -> {dst}  (hash {cfg.hash()}; {len(args.overlay)} overlays, "
+          f"{len(args.override)} overrides)")
     print(f"[fork_run] next: .venv/bin/python -m expert_iter.loop --config {dst}/config.yaml")
 
 

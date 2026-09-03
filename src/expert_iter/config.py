@@ -753,13 +753,70 @@ class DpoCfg:
 
 
 @dataclass
+class GadvClipCfg:
+    """PPO-style per-token clip of rho_t = pi_theta / pi_theta0 (theta0 = the
+    weights the trainer starts from, cached by a no-grad pre-pass before the
+    first optimizer step). A>0 tokens stop moving once rho > 1+eps_hi, A<0
+    tokens once rho < 1-eps_lo. enabled=false trains the plain -A*log pi."""
+
+    enabled: bool = True
+    eps_lo: float = 0.2
+    eps_hi: float = 0.2
+
+
+@dataclass
+class GadvCfg:
+    """Group-advantage objective (train.objective: gadv) — see
+    docs/objective_gadv_spec_20260903.md.
+
+    Per question the iteration's own rollouts form one group: frontier
+    questions (1..n-1 of n correct) contribute ALL clean-correct rows at
+    A = 1-p and their wrong rows at negative advantages; rescued cliffs (0 of n
+    correct, >=1 kept rescue) form a group of the n base failures + the rescues;
+    fully-solved questions are excluded (solved_floor > 0 re-admits a few rows
+    at that constant advantage). The negative mass of a question equals its
+    positive mass (neg_scale=1 -> zero-sum) and is allocated across the wrong
+    rows in proportion to answer_frequency**gamma (gamma=0 == Dr.GRPO's -p;
+    gamma>0 concentrates it on the modal wrong answer).
+
+    Optimizer/batch knobs (lr, epochs, global/micro batch, region weights, ...)
+    are read from train.sft.*; only objective-specific knobs live here."""
+
+    gamma: float = 1.0                  # answer-frequency exponent on the negative side
+    rescue_dose: float = 1.0            # c on rescue rows: A = (1 - R/(n+R)) * c
+    neg_scale: float = 1.0              # negative total = neg_scale * positive total
+    solved_floor: float = 0.0           # >0: include k==n questions at this constant A
+    solved_floor_max_per_question: int = 1
+    correct_max_per_question: int = 8   # frontier correct rows kept (random subset if capped)
+    wrong_max_per_question: int = 8     # wrong rows kept per question (random subset if capped)
+    # Cap on the TRUNCATED wrong rows (finish_reason != "stop") a question may
+    # contribute, applied before wrong_max_per_question; 0 drops them. They are
+    # answer-less singletons under gamma > 0 (the lightest negative mass) yet
+    # every one is a full max_tokens row, so copies per question buy nothing.
+    wrong_truncated_max_per_question: int = 8
+    clip: GadvClipCfg = field(default_factory=GadvClipCfg)
+    guard_weight: float = 1.0           # displacement hinge on rescue rows (0 disables)
+    # Merge prior iterations' gadv rows (their stored advantages) into this
+    # iteration's set. Default false = the iteration's own rollouts only, the
+    # GRPO reading; data.accumulate is NOT consulted for SFT rows under gadv
+    # (it still governs train_dpo.jsonl).
+    accumulate: bool = False
+    # Drop the trailing stop token from wrong rows (ablation leg; default keeps
+    # it — the NSR form damps confident tokens by (1-p), unlike unlikelihood).
+    wrong_drop_terminal_eos: bool = False
+    prepass_batch_size: int = 1         # theta0 log-prob pre-pass micro-batch
+    cache_dtype: str = "float32"        # float32 | float16 (theta0 cache, CPU)
+
+
+@dataclass
 class TrainCfg:
-    objective: str = "sft"             # sft | dpo | sft+dpo
+    objective: str = "sft"             # sft | dpo | sft+dpo | gadv
     init_from: str = "base"            # base (STaR-style) | last
     backend: str = "zero2"             # single | zero2 | zero3 | fsdp2
     max_seq_len: int = 10240
     sft: SftCfg = field(default_factory=SftCfg)
     dpo: DpoCfg = field(default_factory=DpoCfg)
+    gadv: GadvCfg = field(default_factory=GadvCfg)
 
 
 @dataclass
@@ -829,10 +886,20 @@ class Config:
     # -- construction -------------------------------------------------------
 
     @classmethod
-    def load(cls, path: str | Path | None, overrides: list[str] | None = None) -> "Config":
+    def load(cls, path: str | Path | None, overrides: list[str] | None = None,
+             overlays: list[str | Path] | None = None) -> "Config":
+        """path (full or sparse YAML) < overlays (sparse YAMLs, deep-merged in
+        order) < overrides (dot-path pairs). Overlays are how an arm preset is
+        applied on top of a frozen run snapshot (scripts/fork_run.py --overlay);
+        unknown keys in any layer are still hard errors."""
         raw: dict = {}
         if path is not None:
             raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        for ovl in overlays or []:
+            layer = yaml.safe_load(Path(ovl).read_text(encoding="utf-8")) or {}
+            if not isinstance(layer, dict):
+                raise ValueError(f"overlay {ovl} must be a YAML mapping")
+            raw = deep_merge(raw, layer)
         for ov in overrides or []:
             if "=" not in ov:
                 raise ValueError(f"override must be key.path=value, got {ov!r}")
@@ -1294,7 +1361,7 @@ class Config:
                 f"set eval_holdout=0 to use {self.data.holdout_path!r} as the holdout"
             )
         t = self.train
-        if t.objective not in ("sft", "dpo", "sft+dpo"):
+        if t.objective not in ("sft", "dpo", "sft+dpo", "gadv"):
             raise ValueError(f"train.objective: {t.objective!r}")
         if t.init_from not in ("base", "last"):
             raise ValueError(f"train.init_from: {t.init_from!r}")
@@ -1362,17 +1429,38 @@ class Config:
                     "negative.mode=v1 requires train.objective=sft (sft+dpo would apply the "
                     "modal-wrong negatives twice: in-SFT unlikelihood + the DPO phase)"
                 )
-            sel = self.filter.selection
-            if cl.guard.enabled and not (sel.method == "c_score" or sel.always_score):
+            if cl.guard.enabled:
+                _check_guard_scores(self.filter.selection, "train.sft.cliff.guard")
+        # ---- group-advantage objective (train.gadv) ----
+        g = t.gadv
+        for name, val in (("gamma", g.gamma), ("rescue_dose", g.rescue_dose),
+                          ("neg_scale", g.neg_scale), ("solved_floor", g.solved_floor),
+                          ("guard_weight", g.guard_weight)):
+            if val < 0:
+                raise ValueError(f"train.gadv.{name} must be >= 0")
+        if g.solved_floor_max_per_question < 1 or g.prepass_batch_size < 1:
+            raise ValueError(
+                "train.gadv.solved_floor_max_per_question and prepass_batch_size must be >= 1"
+            )
+        # caps are upper bounds (a cap above rollout.n just means "all rows")
+        for name, val in (("correct_max_per_question", g.correct_max_per_question),
+                          ("wrong_max_per_question", g.wrong_max_per_question)):
+            if val < 1:
+                raise ValueError(f"train.gadv.{name}={val} must be >= 1")
+        if g.wrong_truncated_max_per_question < 0:
+            raise ValueError("train.gadv.wrong_truncated_max_per_question must be >= 0")
+        if not 0 < g.clip.eps_lo < 1 or g.clip.eps_hi <= 0:
+            raise ValueError("train.gadv.clip: eps_lo must be in (0, 1) and eps_hi > 0")
+        if g.cache_dtype not in ("float32", "float16"):
+            raise ValueError(f"train.gadv.cache_dtype: {g.cache_dtype!r} (float32 | float16)")
+        if t.objective == "gadv":
+            if cl.enabled:
                 raise ValueError(
-                    "train.sft.cliff.guard needs the C(y) scores file: set "
-                    "filter.selection.method=c_score or filter.selection.always_score=true"
+                    "train.objective=gadv and train.sft.cliff.enabled are mutually exclusive "
+                    "(gadv replaces the cliff term; set train.sft.cliff.enabled=false)"
                 )
-            if cl.guard.enabled and sel.scope != "continuation":
-                raise ValueError(
-                    "train.sft.cliff.guard requires filter.selection.scope=continuation "
-                    "(the guard's live region must match the scored region)"
-                )
+            if g.guard_weight > 0:
+                _check_guard_scores(self.filter.selection, "train.gadv.guard_weight>0")
         for name, global_bs, micro_bs in (
             ("sft", t.sft.global_batch_size, t.sft.micro_batch_size),
             ("dpo", t.dpo.global_batch_size, t.dpo.micro_batch_size),
@@ -1466,6 +1554,33 @@ def _coerce_scalar(target, value, path: str):
     except ValueError as e:
         raise ValueError(f"config value {path}={value!r} is not a valid {target.__name__}") from e
     return value
+
+
+def _check_guard_scores(sel, who: str) -> None:
+    """The displacement guard joins the C(y) pass's s_mean as its reference, so
+    the scores file must exist and cover the continuation region."""
+    if not (sel.method == "c_score" or sel.always_score):
+        raise ValueError(
+            f"{who} needs the C(y) scores file: set "
+            "filter.selection.method=c_score or filter.selection.always_score=true"
+        )
+    if sel.scope != "continuation":
+        raise ValueError(
+            f"{who} requires filter.selection.scope=continuation "
+            "(the guard's live region must match the scored region)"
+        )
+
+
+def deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursive dict merge used for YAML overlays: nested mappings merge key
+    by key, everything else (scalars, lists, None) is replaced wholesale.
+    Mutates and returns `base`."""
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k] = deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
 
 
 def _set_dotted(d: dict, dotted: str, value) -> None:

@@ -19,6 +19,15 @@ reference); negative.mode=v1 adds source="negative" rows = the base policy's
 modal-wrong failures with any trailing EOS STRIPPED — unlikelihood on the
 stop token suppresses termination and blows up generation length; train.dpo.rejected_selection=modal_wrong switches the DPO pairs'
 rejected to the modal-wrong rollout (the v0 arm).
+
+Group-advantage objective (train.objective: gadv — docs/objective_gadv_spec_20260903.md):
+the SFT rows are built by gadv.build_gadv_examples from the iteration's OWN
+rollouts instead of solved.jsonl — frontier questions contribute every
+clean-correct row (source="solved", A>0) and their wrong rows (source="wrong",
+A<0), rescued cliffs contribute the rescues (source="improved") plus the base
+failures; each row carries `advantage`. examples_sft.jsonl = this iteration's
+gadv rows before exclusion; train_sft.jsonl = after the train.gadv.accumulate
+merge (data.accumulate then governs only train_dpo.jsonl) + exclusion + n_q.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from collections import Counter
 from pathlib import Path
 
 from .config import load_stage_config, stage_argparser
+from .gadv import build_gadv_examples
 from .records import DPOExample, ImprovedCandidate, RolloutSample, SFTExample, VerdictRecord
 from .records import load_any
 from .templates import ensure_eos, training_input_ids
@@ -50,17 +60,22 @@ def main(argv: list[str] | None = None) -> None:
 
     from .records import SolvedTrajectory
 
+    # gadv builds its rows from the raw rollouts (all clean-correct rows of
+    # frontier questions + their failures), not from the shortest-k solved set.
+    gadv = cfg.train.gadv if cfg.train.objective == "gadv" else None
+
     sft: list[SFTExample] = []
-    for s in SolvedTrajectory.load_jsonl(it_dir / "partition" / "solved.jsonl"):
-        completion = ensure_eos(s.response_token_ids, eos)
-        sft.append(SFTExample(
-            uid=stable_hash("solved", s.qid, s.sample_idx, args.iteration),
-            qid=s.qid, source="solved",
-            input_ids=training_input_ids(s.prompt_token_ids, [], completion),
-            prompt_len=len(s.prompt_token_ids), anchor_len=0,
-            completion_len=len(completion),
-            text=s.response_text, iter_created=args.iteration,
-        ))
+    if gadv is None:
+        for s in SolvedTrajectory.load_jsonl(it_dir / "partition" / "solved.jsonl"):
+            completion = ensure_eos(s.response_token_ids, eos)
+            sft.append(SFTExample(
+                uid=stable_hash("solved", s.qid, s.sample_idx, args.iteration),
+                qid=s.qid, source="solved",
+                input_ids=training_input_ids(s.prompt_token_ids, [], completion),
+                prompt_len=len(s.prompt_token_ids), anchor_len=0,
+                completion_len=len(completion),
+                text=s.response_text, iter_created=args.iteration,
+            ))
 
     # Solved-only arms (RFT/ReST-EM) drop anchor/improve/filters from
     # loop.stages, so there is no kept.jsonl to join — 0 improved rows,
@@ -71,31 +86,40 @@ def main(argv: list[str] | None = None) -> None:
     # Displacement-guard reference: the C(y) pass's s_mean, keyed like
     # filters._cand_key ("{qid}:{base_sample_idx}:{attempt_idx}").
     refs: dict[str, float | None] = {}
-    if cliff.enabled and cliff.guard.enabled:
+    need_refs = (cliff.enabled and cliff.guard.enabled) or (gadv is not None and gadv.guard_weight > 0)
+    if need_refs:
+        who = "train.sft.cliff.guard" if gadv is None else "train.gadv.guard_weight>0"
         scores_path = it_dir / "filtered" / "candidate_scores.jsonl"
         if not scores_path.exists():
             raise RuntimeError(
-                f"train.sft.cliff.guard needs {scores_path} — run filters with "
+                f"{who} needs {scores_path} — run filters with "
                 "filter.selection.method=c_score or always_score=true"
             )
         for row in load_any(scores_path):
             refs[row["key"]] = row.get("s_mean")
     n_ref_joined = n_ref_missing = 0
-    for c in kept:
-        completion = ensure_eos(c.continuation_token_ids, eos)
-        ref = refs.get(f"{c.qid}:{c.base_sample_idx}:{c.attempt_idx}")
-        if refs:
-            n_ref_joined += ref is not None
-            n_ref_missing += ref is None
-        sft.append(SFTExample(
-            uid=stable_hash("improved", c.qid, c.base_sample_idx, c.attempt_idx, args.iteration),
-            qid=c.qid, source="improved",
-            input_ids=training_input_ids(c.prompt_token_ids, c.anchor_token_ids, completion),
-            prompt_len=len(c.prompt_token_ids), anchor_len=len(c.anchor_token_ids),
-            completion_len=len(completion),
-            text=c.continuation_text, iter_created=args.iteration,
-            ref_mean_nll=ref,
-        ))
+    gadv_stats: dict = {}
+    if gadv is not None:
+        sft, gadv_stats = build_gadv_examples(cfg, it_dir, args.iteration, eos, kept, refs)
+        n_ref_joined = gadv_stats.pop("n_ref_joined")
+        n_ref_missing = gadv_stats.pop("n_ref_missing")
+        print(f"[build_dataset] gadv rows: {gadv_stats['rows']} questions: {gadv_stats['questions']}")
+    else:
+        for c in kept:
+            completion = ensure_eos(c.continuation_token_ids, eos)
+            ref = refs.get(f"{c.qid}:{c.base_sample_idx}:{c.attempt_idx}")
+            if refs:
+                n_ref_joined += ref is not None
+                n_ref_missing += ref is None
+            sft.append(SFTExample(
+                uid=stable_hash("improved", c.qid, c.base_sample_idx, c.attempt_idx, args.iteration),
+                qid=c.qid, source="improved",
+                input_ids=training_input_ids(c.prompt_token_ids, c.anchor_token_ids, completion),
+                prompt_len=len(c.prompt_token_ids), anchor_len=len(c.anchor_token_ids),
+                completion_len=len(completion),
+                text=c.continuation_text, iter_created=args.iteration,
+                ref_mean_nll=ref,
+            ))
 
     # Modal-wrong base failures (the attractor): needed by v1 negatives and by
     # the v0 DPO rejected_selection. Computed only when some consumer wants it.
@@ -144,9 +168,11 @@ def main(argv: list[str] | None = None) -> None:
     SFTExample.dump_jsonl(out_dir / "examples_sft.jsonl", sft)
     DPOExample.dump_jsonl(out_dir / "examples_dpo.jsonl", dpo)
 
-    # Merge with prior iterations if accumulating.
+    # Merge with prior iterations if accumulating. Under gadv the SFT rows
+    # follow train.gadv.accumulate (default: this iteration's rollouts only —
+    # advantages and the theta0 clip are defined per rollout policy).
     sft_all = _merge(args.run_dir, args.iteration, "examples_sft.jsonl", sft, SFTExample,
-                     accumulate=cfg.data.accumulate)
+                     accumulate=(gadv.accumulate if gadv is not None else cfg.data.accumulate))
     dpo_all = _merge(args.run_dir, args.iteration, "examples_dpo.jsonl", dpo, DPOExample,
                      accumulate=cfg.data.accumulate)
     excluded = _load_excluded_qids(cfg.data.exclude_train_qids)
@@ -181,6 +207,8 @@ def main(argv: list[str] | None = None) -> None:
         "n_ref_joined": n_ref_joined,
         "n_ref_missing": n_ref_missing,
         "n_excluded_qids": len(excluded),
+        "objective": cfg.train.objective,
+        **({"gadv": gadv_stats} if gadv is not None else {}),
         **dpo_stats,
     }
     write_json(out_dir / "stats.json", stats)

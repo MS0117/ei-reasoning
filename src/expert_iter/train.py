@@ -8,6 +8,13 @@ Objectives:
   sft      WeightedSFT — per-token region-weighted cross entropy.
   dpo      Anchor-conditioned DPO (prompt = question + anchor).
   sft+dpo  SFT first, then DPO initialized from the SFT result.
+  gadv     Group-advantage SFT (docs/objective_gadv_spec_20260903.md): every
+           row carries a signed advantage A from its question's group
+           (build_dataset/gadv.py); per-token loss = PPO-clipped surrogate
+           -min(rho*A, clip(rho)*A) with rho = pi_theta/pi_theta0, theta0 =
+           the weights the trainer starts from (per-token log-probs cached by
+           a no-grad pre-pass in on_train_begin), token-mean over the global
+           window. Separate GadvTrainer/GadvCollator — the sft paths are untouched.
 
 Why WeightedSFTTrainer subclasses transformers.Trainer, not trl.SFTTrainer:
 our examples are pre-tokenized with region annotations, so SFTTrainer's
@@ -119,6 +126,45 @@ class WeightedCausalCollator:
             out["n_q"] = torch.tensor(n_q, dtype=torch.float)
             out["ref_mean_nll"] = torch.tensor(refs, dtype=torch.float)
             out["completion_mask"] = torch.tensor(comp_mask, dtype=torch.uint8)
+        return out
+
+
+class GadvCollator(WeightedCausalCollator):
+    """Collator for train.objective=gadv: the legacy four channels (identical to
+    WeightedCausalCollator with cliff_mode=False) plus the group-advantage data
+    channels. `advantage` is emitted for inspection and for the UN-cast
+    _get_num_items_in_batch hook only — compute_loss re-reads the fp32
+    advantage by `row_idx`, because accelerate/DeepSpeed cast every float
+    input to the model dtype (bf16) before compute_loss."""
+
+    GADV_SLICE = {"solved": 0, "improved": 1, "wrong": 2}
+
+    def __init__(self, pad_token_id: int, region_weights: dict[str, float]):
+        super().__init__(pad_token_id, region_weights, cliff_mode=False)
+
+    def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
+        out = super().__call__(examples)
+        max_len = out["input_ids"].shape[1]
+        adv, row_idx, slice_ids, n_q, refs, comp = [], [], [], [], [], []
+        for ex in examples:
+            sl = self.GADV_SLICE.get(ex["source"])
+            if sl is None:
+                raise ValueError(f"gadv: unknown source {ex['source']!r} (uid={ex.get('uid')})")
+            adv.append(float(ex["advantage"]))
+            row_idx.append(int(ex["row_idx"]))
+            slice_ids.append(sl)
+            n_q.append(float(max(ex.get("n_q") or 0, 1)) if sl == 1 else 0.0)
+            ref = ex.get("ref_mean_nll")
+            refs.append(float(ref) if ref is not None else -1.0)   # -1 = missing (NLL >= 0)
+            start = ex["prompt_len"] + ex["anchor_len"]
+            comp.append([0] * start + [1] * ex["completion_len"]
+                        + [0] * (max_len - len(ex["input_ids"])))
+        out["advantage"] = torch.tensor(adv, dtype=torch.float)
+        out["row_idx"] = torch.tensor(row_idx, dtype=torch.long)
+        out["slice_ids"] = torch.tensor(slice_ids, dtype=torch.long)
+        out["n_q"] = torch.tensor(n_q, dtype=torch.float)
+        out["ref_mean_nll"] = torch.tensor(refs, dtype=torch.float)
+        out["completion_mask"] = torch.tensor(comp, dtype=torch.uint8)
         return out
 
 
@@ -476,12 +522,387 @@ def make_weighted_trainer_cls():
 
 
 # ---------------------------------------------------------------------------
+# Group-advantage objective (train.objective: gadv)
+# ---------------------------------------------------------------------------
+
+_PREPASS_CHUNK = 2048   # positions per fp32 log-softmax chunk in the theta0 pre-pass
+
+
+def make_gadv_trainer_cls():
+    """Deferred import, like make_weighted_trainer_cls."""
+    from transformers import Trainer
+
+    class GadvTrainer(Trainer):
+        """Advantage-weighted, theta0-clipped token loss:
+
+            L = sum_rows sum_t m_t * -min(rho_t*A, clip(rho_t, 1-eps_lo, 1+eps_hi)*A) / N_tok
+                + guard_weight * sum_{rescue rows with ref} relu(mean_ce - ref)/n_q / D_G
+
+        N_tok and D_G are gathered once per optimizer window (fixed-shape
+        vector, same collective pattern as the cliff trainer) so the loss is
+        invariant to micro-batch/accum/DP topology; the world_size factor undoes
+        the DP gradient average exactly as the legacy path does. At rho == 1
+        the gradient is -A * grad(log pi): SFT for A > 0, NSR-form push-down for
+        A < 0. Advantages and the theta0 cache are looked up by `row_idx`
+        (fp32 on this side; batch floats arrive bf16 under DeepSpeed)."""
+
+        def __init__(self, *args, gadv_cfg, **kwargs):
+            self._gadv = gadv_cfg
+            self._window_denoms = None
+            self._comp_sums: dict[str, float] = {}
+            self._old_logp: list[torch.Tensor] | None = None
+            super().__init__(*args, **kwargs)
+            self.model_accepts_loss_kwargs = True   # see WeightedSFTTrainer
+            self._adv = torch.tensor(list(self.train_dataset["advantage"]), dtype=torch.float32)
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            import torch.nn.functional as F
+
+            weights = inputs.pop("loss_weights")
+            labels = inputs.pop("labels")
+            row_idx = inputs.pop("row_idx")
+            inputs.pop("advantage", None)            # bf16-cast copy: never used for math
+            comp = inputs.pop("completion_mask")
+            sl = inputs.pop("slice_ids")
+            n_q = inputs.pop("n_q")
+            refs = inputs.pop("ref_mean_nll")
+            g = self._gadv
+            A = self._adv[row_idx.cpu()].to(weights.device)            # fp32 [B]
+
+            outputs = model(**inputs)
+            logits = outputs.logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            shift_w = weights[:, 1:].float()
+            shift_comp = comp[:, 1:].bool()
+            logp = -F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                shift_labels.reshape(-1).clamp(min=0),
+                reduction="none",
+            ).view(shift_labels.shape)
+            valid = (shift_labels != -100) & shift_comp
+            m = valid.to(logp.dtype) * shift_w                          # per-token weight [B, T']
+            Ab = A[:, None]
+
+            ratio = None
+            if g.clip.enabled:
+                if self._old_logp is None:
+                    raise RuntimeError("gadv: theta0 log-prob cache missing — the pre-pass "
+                                       "callback did not run before the first step")
+                lengths = shift_comp.sum(dim=1).tolist()
+                chunks = []
+                for j, i in enumerate(row_idx.tolist()):
+                    c = self._old_logp[i]
+                    if c.numel() != lengths[j]:
+                        raise RuntimeError(
+                            f"gadv: theta0 cache for row {i} holds {c.numel()} tokens, "
+                            f"batch has {lengths[j]} completion tokens (row_idx misaligned?)"
+                        )
+                    chunks.append(c)
+                old = torch.zeros_like(logp)
+                if chunks:
+                    old[shift_comp] = torch.cat(chunks).to(device=old.device, dtype=old.dtype)
+                ratio = torch.exp(logp - old)                          # old is a constant
+                clipped = ratio.clamp(1.0 - g.clip.eps_lo, 1.0 + g.clip.eps_hi)
+                per_tok = -torch.minimum(ratio * Ab, clipped * Ab)
+            else:
+                per_tok = -Ab * logp
+
+            weighted = per_tok * m
+            num = weighted.sum()
+
+            D = self._window_denoms
+            if D is None:   # prediction_step / unexpected path: local fallback
+                D = {"N": m.sum(),
+                     "G": torch.where(sl == 1, 1.0 / n_q.clamp(min=1.0), torch.zeros_like(n_q))[
+                         (sl == 1) & (refs >= 0)].sum()}
+
+            def _term(x, key):
+                d = D[key]
+                d = d.to(x.device) if torch.is_tensor(d) else torch.as_tensor(d, device=x.device)
+                return x / d if float(d) > 0 else x * 0.0
+
+            loss = _term(num, "N")
+            L_G = num.new_zeros(())
+            if g.guard_weight > 0:
+                comp_tok = valid.sum(dim=1)
+                mean_ce = -(logp * valid).sum(dim=1) / comp_tok.clamp(min=1.0)
+                guard_rows = (sl == 1) & (refs >= 0)
+                if bool(guard_rows.any()):
+                    inv_nq = torch.where(sl == 1, 1.0 / n_q.clamp(min=1.0), torch.zeros_like(n_q))
+                    hinge = torch.relu(mean_ce - refs)
+                    L_G = _term((hinge * inv_nq)[guard_rows].sum(), "G")
+                loss = loss + g.guard_weight * L_G
+            if self.args.average_tokens_across_devices and self.args.world_size > 1:
+                loss = loss * self.args.world_size
+
+            with torch.no_grad():   # rank-local monitoring, flushed by log()
+                c = self._comp_sums
+                pos_rows, neg_rows = A > 0, A < 0
+                dN = D["N"]
+                dN = float(dN) if float(dN) > 0 else 1.0
+                c["loss/pos"] = c.get("loss/pos", 0.0) + float(weighted[pos_rows].sum()) / dN
+                c["loss/neg"] = c.get("loss/neg", 0.0) + float(weighted[neg_rows].sum()) / dN
+                c["loss/guard"] = c.get("loss/guard", 0.0) + float(L_G)
+                c["rows/pos"] = c.get("rows/pos", 0.0) + float(pos_rows.sum())
+                c["rows/neg"] = c.get("rows/neg", 0.0) + float(neg_rows.sum())
+                c["rows/rescue"] = c.get("rows/rescue", 0.0) + float((sl == 1).sum())
+                c["guard/skipped_ref"] = c.get("guard/skipped_ref", 0.0) + float(((sl == 1) & (refs < 0)).sum())
+                if ratio is not None:
+                    mp, mn = m * pos_rows[:, None], m * neg_rows[:, None]
+                    c["_clip_mass_pos"] = c.get("_clip_mass_pos", 0.0) + float(mp.sum())
+                    c["_clip_mass_neg"] = c.get("_clip_mass_neg", 0.0) + float(mn.sum())
+                    c["_clip_hit_pos"] = c.get("_clip_hit_pos", 0.0) + float((mp * (ratio > 1.0 + g.clip.eps_hi)).sum())
+                    c["_clip_hit_neg"] = c.get("_clip_hit_neg", 0.0) + float((mn * (ratio < 1.0 - g.clip.eps_lo)).sum())
+                    vm = m > 0
+                    c["_ratio_sum"] = c.get("_ratio_sum", 0.0) + float(ratio[vm].sum())
+                    c["_ratio_tok"] = c.get("_ratio_tok", 0.0) + float(vm.sum())
+                    c["_ratio_max"] = max(c.get("_ratio_max", 0.0), float(ratio[vm].max()) if bool(vm.any()) else 0.0)
+                c["_micro"] = c.get("_micro", 0.0) + 1.0
+            return (loss, outputs) if return_outputs else loss
+
+        def log(self, logs, start_time=None):
+            c, self._comp_sums = self._comp_sums, {}
+            micro = c.pop("_micro", 0.0)
+            if micro and "loss" in logs:
+                accum = max(self.args.gradient_accumulation_steps, 1)
+                steps = max(micro / accum, 1.0)
+                for k in ("loss/pos", "loss/neg", "loss/guard", "rows/pos", "rows/neg",
+                          "rows/rescue", "guard/skipped_ref"):
+                    if k in c:
+                        logs[k] = round(c[k] / steps, 6)
+                for sign in ("pos", "neg"):
+                    mass = c.get(f"_clip_mass_{sign}", 0.0)
+                    if mass > 0:
+                        logs[f"clip/frac_{sign}"] = round(c.get(f"_clip_hit_{sign}", 0.0) / mass, 6)
+                if c.get("_ratio_tok", 0.0) > 0:
+                    logs["ratio/mean"] = round(c["_ratio_sum"] / c["_ratio_tok"], 6)
+                    logs["ratio/max"] = round(c.get("_ratio_max", 0.0), 6)
+                D = self._window_denoms
+                if D is not None:   # last window's GLOBAL (gathered) masses
+                    logs["gadv/n_tok"] = round(float(D["N"]), 1)
+                    logs["gadv/pos_mass"] = round(float(D["pos_mass"]), 3)
+                    logs["gadv/neg_mass"] = round(float(D["neg_mass"]), 3)
+            return super().log(logs, start_time)
+
+        def _get_num_items_in_batch(self, batch_samples, device):
+            """Once per optimizer window, BEFORE its compute_loss calls (see
+            WeightedSFTTrainer): gather [N_tok, D_G, pos_mass, neg_mass, n_pos,
+            n_neg] across ranks in one collective; return N_tok as the legacy
+            scalar. Runs on the un-cast batches, so `advantage` is fp32 here."""
+            if not batch_samples or "row_idx" not in batch_samples[0]:
+                return super()._get_num_items_in_batch(batch_samples, device)
+            vec = torch.zeros(6, device=batch_samples[0]["loss_weights"].device)
+            for b in batch_samples:
+                valid = b["labels"][:, 1:].ne(-100) & b["completion_mask"][:, 1:].bool()
+                row_tok = (b["loss_weights"][:, 1:].float() * valid).sum(dim=1)
+                A = self._adv[b["row_idx"].cpu()].to(row_tok.device)
+                sl = b["slice_ids"]
+                inv_nq = torch.where(sl == 1, 1.0 / b["n_q"].clamp(min=1.0), torch.zeros_like(b["n_q"]))
+                vec[0] += row_tok.sum()
+                vec[1] += inv_nq[(sl == 1) & (b["ref_mean_nll"] >= 0)].sum()
+                vec[2] += (A.clamp(min=0) * row_tok).sum()
+                vec[3] += ((-A).clamp(min=0) * row_tok).sum()
+                vec[4] += (A > 0).sum()
+                vec[5] += (A < 0).sum()
+            if self.args.average_tokens_across_devices and self.args.world_size > 1:
+                vec = self.accelerator.gather(vec.to(device)).view(-1, 6).sum(dim=0)
+            self._window_denoms = {"N": vec[0], "G": vec[1], "pos_mass": vec[2],
+                                   "neg_mass": vec[3], "n_pos": vec[4], "n_neg": vec[5]}
+            return vec[0]
+
+    return GadvTrainer
+
+
+def make_gadv_prepass_callback(trainer, collator, batch_size: int = 1,
+                               cache_dtype: str = "float32"):
+    """TrainerCallback that fills trainer._old_logp (per-row completion-token
+    log-probs under theta0) at on_train_begin — after accelerate/DeepSpeed have
+    prepared the model and before the first optimizer step (verl's "recompute
+    old_log_probs"). Each rank scores a strided share of the rows through the
+    prepared model (trainer.model_wrapped, replicated params under ZeRO-2), then
+    the shards are exchanged with all_gather_object so any rank can train on any
+    row in any epoch. Skipped when the clip is disabled (no ratio needed)."""
+    import time
+
+    from transformers import TrainerCallback
+
+    dtype = torch.float32 if cache_dtype == "float32" else torch.float16
+
+    class OldLogpPrepass(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            import torch.distributed as dist
+            import torch.nn.functional as F
+
+            tr = trainer
+            if tr._old_logp is not None or not tr._gadv.clip.enabled:
+                return control
+            t0 = time.time()
+            fwd = getattr(tr, "model_wrapped", None) or tr.model
+            was_training = fwd.training
+            fwd.eval()
+            dev = args.device
+            ds = tr.train_dataset
+            n_rows = len(ds)
+            rank, world = args.process_index, args.world_size
+            lens = [p + a + c for p, a, c in zip(ds["prompt_len"], ds["anchor_len"], ds["completion_len"])]
+            mine = sorted(range(rank, n_rows, world), key=lambda i: -lens[i])
+            local: dict[int, torch.Tensor] = {}
+            with torch.no_grad():
+                for s in range(0, len(mine), batch_size):
+                    chunk = mine[s:s + batch_size]
+                    b = collator([ds[i] for i in chunk])
+                    out = fwd(input_ids=b["input_ids"].to(dev),
+                              attention_mask=b["attention_mask"].to(dev), use_cache=False)
+                    logits = out.logits[:, :-1, :]
+                    tgt = b["labels"][:, 1:].clamp(min=0).to(dev)
+                    logp = torch.empty(tgt.shape, dtype=torch.float32, device=dev)
+                    for st in range(0, tgt.shape[1], _PREPASS_CHUNK):
+                        lg = logits[:, st:st + _PREPASS_CHUNK, :].float()
+                        tg = tgt[:, st:st + _PREPASS_CHUNK]
+                        logp[:, st:st + _PREPASS_CHUNK] = -F.cross_entropy(
+                            lg.reshape(-1, lg.size(-1)), tg.reshape(-1), reduction="none"
+                        ).view(tg.shape)
+                    shift_comp = b["completion_mask"][:, 1:].bool().to(dev)
+                    for j, i in enumerate(chunk):
+                        local[i] = logp[j][shift_comp[j]].to(dtype).cpu()
+                    del out, logits, logp
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                parts: list = [None] * dist.get_world_size()
+                dist.all_gather_object(parts, local)
+                merged = {k: v for p in parts for k, v in p.items()}
+            else:
+                merged = local
+            if len(merged) != n_rows:
+                raise RuntimeError(f"gadv pre-pass covered {len(merged)}/{n_rows} rows")
+            tr._old_logp = [merged[i] for i in range(n_rows)]
+            fwd.train(was_training)
+            if tr.is_world_process_zero():
+                n_tok = sum(t.numel() for t in tr._old_logp)
+                mb = sum(t.numel() * t.element_size() for t in tr._old_logp) / 1e6
+                print(f"[train] gadv theta0 pre-pass: {n_rows} rows, {n_tok} completion tokens, "
+                      f"{mb:.0f} MB {cache_dtype} cache, {time.time() - t0:.0f}s")
+            return control
+
+    return OldLogpPrepass()
+
+
+# ---------------------------------------------------------------------------
 # Entrypoints per objective
 # ---------------------------------------------------------------------------
 
+def _load_policy(init_path: str, sft):
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        init_path,
+        torch_dtype=torch.bfloat16 if sft.bf16 else None,
+        attn_implementation="flash_attention_2",
+    )
+    if sft.gradient_checkpointing:
+        model.config.use_cache = False
+    return model
+
+
+def _sft_training_args(cfg: Config, args, sft, out_dir: Path, grad_accum: int, run_tag: str = "sft"):
+    from transformers import TrainingArguments
+
+    return TrainingArguments(
+        output_dir=str(out_dir / "trainer_state"),
+        per_device_train_batch_size=sft.micro_batch_size,
+        gradient_accumulation_steps=grad_accum,
+        num_train_epochs=sft.epochs,
+        learning_rate=sft.lr,
+        lr_scheduler_type=sft.scheduler,
+        warmup_ratio=sft.warmup_ratio,
+        weight_decay=sft.weight_decay,
+        max_grad_norm=sft.max_grad_norm,
+        bf16=sft.bf16,
+        gradient_checkpointing=sft.gradient_checkpointing,
+        logging_steps=sft.logging_steps,
+        save_strategy="no",              # we save exactly once, at the end
+        report_to=_report_to(cfg),
+        run_name=f"{cfg.run.name}/iter{args.iteration}/{run_tag}",
+        seed=cfg.run.seed,
+        average_tokens_across_devices=True,
+        remove_unused_columns=False,     # keep source/region columns for the collator
+        dataloader_num_workers=2,
+    )
+
+
+def run_gadv(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path) -> None:
+    from collections import Counter
+
+    from datasets import Dataset
+
+    sft = cfg.train.sft
+    g = cfg.train.gadv
+    rows = [r for r in read_jsonl(dataset_path)]
+    n_before = len(rows)
+    rows = [r for r in rows if len(r["input_ids"]) <= cfg.train.max_seq_len]
+    if len(rows) < n_before:
+        print(f"[train] dropped {n_before - len(rows)} examples > max_seq_len={cfg.train.max_seq_len}")
+    n_missing = sum("advantage" not in r for r in rows)
+    if n_missing:
+        raise RuntimeError(
+            f"gadv: {n_missing} rows carry no `advantage` — was {dataset_path} built with "
+            "train.objective=gadv? (legacy train_sft.jsonl cannot be trained with gadv)"
+        )
+    bad = Counter(r["source"] for r in rows if r["source"] not in GadvCollator.GADV_SLICE)
+    if bad:
+        raise RuntimeError(f"gadv: unsupported sources in the dataset: {dict(bad)}")
+    n_zero = sum(float(r["advantage"]) == 0.0 for r in rows)
+    if n_zero:
+        print(f"[train] WARNING: dropping {n_zero} rows with advantage == 0")
+        rows = [r for r in rows if float(r["advantage"]) != 0.0]
+    if not rows:
+        raise RuntimeError("empty gadv training set — no group produced any row this iteration")
+
+    keep_cols = ["uid", "source", "input_ids", "prompt_len", "anchor_len", "completion_len",
+                 "n_q", "ref_mean_nll", "advantage"]
+    ds = Dataset.from_list([
+        {**{k: r.get(k) for k in keep_cols}, "n_q": r.get("n_q", 0), "row_idx": i}
+        for i, r in enumerate(rows)
+    ])
+    if list(ds["row_idx"]) != list(range(len(ds))):
+        raise RuntimeError("gadv: row_idx column is not the dataset position")
+
+    by_src = Counter(r["source"] for r in rows)
+    pos_mass = sum(float(r["advantage"]) * r["completion_len"] for r in rows if float(r["advantage"]) > 0)
+    neg_mass = -sum(float(r["advantage"]) * r["completion_len"] for r in rows if float(r["advantage"]) < 0)
+    print(
+        f"[train] gadv objective: gamma={g.gamma} rescue_dose={g.rescue_dose} "
+        f"neg_scale={g.neg_scale} clip={'on' if g.clip.enabled else 'off'}"
+        f"({g.clip.eps_lo}/{g.clip.eps_hi}) guard_weight={g.guard_weight} | rows {dict(by_src)} | "
+        f"token-weighted mass pos={pos_mass:.0f} neg={neg_mass:.0f} "
+        f"({neg_mass / pos_mass:.2f}x)" if pos_mass else "[train] gadv objective: no positive rows"
+    )
+
+    tokenizer = _load_tokenizer(init_path)
+    model = _load_policy(init_path, sft)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    grad_accum = _grad_accum(sft.global_batch_size, sft.micro_batch_size, world)
+    targs = _sft_training_args(cfg, args, sft, out_dir, grad_accum, run_tag="gadv")
+    collator = GadvCollator(
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        region_weights=sft.region_weights,
+    )
+    trainer = make_gadv_trainer_cls()(
+        model=model, args=targs, train_dataset=ds, data_collator=collator, gadv_cfg=g,
+    )
+    trainer.add_callback(make_gadv_prepass_callback(
+        trainer, collator, batch_size=g.prepass_batch_size, cache_dtype=g.cache_dtype))
+    trainer.train()
+    _save_and_check(trainer, tokenizer, out_dir)
+    trainer.accelerator.free_memory()
+    del trainer, model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+
 def run_sft(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path) -> None:
     from datasets import Dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
     sft = cfg.train.sft
     cliff = sft.cliff
@@ -490,6 +911,12 @@ def run_sft(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path
     rows = [r for r in rows if len(r["input_ids"]) <= cfg.train.max_seq_len]
     if len(rows) < n_before:
         print(f"[train] dropped {n_before - len(rows)} examples > max_seq_len={cfg.train.max_seq_len}")
+    # gadv's negative-advantage rows must never be CE-trained (possible via
+    # data.accumulate after a gadv iteration): drop them loudly.
+    n_wrong = sum(r.get("source") == "wrong" for r in rows)
+    if n_wrong:
+        print(f"[train] WARNING: dropping {n_wrong} gadv 'wrong' rows (objective={cfg.train.objective})")
+        rows = [r for r in rows if r.get("source") != "wrong"]
     if not cliff.enabled:
         # Legacy path must never CE-train unlikelihood rows (possible via
         # data.accumulate after a v1 iteration): drop them loudly.
@@ -534,38 +961,12 @@ def run_sft(cfg: Config, args, dataset_path: Path, init_path: str, out_dir: Path
         )
 
     tokenizer = _load_tokenizer(init_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        init_path,
-        torch_dtype=torch.bfloat16 if sft.bf16 else None,
-        attn_implementation="flash_attention_2",
-    )
-    if sft.gradient_checkpointing:
-        model.config.use_cache = False
+    model = _load_policy(init_path, sft)
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     grad_accum = _grad_accum(sft.global_batch_size, sft.micro_batch_size, world)
 
-    targs = TrainingArguments(
-        output_dir=str(out_dir / "trainer_state"),
-        per_device_train_batch_size=sft.micro_batch_size,
-        gradient_accumulation_steps=grad_accum,
-        num_train_epochs=sft.epochs,
-        learning_rate=sft.lr,
-        lr_scheduler_type=sft.scheduler,
-        warmup_ratio=sft.warmup_ratio,
-        weight_decay=sft.weight_decay,
-        max_grad_norm=sft.max_grad_norm,
-        bf16=sft.bf16,
-        gradient_checkpointing=sft.gradient_checkpointing,
-        logging_steps=sft.logging_steps,
-        save_strategy="no",              # we save exactly once, at the end
-        report_to=_report_to(cfg),
-        run_name=f"{cfg.run.name}/iter{args.iteration}/sft",
-        seed=cfg.run.seed,
-        average_tokens_across_devices=True,
-        remove_unused_columns=False,     # keep source/region columns for the collator
-        dataloader_num_workers=2,
-    )
+    targs = _sft_training_args(cfg, args, sft, out_dir, grad_accum)
     trainer_cls = make_weighted_trainer_cls()
     trainer = trainer_cls(
         model=model,
@@ -829,6 +1230,8 @@ def main(argv: list[str] | None = None) -> None:
     objective = cfg.train.objective
     if args.phase != "all" and objective != "sft+dpo":
         raise SystemExit(f"--phase {args.phase} needs train.objective=sft+dpo, got {objective!r}")
+    if objective == "gadv":
+        run_gadv(cfg, args, it_dir / "dataset" / "train_sft.jsonl", args.model_path, out_dir)
     if objective in ("sft", "sft+dpo") and args.phase in ("all", "sft"):
         run_sft(cfg, args, it_dir / "dataset" / "train_sft.jsonl", args.model_path, out_dir)
     if objective in ("dpo", "sft+dpo") and args.phase in ("all", "dpo"):

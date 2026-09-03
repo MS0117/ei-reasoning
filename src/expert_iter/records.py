@@ -173,11 +173,18 @@ class SFTExample(Record):
       ref_mean_nll = the C(y) scoring pass's s_mean (mean NLL over the
       continuation region under the pre-train policy) — the displacement
       guard's reference. None = unavailable (guard skips the row).
+
+    Group-advantage fields (train.objective: gadv — docs/objective_gadv_spec_20260903.md):
+      source "wrong" = a base rollout with a NEGATIVE advantage (frontier
+      failure, truncated sample, or a rescued cliff's failure); gadv only.
+      advantage = the signed per-row weight A (0 on rows written by other
+      objectives); group_kind = "frontier" | "rescue" | "floor";
+      group_size = the group's member count the advantage was computed under.
     """
 
     uid: str
     qid: str
-    source: str                 # "solved" | "improved" | "negative"
+    source: str                 # "solved" | "improved" | "negative" | "wrong"
     input_ids: list[int]
     prompt_len: int
     anchor_len: int
@@ -186,6 +193,9 @@ class SFTExample(Record):
     iter_created: int = 0
     n_q: int = 0
     ref_mean_nll: float | None = None
+    advantage: float = 0.0
+    group_kind: str = ""
+    group_size: int = 0
 
     def validate(self) -> None:
         total = self.prompt_len + self.anchor_len + self.completion_len
@@ -193,7 +203,7 @@ class SFTExample(Record):
             raise ValueError(
                 f"{self.uid}: region lengths {total} != len(input_ids) {len(self.input_ids)}"
             )
-        if self.source in ("solved", "negative") and self.anchor_len != 0:
+        if self.source in ("solved", "negative", "wrong") and self.anchor_len != 0:
             raise ValueError(f"{self.uid}: {self.source} example with anchor_len != 0")
 
 

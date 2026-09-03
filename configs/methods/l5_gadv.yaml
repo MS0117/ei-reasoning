@@ -1,0 +1,555 @@
+# L5 preset: the group-advantage objective (train.objective: gadv) as the
+# training loss, with the same operator (staged_bridge_sft, stage-2 DPO), data
+# mix, filters and eval as configs/methods/l5_staged_dpo_s3.yaml — a copy of
+# that file with ONLY the train block changed, so the two arms are paired.
+# Spec: docs/objective_gadv_spec_20260903.md.
+#
+#   bash scripts/run.sh -c configs/methods/l5_gadv.yaml -b
+#
+# What differs from l5_staged_dpo_s3.yaml
+#   train.objective          gadv   groups per question from the iteration's own
+#                                   rollouts: frontier questions (1..7 of 8) give
+#                                   every clean-correct row A=1-k/8 and their
+#                                   failures negative advantages; rescued cliffs
+#                                   form ONE group of the 8 failures + rescues;
+#                                   8/8 questions are excluded. Negative mass per
+#                                   question = positive mass (zero-sum), split by
+#                                   answer_frequency**gamma across the wrong rows.
+#                                   Token loss = PPO clip against the trainer's
+#                                   initial weights (theta0 pre-pass), token-mean.
+#   train.init_from          last   the clip is a trust region around the policy
+#                                   that produced the rollouts; with base re-init
+#                                   (STaR) rho != 1 at step 0 for k >= 1. Note
+#                                   this ALSO changes the init policy of the
+#                                   comparison — pair with an init_from=last S3
+#                                   arm, or read k=0 only, when attributing.
+#   train.sft.cliff.enabled  false  gadv replaces the cliff term (mutually
+#                                   exclusive; the block is kept, inert)
+#   train.gadv.accumulate    false  each iteration trains on its own rollouts
+#                                   (advantages and theta0 are per rollout
+#                                   policy). data.accumulate below therefore
+#                                   governs ONLY train_dpo.jsonl under gadv.
+#   partition.solved_*              unchanged but IGNORED by gadv (it reads the
+#                                   raw rollouts, not the shortest-k solved set)
+#
+# The held-out cliff set B is per-run, so it stays an override — build the split
+# once and reuse it for every arm and every iteration so B is never trained on:
+#   .venv/bin/python scripts/cliff_split.py ...      # -> iter_0/cliff_split.json
+#   --override data.exclude_train_qids=<run>/iter_0/cliff_split.json
+
+run:
+  name: l5_gadv
+  output_root: runs
+  seed: 17
+  wandb:
+    project: ei_reasoning
+    # null -> whichever account is logged in on THIS machine, so a run logs to
+    # its own operator's wandb and nothing can fail on a team membership the
+    # machine does not have. Runs therefore live in two places when two people
+    # run arms; that is fine, because NOTHING in the analysis reads wandb —
+    # every paper number comes from metrics.jsonl / verdicts.jsonl, which
+    # scripts/collect_run_artifacts.sh packs. Set a shared team entity here
+    # only if both accounts are members (wandb.init raises otherwise and
+    # loop.py does not catch it -> the run dies at startup).
+    entity: null
+    mode: online
+
+model:
+  base: Qwen/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  # A NO-OP for this base and pinned deliberately: Qwen3-4B-Instruct-2507 is a
+  # non-thinking model whose chat template has no `enable_thinking` variable and
+  # no <think> tag, so token ids are byte-identical with or without it (checked).
+  # It is load-bearing the moment model.base becomes a HYBRID model (Qwen3-4B,
+  # -8B, -14B), where the same flag flips the template into thinking mode — and
+  # configs/bench_eval.yaml already sets it, so pinning it here keeps the
+  # in-loop benchmark canaries and the standalone headline eval on the same
+  # prompt for every base we might swap in.
+  chat_template_kwargs: {enable_thinking: false}
+
+engine:
+  gpus: null
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.95   # srun owns these GPUs outright; the
+                              # score path still drops to 0.80 below
+  max_model_len: 20480        # >= train.max_seq_len
+  enable_lora: true           # LoRA operators serve q_phi via per-request adapters
+  max_loras: 10               # NOT the shard count. The pool worker groups
+                              # requests by adapter and issues one generate call
+                              # per group (engine.py), so exactly ONE adapter is
+                              # live at a time and vLLM never revisits an evicted
+                              # one; shards are single-adapter by construction.
+                              # 80 slots reserved ~4.9 GB of KV cache (63 MB per
+                              # rank-16 adapter) for nothing, and KV is what caps
+                              # concurrency in the 16k tail. 10 is headroom.
+  max_lora_rank: 16
+  max_logprobs: 20            # raise to >= anchor.params.top_k for signal=topk_kl
+  score_gpu_memory_utilization: 0.80   # C(y)/anchor scoring pools run at this
+                              # instead of the value above: prompt_logprobs
+                              # materializes a full-vocab fp32 log_softmax
+                              # (~5 GiB spike) and 0.90 OOMs at 16k tokens
+  score_max_num_batched_tokens: 4096   # score-mode prefill chunk. The
+                              # full-vocab fp32 log_softmax is materialized per
+                              # chunk, so the spike is chunk x vocab x 4 bytes:
+                              # 4.64 GiB at vLLM's 8192 default on a 152k vocab,
+                              # which OOMed even at 0.80 utilization once the KV
+                              # cache was sized. Halving the chunk halves the
+                              # spike and leaves the KV cache alone.
+
+data:
+  # Stratified pass-rate mix (data/sample_mix.py) rather than a random draw from
+  # openr1. Cliffs are 3.6% of the corpus, so the old n_questions: 2000 random
+  # sample carried ~70 of them and spent the rest of the rollout budget where
+  # the operator has nothing to act on. This set over-samples the cliff ~12.6x:
+  # 8,000 questions, 45.5% at c=0/16 under the base policy. y* already rides in
+  # meta.gold_solution, so include_solution has no analogue here.
+  adapter: local_jsonl
+  adapter_args:
+    path: data/mixes/openr1_mix6k_qwen3-4b-2507.jsonl
+  question_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  # No random split: the eval holdout is the 300 cliffs sample_mix.py reserved
+  # OUT of the mix. A proportional 200-question split would carry ~91 cliffs,
+  # and cliff rescue is the endpoint — a paired power simulation puts 300 at 92%
+  # for a +3pp effect (eval.passk.k: 16 below), against 42-54% at 200. The two
+  # sets are exchangeable by construction (62.7% vs 63.7% openr1-`default`), so
+  # the contrast is method effect, not source quality. Overlap with the train
+  # set is a hard error at run start.
+  eval_holdout: 0
+  holdout_path: data/mixes/openr1_mix8k_qwen3-4b-2507_cliff_holdout.jsonl
+  accumulate: true
+
+rollout:
+  n: 8
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+
+partition:
+  verifier: math
+  solved_keep_max: 4
+  solved_selection: shortest
+  cliff_max_correct: 0        # cliff = all K rollouts failed (spec default)
+
+anchor:                       # ---- axis 1: WHERE improvement starts ----
+  policy: none                # staged spec: NO anchor — bridges use the plain
+                              # "write your own complete solution" variant and
+                              # rollouts start from the bare question prompt
+  base_selection: first_failed   # NOT min_mean_nll: with policy=none the pick
+                              # only stamps base_sample_idx onto ids, but
+                              # min_mean_nll pays a full vLLM score pass over
+                              # every failed rollout for it — MEASURED 763s per
+                              # iteration on 500 questions, ~3.4h at 8k.
+
+improve:                      # ---- axis 2: WHAT the LoRA is fitted on ----
+  operator: staged_bridge_sft # lora_sft | bridge_sft | staged_bridge_sft | self_resample
+  n: 16                       # samples per cliff from q_phi (researcher default)
+  temperature: 1.2
+  top_p: 0.98
+  max_tokens: 16384
+  lora_sft:                   # shared by BOTH LoRA operators
+    # ---- HOW MANY TRANSIENT ADAPTERS FOR THE CLIFF BATCH ------------------
+    # The operator's premise is a TRANSIENT adapter that overfits THIS batch
+    # hard enough to make its questions solvable — not a general SFT. How many
+    # questions share one adapter is therefore a methodology knob, not a
+    # performance one, and it is the first thing to revisit as the cliff set
+    # grows.
+    #
+    #   pooled + chunk_size 0  ONE adapter for every cliff question (current)
+    #   pooled + chunk_size N  one adapter per N-question chunk; each question
+    #                          is then sampled from its own chunk's adapter
+    #   per_problem            one adapter per question (chunk_size ignored)
+    #
+    # MEASURED at 107 cliffs / 313 bridge pairs, r=16 (~33.0M trainable params),
+    # 3 full-batch steps: fit took 26 min and gave 42% conversion. Cost is
+    # linear in RESPONSE TOKENS (1.47M here, ~2800 tok/s) plus ~50 s of
+    # subprocess overhead (model load) per adapter.
+    #
+    # WHEN THE CLIFF SET GROWS the code does not break — the methodology does.
+    # One rank-16 adapter absorbing 3 gradient steps over ~5800 pairs (a
+    # 2000-cliff run) dilutes the per-question signal, so P_hat falls with
+    # nothing erroring. Rough guide:
+    #
+    #     cliffs   pairs    chunk_size    adapters   fit time (1 GPU)
+    #       ~100    ~300    0 (pooled)           1   ~30 min
+    #       ~500   ~1500    100-200            3-5   ~2 h + ~4 min overhead
+    #      ~2000   ~5800    100-200          10-20   ~8 h + ~15 min overhead
+    #
+    # Total FLOPs are the same however it is chunked — chunking only adds the
+    # per-adapter model load. Check two things before chunking at scale:
+    #   * engine.max_loras (currently 8) caps how many adapters vLLM keeps
+    #     co-resident per batch; more chunks than that means swapping.
+    #   * chunk_size has NEVER been run above 0 — every result so far is
+    #     single-adapter. Validate cheaply first: re-run the 107-cliff set with
+    #     chunk_size 25 (4 adapters) against the pooled arm (--reuse-rollout
+    #     makes it paired).
+    adapter_scope: pooled     # pooled (ONE adapter for the cliff batch) | per_problem
+    chunk_size: 0             # MUST stay 0 for staged_bridge_sft: this global knob
+                              # has no defined stage here — shard with
+                              # staged.stage1_chunk_size / stage2_chunk_size below
+                              # (both set to 100 for this preset).
+    refit_budget: 0           # per-problem refits for unresolved cliffs (0 = off,
+                              # confirmed: they simply pass this iteration)
+    fit:
+      r: 16
+      lora_alpha: 32
+      lr: 1.0e-4
+      steps: 2                # STAGE-1 fit steps (staged spec default)
+      max_pair_tokens: 16384
+      dropout: 0.0
+      micro_batch_size: 1     # grad-accum reaches the full batch each step
+      max_grad_norm: 1.0      # 0 disables clipping
+      bf16: true
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+      num_processes: null     # null -> all engine GPUs (DDP, CPU-verified
+                              # equivalent to 1 process); 1 forces single-GPU
+      adaptive:               # tau_E early stop (off = the fixed fit.steps above)
+        enabled: false
+        tau_e: 0.5            # stop when this fraction of the chunk is solved
+        max_steps: 10         # hard cap on total gradient steps
+        eval_every: 2         # gradient steps per round (each round = 1 engine boot)
+        m_rollouts: 4         # probe samples per question per round
+        criterion: frac_solved   # frac_solved (confirmed) | mean_p_hat
+    project_back:
+      enabled: false          # vanilla: no alpha scaling
+      alphas: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+      tau_p: 0.25
+      m_rollouts: 16
+      granularity: per_problem   # alpha* unit (C2-1); NOT the fit batching
+    bridge:                   # ---- bridge generation (this operator) ----
+      n: 8                    # N_B bridge samples per cliff (base policy + y* prompt)
+      temperature: null       # null -> improve.temperature
+      retry_temperature: 1.5
+      max_keep: 4
+      keep_selection: shortest   # shortest | longest | random — which accepted
+                              # bridges fill the max_keep quota (also the
+                              # add_bridge merge re-rank rule)
+      max_tokens: null        # null -> improve.max_tokens
+      leakage_rules: false    # G5 regex screen (default OFF — confirmed)
+      judge_enabled: false    # G5 LLM judge screen (default OFF — confirmed)
+      sample_skipped: true
+    staged:                   # ---- staged_bridge_sft schedule (this operator) ----
+      rollout_n: 8            # (b) samples per cliff off the stage-1 adapter and all stages before final
+      num_stages: 1           # stage-2 fit passes (>1 repeats fit->rollout on
+                              # the still-unsolved cliffs)
+      chain_adapter: true     # warm-start each stage-2 fit from the previous
+                              # adapter (false = fresh adapter from base)
+      unsolved_targets: reuse_bridge   # reuse_bridge | regen_bridge (bridges
+                              # (reuse_bridge | regen_bridge | add_bridge —
+                              # regen falls back to stage-1 bridges on failure;
+                              # add merges old+new: dedup + keep_selection re-rank)
+      stage_bridge_n: null    # stage-2+ bridge samples per question (null -> bridge.n)
+      stage_max_keep: null    # per-question pair cap for stage-2 fits, applied
+                              # after the add_bridge merge (null -> bridge.max_keep)
+                              # regenerated THROUGH the current adapter)
+      solved_targets: self_wash_min_c  # self_wash_min_c | bridge | random |
+                              # longest | shortest — read only when
+                              # train_scope: full_pool
+      train_scope: unsolved_only       # unsolved_only | full_pool
+      stage2_objective: dpo   # sft | dpo | ul — all three share the same
+                              # pairs (chosen = the bridge, rejected = this
+                              # adapter's own stage-1 failure), so the arms
+                              # differ only in the objective. dpo is the
+                              # measured best: on the 107-cliff toy set its kept
+                              # trajectories score C(y) 2.91 vs 3.46-3.63 (sft)
+                              # and 3.65 (ul), paired p<0.001. Conversion counts
+                              # do NOT separate them (same-config replicate SD
+                              # is ~5 of 107). See data/configs/STAGED.yaml for
+                              # the knob notes and STAGED_UL.yaml for the ul arm.
+      dpo:
+        beta: 0.1
+        lr: null              # null -> fit.lr
+        sft_weight: 0.0       # RPO-style NLL(chosen) term; raise if margin
+                              # climbs while conversion falls
+        negative_selection: random   # random | longest | shortest
+        max_pairs_per_question: null
+        reference: init       # init | base
+      ul:                     # read only when stage2_objective: ul
+        mu: 0.1               # weight on the unlikelihood term. MEASURED on the
+                              # toy set: mu 0.1 -> 1.0 moved the per-token
+                              # unlikelihood only 2.79 -> 2.73 (1.36x for a 10x
+                              # dose) because a full-batch fit takes just
+                              # `stage2_steps` AdamW updates, so mu steers the
+                              # step DIRECTION but cannot lengthen it. Raising
+                              # mu starves the chosen-NLL term instead: C(y)
+                              # went 3.65 -> 3.94 (vs dpo 2.91, p=0.001).
+        delta: 0.02           # p clamp; u is bounded by -log(delta) ~= 3.91
+        guard: true           # + relu(mean chosen NLL - reference mean chosen
+                              # NLL) per pair, so the negative cannot displace
+                              # the bridge it protects
+        lr: null              # null -> fit.lr
+        negative_selection: modal   # modal | random | longest | shortest.
+                              # modal targets the failures boxing this stage's
+                              # modal wrong answer (random hits it only 62-69%)
+        max_pairs_per_question: null
+        reference: init       # guard baseline: init | base
+      stage2_steps: 2         # gradient steps per stage-2 fit. MEASURED on the
+                              # 107-cliff toy set (paired, same rollout): 2+2
+                              # steps converted 55.1% vs 43.9% at 2+1, so the
+                              # step budget matters more here than the schedule.
+      stage1_chunk_size: 100  # 0 = ONE stage-1 adapter (pooled); N = one adapter per
+                              # N questions. Size shards by PAIRS PER ADAPTER
+                              # (~250-320 validated, ~3 pairs/question -> chunk
+                              # ~100 once the cliff set passes ~300 questions; 0
+                              # below that). stage2_chunk_size must be <= this:
+                              # equal = one-to-one shards, smaller = each stage-1
+                              # shard is sub-split (children warm-start from the
+                              # parent). Pooled stage 2 after a sharded stage 1
+                              # needs chain_adapter: false. Keep engine.max_loras
+                              # >= the shard count.
+      stage2_chunk_size: 100  # 0 = ONE stage-2 adapter (pooled); N = one adapter
+                              # per N questions. MUST be <= stage1_chunk_size:
+                              # equal (here) = shard i keeps its questions and
+                              # chains from its own stage-1 adapter, just shrinking
+                              # as they convert; smaller = sub-split. 0 after a
+                              # sharded stage 1 is rejected unless chain_adapter is
+                              # false. On the 8k mix: ~4,900 cliffs / 100 = ~49
+                              # shards, ~290 pairs each, ~98 fits (+~80 min of
+                              # adapter loads). That is 2.4x the 2000-question
+                              # estimate this preset was written against — see
+                              # the fit-time table under improve.lora_sft before
+                              # launching, and keep engine.max_loras >= 49.
+      final_rollout_n: 16
+      final_rollout_scope: unsolved    # unsolved | all
+      emit: all               # all (should be pair with final_rollout_scope: all) | final_only (which pool rounds reach filters)
+  rl:                         # ---- axis 3: optional post-SFT RL (NOT an operator) ----
+    enabled: false            # runs AFTER the fit, BEFORE candidate sampling;
+                              # trains LoRA params only, phi_E replaces the adapter
+    algo: grpo                # grpo (GRPOTrainer) | reinforce (RLOOTrainer);
+                              # "ppo" is rejected — grpo's epsilon IS the PPO clip
+    group_size: 8             # G rollouts per question per step
+    # Budget: set EXACTLY ONE of epochs / steps. One optimizer step covers
+    # num_processes questions x group_size rollouts, so 1 epoch over N cliff
+    # questions is floor(N / num_processes) steps — the budget follows the set
+    # size instead of a fixed count that only reaches its first slice.
+    epochs: 1.0             # passes over the chunk's questions (null -> use steps)
+    steps: null             # raw optimizer-step cap (null -> use epochs)
+    gradient_checkpointing: true   # recompute activations instead of storing
+                              # them: without it a long max_completion_length
+                              # dwarfs the colocate vLLM share
+    lr: 1.0e-6              # long-CoT math RL value (Tina, LoRA-alpha
+                              # study); TRL/verl's '10x for LoRA' says 1e-5
+    epsilon: 0.2              # PPO clip range
+    kl_beta: 0.0              # 0 (no reference model) or <= 1e-3
+    # ---- vLLM <-> training logprob mismatch correction (grpo only) ------
+    # Rollouts come from vLLM but gradients from a transformers forward, and the
+    # two disagree on logprobs for the SAME tokens. trl corrects with
+    # exp(log pi_train - log pi_vllm). Its DEFAULT "sequence_mask" sums that gap
+    # over the whole completion, so it underflows to 0 past a few thousand
+    # tokens and zeroes the gradient — measured on a real 16k run, grad_norm was
+    # 0 for every completion over ~4k (docs/api_notes.md finding 24). Token-level
+    # ratios stay near exp(+-0.1) with no accumulation.
+    vllm_importance_sampling_correction: true
+    vllm_importance_sampling_mode: token_truncate   # token_truncate | token_mask
+                              # | sequence_truncate | sequence_mask (trl default,
+                              # unusable for long CoT)
+    vllm_importance_sampling_cap: 2.0   # verl's rollout_is_threshold, TRL's recipe
+                              # configs and the Diagnosing-TIM paper all use 2.0
+    temperature: null         # null -> improve.temperature
+    max_completion_length: null   # null -> improve.max_tokens (lower to ~8192 for cost)
+    num_processes: null       # null -> all engine GPUs (accelerate DDP, GPU-verified)
+    vllm_gpu_memory_utilization: 0.3
+    backend: trl              # trl (colocate vLLM, GPU-probed green) | pool (reserved)
+    seam_strict: false        # anchored prompts are re-rendered as TEXT for trl:
+                              # true = hard-fail on a retokenization seam mismatch,
+                              # false = count + warn (candidate ids stay spliced)
+    seed: null                # null -> stable_seed(run.seed, "lora_rl", iter, chunk)
+    grad_accum: 1             # questions per optimizer step =
+                              # micro_batch_size x num_processes x grad_accum
+                              #   / group_size. Raise to average each update
+                              # over more questions (generation batch grows too).
+    micro_batch_size: null    # sequences per forward/backward = the ACTIVATION
+                              # MEMORY knob, not the question batch. null ->
+                              # group_size, the only value legal for every
+                              # (num_processes, grad_accum) pair. Lower it (e.g.
+                              # 1) if long max_completion_length OOMs — then
+                              # micro_batch x num_processes x grad_accum must
+                              # stay divisible by group_size, and config load
+                              # tells you the legal grad_accum values.
+    prompt_filter:            # DAPO-style zero-variance prompt filtering — OFF
+      enabled: false          # by default, so a run stays comparable with the
+                              # pre-filter arms; flipping it on is the paired
+                              # comparison. A group whose 8 rollouts are ALL
+                              # wrong has advantage 0 and yields NO gradient —
+                              # measured 74.2% of groups on the cliff set.
+      m_rollouts: 8           # probe samples per question, off the FIT adapter
+      min_pass_rate: 0.0      # keep questions with pass rate STRICTLY between
+      max_pass_rate: 1.0      # these (exclusive 0/1 = drop all-wrong and
+                              # all-right = DAPO's rule; 0.2/0.8 = the
+                              # literature's pass-rate-band heuristic)
+    plateau:                  # reward-plateau early stop — OFF by default
+      enabled: false          # trl logs the CURRENT step's question rewards and
+                              # every step draws different questions, so the raw
+                              # series tracks difficulty, not learning: with
+                              # window 1 the patience below fires at step ~5 of 53
+      patience: 3             # windows without improvement >= min_delta
+      min_delta: 0.01
+      window: null            # logs averaged before comparing; null -> one epoch
+                              # of steps ("did this epoch beat the last?")
+  rounds: 1                   # improvement passes per iteration
+  teacher:                    # read only by improve.operator: teacher (stub)
+    model: null
+    gpus: null
+    quantization: null
+
+filter:                       # learnability gates + per-question selection
+  gates: [correctness, no_external_context, length, dedup]
+  max_total_tokens: 18432     # prompt+anchor+continuation cap (<= train.max_seq_len)
+  max_per_question: 2         # keep cap (researcher default)
+  selection:
+    method: shortest          # shortest | c_score | random
+    always_score: true    # true -> measure C(y) even when method != c_score
+    lambda_tail: 1.0          # c_score: C = S_mean + lambda*S_tail + gamma*D_tail
+    gamma_dtail: 0.0
+    tail_fraction: 0.1
+    scope: continuation
+  logprob_gate:               # drop candidates the student finds too unlikely
+    enabled: false
+    min_mean_logprob: -1.5
+    scope: continuation       # continuation | full
+  leakage:                    # used by the `leakage_rules` gate (add it to gates
+                              # above) and by improve.lora_sft.bridge.leakage_rules
+    judge_enabled: false      # extra LLM judge pass over the screened text
+    judge_model: null         # null -> current policy
+    judge_max_tokens: 16
+    judge_temperature: 0.0
+    patterns:                 # \b-anchored: bare "as given" fired on benign text
+                              # ("was given 5 candies") and doubled the floor
+      - "주어진 풀이"
+      - "참고 풀이"
+      - '\breference solution\b'
+      - '\bgiven solution\b'
+      - '\bprovided solution\b'
+      - '\bmodel solution\b'
+      - '\bofficial solution\b'
+      - '\bas given\b'
+      - '\bthe hint\b'
+      - '\baccording to the (solution|reference)\b'
+
+train:
+  objective: gadv
+  init_from: last             # see header: clip = trust region around the rollout policy
+  backend: zero2
+  max_seq_len: 18432
+  sft:                        # optimizer / batch shape shared with the other L5 arms
+    lr: 1.0e-5
+    epochs: 2
+    global_batch_size: 32
+    micro_batch_size: 1
+    region_weights:
+      prompt: 0.0
+      anchor: 1.0             # G3 default: anchor tokens are the student's own — train on them
+      continuation: 1.0
+      solution: 1.0
+    # ---- cliff objective: OFF under gadv (mutually exclusive); block kept so a
+    # paired S3 arm is a one-key flip (objective: sft + enabled: true).
+    cliff:
+      enabled: false
+      rho: 0.3                # per-step share of the cliff bracket, (0,1)
+      per_question_norm: true # false = S3-tok ablation (token-normalized L_C)
+      m_per_batch: auto       # cliff rows per 32-example global batch window.
+                              # NOT 1: an epoch is sized by the SOLVED pool
+                              # (n_win = n_solved // fill), so a fixed value
+                              # decides coverage by accident. L3's ratio (118
+                              # improved rows / 173 windows) over-sampled at 1,
+                              # but this mix over-samples cliffs ~12x and at 1 a
+                              # 6k run would train on only ~24% of its rescue
+                              # trajectories per epoch (measured 4% on a
+                              # 300-question smoke). auto solves for the
+                              # smallest m_C that shows every improved row once
+                              # — and returns 1 at L3-like ratios, so the
+                              # validated setting is untouched there.
+      negative:
+        mode: "off"           # off | v0 (sft+dpo + modal_wrong rejected) | v1 (unlikelihood)
+        mu: 0.1
+        m_per_batch: 1
+        max_per_question: 8
+        delta: 0.02
+      guard:
+        enabled: true         # displacement hinge vs the C(y) pass's s_mean
+  # ---- group-advantage objective (docs/objective_gadv_spec_20260903.md) ----
+  gadv:
+    gamma: 1.0                # negative mass ~ answer_frequency**gamma; 0 = GRPO uniform
+    rescue_dose: 1.0          # c on rescue rows: A = (1 - R/(8+R)) * c
+    neg_scale: 1.0            # 1 = zero-sum per question
+    solved_floor: 0.0         # > 0 admits 8/8 rows at this constant advantage
+    solved_floor_max_per_question: 1
+    correct_max_per_question: 8
+    wrong_max_per_question: 8
+    wrong_truncated_max_per_question: 8   # per-question cap on 16k truncated failures (budget arm: 1)
+    clip:
+      enabled: true
+      eps_lo: 0.2
+      eps_hi: 0.2
+    guard_weight: 1.0         # displacement hinge on rescue rows (needs always_score)
+    accumulate: false         # this iteration's rollouts only
+    wrong_drop_terminal_eos: false
+    prepass_batch_size: 1
+    cache_dtype: float32
+
+loop:
+  iterations: 3
+
+eval:
+  # TRACKING ONLY — the headline is NOT measured here. Per docs/L5_protocol_20260829.md
+  # the paper's cliff numbers come from a post-hoc `scripts/cliff_reroll.py
+  # --qids-file holdout --n 32` on the FINAL checkpoint (plus one base floor
+  # shared by every arm), which is the L3 measurement path and runs at
+  # rollout.max_tokens. This in-loop pass exists to draw the per-iteration
+  # curve, so it is deliberately cheap: greedy off, k=4.
+  greedy_pass1: false
+  # k=16, not the usual 8: the holdout is 300 cliffs rather than a 200-question
+  # proportional split, and k is what buys the per-question precision that keeps
+  # the smaller set at 92% power (79% at k=8). Cost is unchanged — 300x16 vs the
+  # old 200x8 plus a proportional split's dead weight.
+  passk: {k: 4, temperature: 0.7, top_p: 0.95}
+  max_tokens: 16384         # match rollout: 14.6% of correct samples
+                            # exceed 8192 (measured), and censoring them
+                            # penalises whichever arm reasons longest
+  # Regression canaries on the trained checkpoint.
+  benchmark_verifier: math_strict
+  # Regression canaries on the trained checkpoint — NOT the paper's benchmark
+  # numbers (those come from scripts/eval_bench.sh at n=32 on the final ckpt,
+  # docs/L5_protocol_20260829.md §3). Their job is only to show that learning
+  # cliffs hard does not break general math.
+  #
+  # n differs by design: aime24 has 30 questions to math500_hard's 134, so the
+  # smaller set buys its precision with more samples. Both run at 16384 —
+  # math500_hard used to be capped at 8192 and MEASURED 6.5% -> 8.8% truncation
+  # across iterations, which censors exactly the arms that reason longest and
+  # drifts as the policy does.
+  benchmark_every: 1          # EVERY iteration — the per-iteration benchmark curve
+                              # is wanted in the paper, and back-filling a skipped
+                              # iteration later would need that checkpoint to still
+                              # exist on the machine that trained it.
+  # SAMPLING = temp .7 / top_p .8 / top_k 20, the setting Qwen3-*-Instruct-2507
+  # ships as its own recommendation for NON-thinking use (which is how this base
+  # runs, model.chat_template_kwargs.enable_thinking: false). .6/.95 is the
+  # THINKING-mode / DeepSeek-R1 setting and is wrong for this model; it is what
+  # configs/bench_eval.yaml still carried on 2026-09-01, and the L3 preliminary
+  # bench sweep ran under it. The L5 headline sweep must use THESE values, so
+  # the canary curve and the final n=32 number stay the same quantity (only `n`
+  # differs, and avg@n is unbiased at any n).
+  #
+  # SET CHOICE: one probe per direction, not two of the same thing. The three
+  # AIME sets are near-duplicates of each other and, at n=4 on 30 questions, all
+  # too coarse to read (paired SE ~4pp each, ~2.6pp for any two of them pooled).
+  # MEASURED on the base at n=32 (runs/bench/Qwen_Qwen3-4B-Instruct-2507_bench_eval_20260901_110721):
+  #
+  #   set            Q    avg    p=0   p>=.9   paired SE @n=4
+  #   hmmt25        30   0.321  33.3%  20.0%       3.35pp
+  #   math500_hard 134   0.863   5.2%  76.1%       1.19pp
+  #   (aime24/25/26 30   .61/.48/.50               ~4.0pp each)
+  #
+  #  * hmmt25 — the hardest set and the most cliff-like (a third of its
+  #    questions are 0/32 for the base), so this is where transfer OUT of the
+  #    training distribution would show up first.
+  #  * math500_hard — the regression alarm. 134 questions make it 3x more
+  #    precise than any AIME set at the same n, and 76% of them sit at p>=0.9,
+  #    so breakage shows immediately. "Too easy to show improvement" is not a
+  #    defect here: showing improvement is the final n=32 sweep's job, and that
+  #    sweep covers all five sets anyway.
+  #
+  # Still read the TREND across iterations, not a single-iteration gap.
+  benchmarks:
+    - {name: hmmt25, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: math500_hard, n: 4, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

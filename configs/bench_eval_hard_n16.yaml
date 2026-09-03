@@ -1,3 +1,7 @@
+# n=16 variant of bench_eval_hard.yaml (2026-09-02): the srv08 re-sweep halves the
+# sample budget so base + 3 OpenR1 arms + 2 InT arms fit one allocation. Pooled
+# over 193 questions the avg@n SE is ~0.3pp and 95 of them are 0/n cliffs, so the
+# attractor endpoint keeps power 0.98 at 11pp; pass@32/coverage are the cost.
 # Harder / cliff-richer competition sets — a SECOND sweep, kept separate from
 # configs/bench_eval.yaml so the running L3 sweep's grading key is untouched
 # (eval_bench_sweep.sh compares benchmark lists and would otherwise re-run).
@@ -58,14 +62,14 @@ eval:
     # hmmt25 re-run here at T=0.7/top_p 0.8 (user decision 2026-09-02) so every
     # set in this config shares one sampling setting; the old bench_eval.yaml
     # sweep's hmmt25 (T=0.6/top_p .95) stays comparable only within itself.
-    - {name: hmmt25, n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+    - {name: hmmt25, n: 16, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: hmmt_feb26, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/hmmt_feb_2026, split: train, bench_name: hmmt_feb26},
-       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+       n: 16, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: smt25, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/smt_2025, split: train, bench_name: smt25},
-       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+       n: 16, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: apex_short, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/apex-shortlist, split: train, bench_name: apex_short},
-       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+       n: 16, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: amo_int, adapter: hf_benchmark, adapter_args: {hf_name: haoranli-ml/AMO-Bench-Int, split: train, bench_name: amo_int},
-       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+       n: 16, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
     - {name: cmimc25, adapter: hf_benchmark, adapter_args: {hf_name: MathArena/cmimc_2025, split: train, bench_name: cmimc25},
-       n: 32, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}
+       n: 16, temperature: 0.7, top_p: 0.8, top_k: 20, max_tokens: 16384}

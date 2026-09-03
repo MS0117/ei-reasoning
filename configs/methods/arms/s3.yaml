@@ -1,0 +1,16 @@
+# L3 arm overlay: S3 (the cliff objective at rho=0.3) with rho controlled from
+# YAML instead of the hardcoded --override in scripts/l3_arm.sh's S3 case.
+#
+#   PRESET=configs/methods/arms/s3.yaml bash scripts/l3_arm.sh P <FROZEN> 0,1
+#
+# Must produce the same config hash as `bash scripts/l3_arm.sh S3 <FROZEN>`
+# (tests/test_fork_run_overlay.py pins that). The other cliff keys
+# (per_question_norm, m_per_batch, negative, guard) come from the frozen
+# snapshot through the nested merge — override them here for the S3 variants
+# (e.g. per_question_norm: false = S3-tok, rho: 0.1 = the untested low dose).
+
+train:
+  sft:
+    cliff:
+      enabled: true
+      rho: 0.3

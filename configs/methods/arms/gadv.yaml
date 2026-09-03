@@ -1,0 +1,43 @@
+# L3 arm overlay: the group-advantage objective (train.objective: gadv) on the
+# frozen L2 rollouts. Spec: docs/objective_gadv_spec_20260903.md.
+#
+# Applied by `PRESET=configs/methods/arms/gadv.yaml bash scripts/l3_arm.sh P <FROZEN> 0,1`
+# through scripts/fork_run.py --overlay: this sparse mapping is deep-merged onto
+# the frozen run snapshot BEFORE the arm's COMMON --override pairs (run.name,
+# loop.stages, data.exclude_train_qids, filter.selection.always_score), so
+# every objective knob lives here and only the split/name come from the script.
+#
+# What the objective does with the iteration's own rollouts (n = rollout.n):
+#   8/8 solved      excluded (solved_floor > 0 re-admits a few rows at that A)
+#   1..7/8 frontier all clean-correct rows A = 1-k/n, wrong rows negative
+#   0/8 + rescues   the n failures + the kept rescues as ONE group
+#   0/8, no rescue  excluded
+# Negative mass per question = neg_scale x positive mass, allocated across the
+# wrong rows by answer_frequency ** gamma (gamma=0 == Dr.GRPO's -p uniformly).
+# Token loss = PPO-clipped ratio against the trainer's initial weights theta0
+# (per-token log-probs cached by a no-grad pre-pass), token-mean over the
+# global optimizer window.
+
+train:
+  objective: gadv
+  sft:
+    cliff:
+      enabled: false          # gadv replaces the cliff term (mutually exclusive)
+  gadv:
+    gamma: 1.0                # ablation: 0 (= GRPO uniform negatives), 3
+    rescue_dose: 1.0          # ablation: 0.5
+    neg_scale: 1.0            # 1 = zero-sum per question; ablation: 0.3
+    solved_floor: 0.0         # > 0 admits 8/8 rows at this constant advantage
+    solved_floor_max_per_question: 1
+    correct_max_per_question: 8
+    wrong_max_per_question: 8
+    wrong_truncated_max_per_question: 8   # per-question cap on 16k truncated failures (budget arm: 1)
+    clip:
+      enabled: true
+      eps_lo: 0.2             # ablation: 0.5 (or enabled: false = plain -A*log pi)
+      eps_hi: 0.2
+    guard_weight: 1.0         # displacement hinge on rescue rows; 0 disables
+    accumulate: false         # this iteration's rollouts only (GRPO reading)
+    wrong_drop_terminal_eos: false
+    prepass_batch_size: 1
+    cache_dtype: float32
